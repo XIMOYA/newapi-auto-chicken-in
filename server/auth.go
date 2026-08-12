@@ -1,0 +1,190 @@
+/*
+server/auth.go
+NewAPI 签到配置管理平台 · 认证与鉴权
+
+职责：
+- bcrypt 密码哈希与校验
+- JWT 签发 / 解析（HS256，密钥来自 NCF_JWT_SECRET）
+- API Key 生成（格式 ncf_ + 32 位随机 hex，库中仅存 sha256 哈希，明文创建时只返回一次）
+- 鉴权中间件：JWT（管理端）与 API Key（拉取端 /api/config/raw）
+*/
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/crypto/bcrypt"
+)
+
+// APIKeyPrefix API Key 固定前缀，用于识别与展示。
+const APIKeyPrefix = "ncf_"
+
+// tokenTTL 管理端 JWT 有效期：7 天（604800 秒），与接口契约 expires_in 一致。
+const tokenTTL = 7 * 24 * time.Hour
+
+// tokenClaims JWT 载荷：携带用户名，便于修改密码等场景定位账号。
+type tokenClaims struct {
+	Username string `json:"username"`
+	jwt.RegisteredClaims
+}
+
+// ---------------------------------------------------------------------------
+// 密码
+// ---------------------------------------------------------------------------
+
+// HashPassword 使用 bcrypt（默认成本）生成密码哈希。
+func HashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", fmt.Errorf("bcrypt 哈希失败: %w", err)
+	}
+	return string(hash), nil
+}
+
+// CheckPassword 校验明文密码与 bcrypt 哈希是否匹配。
+func CheckPassword(hash, password string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+}
+
+// ---------------------------------------------------------------------------
+// JWT
+// ---------------------------------------------------------------------------
+
+// SignToken 为指定用户名签发 HS256 JWT，返回 token 与过期秒数（604800）。
+func SignToken(username string, secret []byte) (string, int64, error) {
+	return signTokenWithTTL(username, secret, tokenTTL)
+}
+
+// signTokenWithTTL 签发带自定义有效期的 JWT（测试过期场景用）。
+func signTokenWithTTL(username string, secret []byte, ttl time.Duration) (string, int64, error) {
+	now := time.Now()
+	claims := tokenClaims{
+		Username: username,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   username,
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+		},
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString(secret)
+	if err != nil {
+		return "", 0, fmt.Errorf("签发 JWT: %w", err)
+	}
+	return signed, int64(ttl.Seconds()), nil
+}
+
+// ParseToken 解析并校验 JWT，返回其中的用户名。
+func ParseToken(tokenStr string, secret []byte) (string, error) {
+	tok, err := jwt.ParseWithClaims(tokenStr, &tokenClaims{}, func(t *jwt.Token) (any, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("非预期的签名算法: %v", t.Header["alg"])
+		}
+		return secret, nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+	if err != nil {
+		return "", fmt.Errorf("解析 JWT: %w", err)
+	}
+	claims, ok := tok.Claims.(*tokenClaims)
+	if !ok || !tok.Valid {
+		return "", fmt.Errorf("无效的 JWT")
+	}
+	return claims.Username, nil
+}
+
+// ---------------------------------------------------------------------------
+// API Key
+// ---------------------------------------------------------------------------
+
+// GenerateAPIKey 生成新 API Key：ncf_ + 32 位随机 hex（共 36 字符）。
+// 返回明文（仅此一次展示）、sha256 哈希（存库）、前缀（前 8 位，如 ncf_xxxx）。
+func GenerateAPIKey() (plain, hash, prefix string, err error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", "", "", fmt.Errorf("生成随机密钥: %w", err)
+	}
+	plain = APIKeyPrefix + hex.EncodeToString(buf)
+	return plain, HashAPIKey(plain), plain[:8], nil
+}
+
+// HashAPIKey 计算 API Key 的 sha256 十六进制哈希，用于库中存储与比对。
+// API Key 为高熵随机值，sha256 足够安全且支持按哈希直接索引查询。
+func HashAPIKey(plain string) string {
+	sum := sha256.Sum256([]byte(plain))
+	return hex.EncodeToString(sum[:])
+}
+
+// ---------------------------------------------------------------------------
+// 鉴权中间件
+// ---------------------------------------------------------------------------
+
+// ctxKey 请求上下文中自定义键的类型，避免与其他包冲突。
+type ctxKey string
+
+const (
+	ctxKeyUsername = ctxKey("username")
+	ctxKeyAPIKeyID = ctxKey("api_key_id")
+)
+
+// bearerToken 从 Authorization 头提取 Bearer token；格式不符返回 false。
+func bearerToken(r *http.Request) (string, bool) {
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if len(h) > len(prefix) && strings.EqualFold(h[:len(prefix)], prefix) {
+		return strings.TrimSpace(h[len(prefix):]), true
+	}
+	return "", false
+}
+
+// requireJWT 管理端鉴权中间件：校验 Authorization: Bearer <JWT>，
+// 通过后把用户名写入请求上下文，供 handler 读取。
+func (s *Server) requireJWT(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tok, ok := bearerToken(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "未认证")
+			return
+		}
+		username, err := ParseToken(tok, s.jwtSecret)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "未认证")
+			return
+		}
+		ctx := context.WithValue(r.Context(), ctxKeyUsername, username)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+// requireAPIKey 拉取端鉴权中间件：校验 Authorization: Bearer <API_KEY>，
+// 仅用于 /api/config/raw；鉴权通过后顺手更新该 Key 的 last_used_at。
+func (s *Server) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tok, ok := bearerToken(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "无效的 API Key")
+			return
+		}
+		keyHash := HashAPIKey(tok)
+		row, err := GetAPIKeyByHash(s.db, keyHash)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "服务器内部错误")
+			return
+		}
+		if row == nil {
+			writeError(w, http.StatusUnauthorized, "无效的 API Key")
+			return
+		}
+		// 使用时间更新失败不影响主流程（仅记录），避免拖垮正常拉取
+		_ = UpdateAPIKeyLastUsed(s.db, row.ID)
+		ctx := context.WithValue(r.Context(), ctxKeyAPIKeyID, row.ID)
+		next(w, r.WithContext(ctx))
+	}
+}
