@@ -1,0 +1,6 @@
+# ARMv7l/armhf runtime and build dependencies.
+# Camoufox is intentionally excluded: the official browser runtime has no armv7l target.
+curl_cffi==0.16.0
+rich==15.0.0
+patchright==1.61.2
+pyinstaller==6.14.2

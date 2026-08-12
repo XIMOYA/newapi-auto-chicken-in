@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">NewAPI Checkin</title>
+  <desc id="desc">A blue shield with a check mark and a small scheduling clock.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#173969"/>
+      <stop offset="1" stop-color="#0b1b36"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#55a4ff"/>
+      <stop offset="1" stop-color="#2465c7"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#bg)"/>
+  <path d="M128 36 60 61v57c0 45 27 75 68 96 41-21 68-51 68-96V61z" fill="url(#shield)" opacity=".98"/>
+  <path d="m84 126 27 27 61-66" fill="none" stroke="#fff" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="188" cy="184" r="42" fill="#102746" stroke="#83c4ff" stroke-width="7"/>
+  <path d="M188 160v26l18 11" fill="none" stroke="#fff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="188" cy="184" r="4" fill="#fff"/>
+</svg>

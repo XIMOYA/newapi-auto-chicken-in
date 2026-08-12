@@ -1,0 +1,16 @@
+/.venv/
+__pycache__/
+*.py[cod]
+
+# 实际配置含 cookie 与 api_key，不入库
+/config.json
+/visit_config.json
+
+# 运行期产物（整体忽略 data，含 profiles / shots / logs / sessions / 加密配置）
+/data/
+/.build-armv7l/
+/dist/
+.pytest_cache/
+
+# 本地下载的 Camoufox 浏览器压缩包（GitHub Actions 用 Linux 版，运行时自动下载）
+/camoufox-*.zip

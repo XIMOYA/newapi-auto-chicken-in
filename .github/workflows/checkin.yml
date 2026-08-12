@@ -1,0 +1,114 @@
+# ============================================================================ #
+# .github/workflows/checkin.yml
+# New API 每日自动签到（GitHub Actions）
+#
+# 触发方式：
+#   1. schedule —— 每天北京时间 00:05（GitHub Actions 的 cron 使用 UTC，
+#      UTC 16:05 = 北京 00:05）。注意：schedule 触发不保证准点，可能有延迟。
+#   2. workflow_dispatch —— 仓库 Actions 页面手动运行，可选 dry-run 只验连通性。
+#
+# 首次使用前必须配置（重要！）：
+#   GitHub 仓库 -> Settings -> Secrets and variables -> Actions -> New secret
+#     Name:  CONFIG_JSON
+#     Value: 完整 config.json 文件内容（含 13 个账号 cookie 与 AI api_key）
+#
+# 【公共仓库安全须知】
+#   - Secret 的值只有仓库所有者/管理员可见，日志中会被 GitHub 自动打码为 ***；
+#   - 但 Actions 运行日志、失败截图(artifact)、缓存对外是公开可读的，因此：
+#       * 本工作流不缓存 data/sessions.json（公共缓存可被他人读取）；
+#       * 日志会公开显示账号名、站点 URL、AI 的 base_url 和 /api/user/self
+#         返回的用户名（cookie 已在程序内脱敏打印）；
+#       * 建议把 config.json 里的账号 name 换成不敏感的代号；
+#   - fork 的仓库不会继承你的 secret，别人 fork 后无法读取你的配置。
+# ============================================================================ #
+
+name: 每日签到
+
+on:
+  schedule:
+    # UTC 16:05 = 北京时间 00:05
+    - cron: '5 16 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只做连通性检查，不真签到'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# 同一时间只允许一个签到任务在跑，防止并发触发互相干扰
+concurrency:
+  group: checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装系统依赖（Camoufox/Firefox 运行库 + 中文字体）
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            libgtk-3-0 libasound2t64 libdbus-glib-1-2 libx11-xcb1 libxcb1 \
+            libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libnss3 \
+            fonts-liberation fonts-noto-cjk ca-certificates
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装 Python 依赖（精简版，不含 PySide6 GUI）
+        run: pip install -r requirements-ci.txt
+
+      - name: 恢复 Camoufox 浏览器缓存（约几百 MB，命中后秒级恢复）
+        id: camoufox-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/camoufox
+            ~/.local/share/camoufox
+          key: camoufox-${{ runner.os }}-${{ hashFiles('requirements-ci.txt') }}
+
+      - name: 下载 Camoufox 浏览器（仅首次或依赖升级时）
+        if: steps.camoufox-cache.outputs.cache-hit != 'true'
+        run: python -m camoufox fetch
+
+      # 注意：公共仓库的 Actions 缓存对外可读，这里刻意【不缓存】data/sessions.json
+      # （其中含过盾 cookie）。cf_clearance 绑定出口 IP，每次 runner IP 不同基本
+      # 都会重新过盾，缓存价值有限，放弃缓存换取安全。
+
+      - name: 写入配置（来自 GitHub Secrets）
+        env:
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+        run: |
+          if [ -z "$CONFIG_JSON" ]; then
+            echo "::error::未设置 CONFIG_JSON secret。请到仓库 Settings -> Secrets -> Actions 添加，值为完整 config.json 内容"
+            exit 2
+          fi
+          python - <<'PY'
+          import json, os, pathlib
+          raw = os.environ["CONFIG_JSON"]
+          json.loads(raw)  # 先校验是合法 JSON，避免写入坏配置
+          pathlib.Path("config.json").write_text(raw, encoding="utf-8")
+          print("config.json 已写入（校验通过）")
+          PY
+
+      - name: 开始签到（headless 真无头 + 并行 2）
+        run: python main.py --headless --parallel 2 -v ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: 上传排障截图与页面快照（仅失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkin-shots
+          path: data/shots
+          if-no-files-found: ignore
+          retention-days: 7

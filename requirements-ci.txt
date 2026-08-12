@@ -1,0 +1,16 @@
+# GitHub Actions / 无头 CI 专用精简依赖（桌面版仍用 requirements.txt 全量安装）
+# 与 requirements.txt 的差异：去掉 PySide6（桌面 GUI）与 pytest（本地测试）
+# 版本与 requirements.txt 保持一致，勿单独升级
+
+# 核心依赖（版本已锁定，勿改为开放区间）
+curl_cffi==0.16.0          # TLS/JA3 指纹伪装的 HTTP 客户端，S0/S1 快路径
+rich==15.0.0               # 彩色日志与汇总表
+cryptography==49.0.0       # JSON 配置 AES-GCM 加解密
+
+# 浏览器过盾主实现（S2/S3/S4）
+# 安装后需执行一次：python -m camoufox fetch
+camoufox[geoip]==0.5.4
+
+# 浏览器过盾备选实现（Camoufox 装不上时用）
+# 启用后需执行一次：patchright install chromium
+patchright==1.61.2

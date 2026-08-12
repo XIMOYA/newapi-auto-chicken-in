@@ -1,0 +1,58 @@
+{
+  "security": {
+    "encryption_enabled": false,
+    "config_key": "请修改为至少 8 个字符的密钥",
+    "encrypted_file": "data/config.encrypted.json"
+  },
+  "config_sync": {
+    "enabled": false,
+    "url": "https://你的配置服务.example.com/config",
+    "method": "GET",
+    "token": "",
+    "token_header": "Authorization",
+    "token_prefix": "Bearer",
+    "headers": {},
+    "body": null,
+    "response_field": "",
+    "timeout": 20,
+    "auto_before_checkin": true
+  },
+  "ai": {
+    "enabled": true,
+    "base_url": "https://你的站点.com/v1",
+    "api_key": "sk-xxxx",
+    "model": "gpt-4o-mini",
+    "timeout": 60,
+    "max_retries": 2
+  },
+  "browser": {
+    "driver": "camoufox",
+    "headless": "virtual",
+    "humanize": true,
+    "timeout": 60,
+    "keep_artifacts_on_fail": true,
+    "locale": "zh-CN",
+    "window": [1280, 800],
+    "executable_path": null
+  },
+  "http": {
+    "impersonate": "chrome",
+    "timeout": 20
+  },
+  "defaults": {
+    "retry": 2,
+    "interval_seconds": [3, 8]
+  },
+  "accounts": [
+    {
+      "name": "站点A",
+      "url": "https://xxx.com",
+      "cookie": "session=在浏览器里复制完整 Cookie",
+      "user_id": null,
+      "proxy": null,
+      "checkin_path": null,
+      "browser_path": "/dashboard",
+      "enabled": true
+    }
+  ]
+}
