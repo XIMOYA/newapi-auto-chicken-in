@@ -59,14 +59,14 @@ class TestReportHtml:
         html = nt.build_report_html(rows, date_str="2026-08-12")
         assert "今日全部签到成功" in html
         assert "2/2" in html
-        assert "linear-gradient(135deg,#10b981" in html
+        assert "linear-gradient(135deg,#059669" in html
 
     def test_banner_headline_failure_and_alert(self):
         rows = [make_row("A", "success"), make_row("B", "auth_failed")]
         html = nt.build_report_html(rows, date_str="2026-08-12")
         assert "有 1 个账号签到失败" in html
         assert "需要关注" in html
-        assert "linear-gradient(135deg,#ef4444" in html
+        assert "linear-gradient(135deg,#dc2626" in html
 
     def test_stats_counts(self):
         rows = [
@@ -86,13 +86,14 @@ class TestReportHtml:
         assert "500000" in html
 
     def test_badge_status_style_mapping(self):
-        # success 与 already_done 颜色一致（绿），文字不同
-        assert "#0d9488" in nt._badge("success")
-        assert "#0d9488" in nt._badge("already_done")
+        # success 与 already_done 颜色一致（绿），文字不同；徽章含语义色圆点
+        assert "#059669" in nt._badge("success")
+        assert "#059669" in nt._badge("already_done")
         assert "#dc2626" in nt._badge("network_error")
         assert "#b45309" in nt._badge("unknown")
         assert "签到成功" in nt._badge("success")
         assert "今日已签" in nt._badge("already_done")
+        assert 'border-radius:50%' in nt._badge("success")  # 色点存在
 
     def test_full_document(self):
         rows = [make_row("A", "success")]

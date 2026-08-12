@@ -24,18 +24,18 @@ OK_STATUSES = {"success", "already_done"}
 
 # 状态 -> (徽章文字, 前景色, 背景色)
 _STATUS_STYLE = {
-    "success": ("签到成功", "#0d9488", "#ccfbf1"),
-    "already_done": ("今日已签", "#0d9488", "#ccfbf1"),
-    "skipped": ("已跳过", "#6b7280", "#f3f4f6"),
-    "failed": ("签到失败", "#dc2626", "#fee2e2"),
-    "auth_failed": ("认证失败", "#dc2626", "#fee2e2"),
-    "login_required": ("浏览器未登录", "#dc2626", "#fee2e2"),
-    "cf_blocked": ("被盾拦截", "#dc2626", "#fee2e2"),
-    "waf_block": ("WAF 封禁", "#dc2626", "#fee2e2"),
-    "turnstile_required": ("需要 Turnstile", "#b45309", "#fef3c7"),
-    "network_error": ("网络异常", "#dc2626", "#fee2e2"),
-    "config_error": ("配置错误", "#dc2626", "#fee2e2"),
-    "unknown": ("结果未知", "#b45309", "#fef3c7"),
+    "success": ("签到成功", "#059669", "#ecfdf5", "#059669"),
+    "already_done": ("今日已签", "#059669", "#ecfdf5", "#059669"),
+    "skipped": ("已跳过", "#64748b", "#f1f5f9", "#64748b"),
+    "failed": ("签到失败", "#dc2626", "#fef2f2", "#dc2626"),
+    "auth_failed": ("认证失败", "#dc2626", "#fef2f2", "#dc2626"),
+    "login_required": ("浏览器未登录", "#dc2626", "#fef2f2", "#dc2626"),
+    "cf_blocked": ("被盾拦截", "#dc2626", "#fef2f2", "#dc2626"),
+    "waf_block": ("WAF 封禁", "#dc2626", "#fef2f2", "#dc2626"),
+    "turnstile_required": ("需要 Turnstile", "#b45309", "#fffbeb", "#b45309"),
+    "network_error": ("网络异常", "#dc2626", "#fef2f2", "#dc2626"),
+    "config_error": ("配置错误", "#dc2626", "#fef2f2", "#dc2626"),
+    "unknown": ("结果未知", "#b45309", "#fffbeb", "#b45309"),
 }
 
 _DATE_FORMAT = "%Y-%m-%d"
@@ -136,20 +136,38 @@ def build_subject(prefix: str, date_str: str, failed_count: int,
 # --------------------------------------------------------------------------- #
 # HTML 模板
 # --------------------------------------------------------------------------- #
+# 设计语言：Executive Dashboard（高管仪表盘）
+#   - 品牌主色 深蓝 #1E3A8A / 副色 #3B82F6，语义色 成功绿 / 失败红 / 警告橙
+#   - KPI 大数字 + 小标签，数字用等宽 tabular-nums，避免宽度跳动
+#   - 全内联样式 + table 布局（QQ/163/Gmail/Outlook 均安全）
+#   - 状态徽章 = 浅底深字胶囊 + 语义色圆点（不只靠颜色区分，见 WCAG color-not-only）
 
 def _badge(status: str) -> str:
-    label, fg, bg = _STATUS_STYLE.get(status, _STATUS_STYLE["unknown"])
+    label, fg, bg, dot = _STATUS_STYLE.get(status, _STATUS_STYLE["unknown"])
     return (
-        f'<span style="display:inline-block;padding:3px 12px;border-radius:999px;'
-        f'font-size:12px;font-weight:600;color:{fg};background:{bg};white-space:nowrap;">'
+        f'<span style="display:inline-block;padding:4px 12px;border-radius:999px;'
+        f'font-size:12px;font-weight:600;color:{fg};background:{bg};'
+        f'white-space:nowrap;line-height:1.4;">'
+        f'<span style="display:inline-block;width:6px;height:6px;border-radius:50%;'
+        f'background:{fg};margin-right:6px;vertical-align:1px;"></span>'
         f'{label}</span>'
+    )
+
+
+def _section_title(text: str, accent: str = "#1E3A8A") -> str:
+    return (
+        f'<div style="margin:26px 0 12px;font-size:14px;font-weight:700;color:#1F2937;'
+        f'letter-spacing:.3px;">'
+        f'<span style="display:inline-block;width:4px;height:14px;border-radius:2px;'
+        f'background:{accent};vertical-align:-2px;margin-right:8px;"></span>'
+        f'{_esc(text)}</div>'
     )
 
 
 def build_report_html(rows: list, *, date_str: str, run_context: str = "GitHub Actions",
                       beijing_time: str = "", dry_run: bool = False,
                       extra_note: str = "") -> str:
-    """把汇总行渲染成一封好看的 HTML 邮件。"""
+    """把汇总行渲染成一封好看的 HTML 邮件（Executive Dashboard 风格）。"""
     total = len(rows)
     ok_count = sum(1 for r in rows if r.status in OK_STATUSES)
     failed = [r for r in rows if r.status not in OK_STATUSES and r.status != "skipped"]
@@ -157,96 +175,136 @@ def build_report_html(rows: list, *, date_str: str, run_context: str = "GitHub A
     skipped_count = sum(1 for r in rows if r.status == "skipped")
 
     if failed_count == 0:
-        banner_bg = "linear-gradient(135deg,#10b981,#059669)"
-        banner_icon = "✅"
+        banner_bg = "linear-gradient(135deg,#059669,#10b981)"
+        banner_fallback = "#059669"
+        banner_label = "全部成功"
+        banner_label_color = "#065f46"
+        banner_label_bg = "#d1fae5"
         headline = f"今日全部签到成功！ {ok_count}/{total}"
     else:
-        banner_bg = "linear-gradient(135deg,#ef4444,#b91c1c)"
-        banner_icon = "⚠️"
+        banner_bg = "linear-gradient(135deg,#dc2626,#ef4444)"
+        banner_fallback = "#dc2626"
+        banner_label = f"{failed_count} 个失败"
+        banner_label_color = "#991b1b"
+        banner_label_bg = "#fee2e2"
         headline = f"有 {failed_count} 个账号签到失败"
 
-    # 统计卡片
-    stat_cell = (
-        "<td style='width:33.3%;text-align:center;padding:16px 8px;'>"
-        "<div style='font-size:28px;font-weight:800;color:#111827;'>{}</div>"
-        "<div style='font-size:12px;color:#9ca3af;margin-top:4px;'>{}</div></td>"
+    # ---- 头部横幅：品牌小字 + 大标题 + 状态胶囊（不依赖 emoji）----
+    banner = (
+        f'<div style="background:{banner_bg};background-image:{banner_bg};'
+        f'padding:32px 36px 30px;">'
+        f'<div style="font-size:11px;font-weight:600;letter-spacing:2.5px;'
+        f'color:rgba(255,255,255,.75);">NEWAPI CHECKIN · 每日签到</div>'
+        f'<div style="color:#ffffff;font-size:24px;font-weight:800;margin-top:12px;'
+        f'line-height:1.3;">{_esc(headline)}</div>'
+        f'<div style="margin-top:14px;">'
+        f'<span style="display:inline-block;padding:5px 14px;border-radius:999px;'
+        f'background:{banner_label_bg};color:{banner_label_color};'
+        f'font-size:12px;font-weight:700;">{banner_label}</span>'
+        f'<span style="display:inline-block;margin-left:10px;color:rgba(255,255,255,.9);'
+        f'font-size:13px;">{_esc(date_str)} · {_esc(run_context)}</span>'
+        f'</div></div>'
     )
+
+    # ---- KPI 统计卡：总账号 / 成功 / 失败 ----
+    def _kpi(value, label, color, dot_color=None):
+        dot = dot_color or color
+        return (
+            "<td style='width:33.3%;text-align:center;padding:18px 8px 16px;'>"
+            f"<div style='font-size:27px;font-weight:800;color:{color};"
+            f"font-variant-numeric:tabular-nums;line-height:1.2;'>{value}</div>"
+            f"<div style='font-size:11px;color:#94a3b8;margin-top:6px;"
+            f"letter-spacing:1px;'>"
+            f"<span style='display:inline-block;width:5px;height:5px;border-radius:50%;"
+            f"background:{dot};margin-right:5px;vertical-align:1px;'></span>{label}</div></td>"
+        )
     stats = (
-        "<table style='width:100%;border-collapse:collapse;margin:0 auto;"
-        "background:#f9fafb;border-radius:10px;'>"
+        "<table role='presentation' style='width:100%;border-collapse:collapse;"
+        "background:#ffffff;'>"
         "<tr>"
-        + stat_cell.format(total, "总账号")
-        + stat_cell.format(ok_count, "成功")
-        + stat_cell.format(failed_count, "失败")
+        + _kpi(total, "总账号", "#1E3A8A")
+        + _kpi(ok_count, "成功", "#059669")
+        + _kpi(failed_count, "失败", "#dc2626" if failed_count else "#cbd5e1",
+               dot_color="#dc2626" if failed_count else "#cbd5e1")
         + "</tr></table>"
     )
 
-    # 明细表
+    # ---- 明细表 ----
     thead = (
-        "<tr style='background:#f3f4f6;'>"
-        "<th style='text-align:left;padding:10px 14px;font-size:12px;color:#6b7280;"
-        "border-bottom:1px solid #e5e7eb;'>账号</th>"
-        "<th style='text-align:left;padding:10px 14px;font-size:12px;color:#6b7280;"
-        "border-bottom:1px solid #e5e7eb;'>结果</th>"
-        "<th style='text-align:left;padding:10px 14px;font-size:12px;color:#6b7280;"
-        "border-bottom:1px solid #e5e7eb;'>策略</th>"
-        "<th style='text-align:right;padding:10px 14px;font-size:12px;color:#6b7280;"
-        "border-bottom:1px solid #e5e7eb;'>额度</th></tr>"
+        "<tr>"
+        "<th style='text-align:left;padding:10px 16px;font-size:11px;color:#64748b;"
+        "background:#f8fafc;border-bottom:1px solid #e2e8f0;letter-spacing:.5px;'>账号</th>"
+        "<th style='text-align:left;padding:10px 16px;font-size:11px;color:#64748b;"
+        "background:#f8fafc;border-bottom:1px solid #e2e8f0;letter-spacing:.5px;'>结果</th>"
+        "<th style='text-align:left;padding:10px 16px;font-size:11px;color:#64748b;"
+        "background:#f8fafc;border-bottom:1px solid #e2e8f0;letter-spacing:.5px;'>策略</th>"
+        "<th style='text-align:right;padding:10px 16px;font-size:11px;color:#64748b;"
+        "background:#f8fafc;border-bottom:1px solid #e2e8f0;letter-spacing:.5px;'>额度</th></tr>"
     )
     body_rows = []
-    for r in rows:
+    for idx, r in enumerate(rows):
         quota = "-" if r.quota in (None, "", 0) else str(r.quota)
-        detail = f"<div style='font-size:11px;color:#9ca3af;'>{_esc(r.detail)}</div>" if r.detail else ""
+        stripe = "background:#ffffff;" if idx % 2 == 0 else "background:#fcfdfe;"
+        detail = (
+            f"<div style='font-size:11px;color:#94a3b8;margin-top:2px;'>{_esc(r.detail)}</div>"
+            if r.detail else ""
+        )
         body_rows.append(
             "<tr>"
-            f"<td style='padding:9px 14px;font-size:13px;color:#374151;border-bottom:1px solid #f3f4f6;'>"
-            f"{_esc(r.name)}{detail}</td>"
-            f"<td style='padding:9px 14px;border-bottom:1px solid #f3f4f6;'>{_badge(r.status)}</td>"
-            f"<td style='padding:9px 14px;font-size:12px;color:#6b7280;border-bottom:1px solid #f3f4f6;'>"
-            f"{_esc(r.strategy)}</td>"
-            f"<td style='padding:9px 14px;font-size:13px;color:#374151;text-align:right;"
-            f"border-bottom:1px solid #f3f4f6;'>{_esc(quota)}</td>"
+            f"<td style='padding:11px 16px;font-size:13px;color:#1f2937;font-weight:600;"
+            f"border-bottom:1px solid #f1f5f9;{stripe}'>{_esc(r.name)}{detail}</td>"
+            f"<td style='padding:11px 16px;border-bottom:1px solid #f1f5f9;{stripe}'>{_badge(r.status)}</td>"
+            f"<td style='padding:11px 16px;font-size:12px;color:#64748b;"
+            f"border-bottom:1px solid #f1f5f9;{stripe}'>{_esc(r.strategy)}</td>"
+            f"<td style='padding:11px 16px;font-size:13px;color:#334155;text-align:right;"
+            f"font-variant-numeric:tabular-nums;border-bottom:1px solid #f1f5f9;{stripe}'>"
+            f"{_esc(quota)}</td>"
             "</tr>"
         )
     table = (
-        "<table style='width:100%;border-collapse:collapse;'>" + thead + "".join(body_rows) + "</table>"
+        "<table role='presentation' style='width:100%;border-collapse:collapse;"
+        "border:1px solid #e2e8f0;border-radius:8px;'>" + thead + "".join(body_rows) + "</table>"
     )
 
-    # 失败警示
+    # ---- 失败警示：左侧红条卡片 ----
     alert = ""
     if failed_count:
         names = "、".join(_esc(r.name) for r in failed[:10])
         more = f" 等 {failed_count} 个" if failed_count > 10 else ""
         alert = (
-            "<div style='margin:18px 0;padding:14px 16px;background:#fef2f2;border:1px solid #fecaca;"
-            "border-radius:8px;font-size:13px;color:#b91c1c;'>"
-            f"<b>⚠️ 需要关注：</b>{names}{more} 未能成功签到，请查看运行日志排查。</div>"
+            "<div style='margin:18px 0;padding:13px 16px;background:#fef2f2;"
+            "border-left:4px solid #dc2626;border-radius:6px;font-size:13px;"
+            "color:#991b1b;line-height:1.6;'>"
+            f"<b>需要关注</b>：{names}{more} 未能成功签到，请查看运行日志排查。</div>"
         )
 
-    note_html = f"<div style='margin:14px 0;font-size:12px;color:#9ca3af;'>{_esc(extra_note)}</div>" if extra_note else ""
+    note_html = (
+        f"<div style='margin:14px 0;padding:10px 14px;background:#f8fafc;border-radius:6px;"
+        f"font-size:12px;color:#64748b;'>{_esc(extra_note)}</div>" if extra_note else ""
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f4f6f8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;">
-<div style="max-width:640px;margin:24px auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.08);">
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;">
+<div style="max-width:600px;margin:24px auto;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 4px 24px rgba(30,58,138,.08);">
 
-  <div style="background:{banner_bg};padding:28px 32px;">
-    <div style="font-size:36px;line-height:1;">{banner_icon}</div>
-    <div style="color:#ffffff;font-size:22px;font-weight:700;margin-top:10px;">{_esc(headline)}</div>
-    <div style="color:rgba(255,255,255,.88);font-size:13px;margin-top:6px;">{date_str} · {run_context}</div>
-  </div>
+  {banner}
 
-  <div style="padding:24px 32px 6px;">
+  <div style="padding:8px 32px 28px;">
+    {_section_title("签到总览")}
     {stats}
     {alert}
     {note_html}
-    <div style="font-size:14px;font-weight:700;color:#111827;margin:22px 0 10px;">📋 签到明细</div>
+    {_section_title("签到明细", accent="#3b82f6")}
     {table}
   </div>
 
-  <div style="padding:20px 32px 28px;color:#9ca3af;font-size:12px;text-align:center;border-top:1px solid #f3f4f6;margin-top:18px;">
-    {_esc('运行于 ' + run_context)} · 北京时间 {beijing_time or '—'} · 自动发送，请勿回复
+  <div style="padding:18px 32px 26px;color:#94a3b8;font-size:11px;text-align:center;border-top:1px solid #f1f5f9;letter-spacing:.5px;">
+    NewAPI Checkin · 自动签到通知
+    <div style="margin-top:6px;font-size:11px;color:#cbd5e1;">
+      {_esc('运行于 ' + run_context)} · 北京时间 {beijing_time or '—'} · 自动发送，请勿回复
+    </div>
   </div>
 
 </div>
