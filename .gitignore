@@ -19,6 +19,8 @@ __pycache__/
 /server/*.exe
 /server/data/
 /server/*.db
+/server/embed_dist/*
+!/server/embed_dist/.gitkeep
 /web/node_modules/
 /web/dist/
 /web/*.local

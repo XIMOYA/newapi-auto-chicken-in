@@ -13,6 +13,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -331,24 +332,28 @@ func readJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	return nil
 }
 
-// staticHandler 托管前端静态文件：
-// - 找到 web/dist：普通文件直接返回；未命中的非 API 路径回退 index.html（SPA history 路由）
-// - 找不到 web/dist：返回 JSON 提示，服务仍可用于纯 API 场景
+// staticHandler 托管前端静态文件，按优先级：
+// 1) 外部 web/dist（开发热更新，免重新编译）
+// 2) 嵌入二进制的 embed_dist（go:embed，单文件部署）
+// 命中普通文件直接返回；未命中的非 API 路径回退 index.html（SPA history 路由）；
+// 前端完全缺失时返回 JSON 提示，服务仍可用于纯 API 场景。
 func (s *Server) staticHandler() http.Handler {
-	dist := findDistDir()
-	if dist == "" {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// 未知 API 路径返回 JSON 404，而不是「纯 API 模式」提示
-			if strings.HasPrefix(r.URL.Path, "/api/") {
-				writeError(w, http.StatusNotFound, "接口不存在")
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]string{
-				"message": "前端静态文件未构建（web/dist 不存在），当前仅提供 API 服务",
-			})
-		})
+	if dist := findDistDir(); dist != "" {
+		return serveFromDir(dist)
 	}
 
+	sub, err := fs.Sub(embeddedDist, "embed_dist")
+	if err != nil {
+		sub = nil
+	}
+	if sub == nil {
+		return noFrontendHandler()
+	}
+	return serveFromFS(sub)
+}
+
+// serveFromDir 基于磁盘目录提供前端静态文件。
+func serveFromDir(dist string) http.Handler {
 	fileServer := http.FileServer(http.Dir(dist))
 	indexPath := filepath.Join(dist, "index.html")
 	hasIndex := func() bool {
@@ -378,6 +383,49 @@ func (s *Server) staticHandler() http.Handler {
 		r2 := r.Clone(r.Context())
 		r2.URL.Path = "/"
 		fileServer.ServeHTTP(w, r2)
+	})
+}
+
+// serveFromFS 基于嵌入式文件系统提供前端静态文件（单二进制场景）。
+func serveFromFS(sub fs.FS) http.Handler {
+	fileServer := http.FileServer(http.FS(sub))
+	hasIndex := func() bool {
+		_, err := fs.Stat(sub, "index.html")
+		return err == nil
+	}()
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			writeError(w, http.StatusNotFound, "接口不存在")
+			return
+		}
+		p := strings.TrimPrefix(filepath.Clean(r.URL.Path), string(filepath.Separator))
+		if p != "" && p != "." {
+			if st, err := fs.Stat(sub, filepath.ToSlash(p)); err == nil && !st.IsDir() {
+				fileServer.ServeHTTP(w, r)
+				return
+			}
+		}
+		if !hasIndex {
+			writeError(w, http.StatusNotFound, "静态文件未找到（前端未嵌入，请用构建脚本重新编译）")
+			return
+		}
+		r2 := r.Clone(r.Context())
+		r2.URL.Path = "/"
+		fileServer.ServeHTTP(w, r2)
+	})
+}
+
+// noFrontendHandler 前端完全不可用时返回 JSON 提示（纯 API 模式）。
+func noFrontendHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			writeError(w, http.StatusNotFound, "接口不存在")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{
+			"message": "前端静态文件未构建（web/dist 与嵌入资源均不存在），当前仅提供 API 服务",
+		})
 	})
 }
 
