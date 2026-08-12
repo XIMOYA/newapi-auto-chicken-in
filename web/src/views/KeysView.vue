@@ -35,8 +35,15 @@ web/src/views/KeysView.vue
         :pagination="pagination"
         striped
         :scroll-x="760"
-      />
-      <n-empty v-if="!loading && !keys.length" class="table-empty" description="暂无 API Key，点击右上角「创建 API Key」创建" />
+      >
+        <template #empty>
+          <n-empty
+            v-if="!loading"
+            class="table-empty"
+            description="暂无 API Key，点击右上角「创建 API Key」创建"
+          />
+        </template>
+      </n-data-table>
     </n-card>
 
     <key-create-modal ref="modalRef" v-model:show="modalVisible" :creating="creating" @create="handleCreate" />

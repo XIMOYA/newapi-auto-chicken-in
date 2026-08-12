@@ -15,6 +15,7 @@ web/src/views/BrowserSettingsView.vue
       :updated-at="configStore.updatedAt"
       :show-reset="true"
       compact
+      :dirty="isDirty"
       @save="handleSave"
       @reset="handleReset"
     >
@@ -64,6 +65,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { NForm, NFormItem, NInput, NInputNumber, NSwitch, NSelect, useMessage, type SelectOption } from 'naive-ui'
 import ConfigCard from '@/components/ConfigCard.vue'
 import { useConfigStore } from '@/stores/config'
+import { useDirtyGuard } from '@/composables/useDirtyGuard'
 import { deepClone } from '@/utils/clone'
 import { extractErrorMessage } from '@/utils/error'
 import type { AppConfig, BrowserConfig } from '@/types'
@@ -74,11 +76,14 @@ const message = useMessage()
 const saving = ref(false)
 const initialized = ref(false)
 
+// 脏检测：表单与已保存快照不一致时显示「未保存修改」，离开前弹确认
+const savedSnapshot = ref('')
+const isDirty = computed(() => JSON.stringify(form) !== savedSnapshot.value)
+useDirtyGuard(() => isDirty.value)
+
 const driverOptions: SelectOption[] = [
-  { label: 'camoufox（反指纹浏览器）', value: 'camoufox' },
-  { label: 'chromium', value: 'chromium' },
-  { label: 'firefox', value: 'firefox' },
-  { label: 'webkit', value: 'webkit' }
+  { label: 'camoufox（反指纹浏览器，推荐）', value: 'camoufox' },
+  { label: 'patchright（无头浏览器备选）', value: 'patchright' }
 ]
 
 const headlessOptions: SelectOption[] = [
@@ -121,6 +126,7 @@ function initForm(cfg: AppConfig) {
   form.locale = b.locale
   form.window = [b.window?.[0] ?? 1280, b.window?.[1] ?? 800]
   form.executable_path = b.executable_path ?? null
+  savedSnapshot.value = JSON.stringify(form)
 }
 
 watch(
@@ -149,6 +155,7 @@ async function handleSave() {
       executable_path: form.executable_path && form.executable_path.trim() !== '' ? form.executable_path.trim() : null
     }
     await configStore.save(next)
+    savedSnapshot.value = JSON.stringify(form)
     message.success('浏览器配置已保存')
   } catch (e) {
     message.error(extractErrorMessage(e, '浏览器配置保存失败'))

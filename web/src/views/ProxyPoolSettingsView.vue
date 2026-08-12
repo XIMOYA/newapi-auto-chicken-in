@@ -15,6 +15,7 @@ web/src/views/ProxyPoolSettingsView.vue
       :updated-at="configStore.updatedAt"
       :show-reset="true"
       compact
+      :dirty="isDirty"
       @save="handleSave"
       @reset="handleReset"
     >
@@ -52,11 +53,12 @@ web/src/views/ProxyPoolSettingsView.vue
 </template>
 
 <script setup lang="ts">
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { NForm, NFormItem, NInput, NInputNumber, NSwitch, useMessage } from 'naive-ui'
 import ConfigCard from '@/components/ConfigCard.vue'
 import DynamicStringList from '@/components/DynamicStringList.vue'
 import { useConfigStore } from '@/stores/config'
+import { useDirtyGuard } from '@/composables/useDirtyGuard'
 import { deepClone } from '@/utils/clone'
 import { extractErrorMessage } from '@/utils/error'
 import type { AppConfig, ProxyPoolConfig } from '@/types'
@@ -66,6 +68,11 @@ const message = useMessage()
 
 const saving = ref(false)
 const initialized = ref(false)
+
+// 脏检测：表单与已保存快照不一致时显示「未保存修改」，离开前弹确认
+const savedSnapshot = ref('')
+const isDirty = computed(() => JSON.stringify(form) !== savedSnapshot.value)
+useDirtyGuard(() => isDirty.value)
 
 const form = reactive<ProxyPoolConfig>({
   enabled: false,
@@ -86,6 +93,7 @@ function initForm(cfg: AppConfig) {
   form.max_proxies = p.max_proxies
   form.ip_swap_limit = p.ip_swap_limit
   form.sources = [...(p.sources ?? [])]
+  savedSnapshot.value = JSON.stringify(form)
 }
 
 watch(
@@ -113,6 +121,7 @@ async function handleSave() {
       sources: form.sources.map((s) => s.trim()).filter((s) => s !== '')
     }
     await configStore.save(next)
+    savedSnapshot.value = JSON.stringify(form)
     message.success('代理池配置已保存')
   } catch (e) {
     message.error(extractErrorMessage(e, '代理池配置保存失败'))

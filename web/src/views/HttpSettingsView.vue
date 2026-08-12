@@ -14,6 +14,7 @@ web/src/views/HttpSettingsView.vue
       :updated-at="configStore.updatedAt"
       :show-reset="true"
       compact
+      :dirty="isDirty"
       @save="handleSave"
       @reset="handleReset"
     >
@@ -38,10 +39,11 @@ web/src/views/HttpSettingsView.vue
 </template>
 
 <script setup lang="ts">
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { NForm, NFormItem, NInputNumber, NSwitch, NSelect, useMessage, type SelectOption } from 'naive-ui'
 import ConfigCard from '@/components/ConfigCard.vue'
 import { useConfigStore } from '@/stores/config'
+import { useDirtyGuard } from '@/composables/useDirtyGuard'
 import { deepClone } from '@/utils/clone'
 import { extractErrorMessage } from '@/utils/error'
 import type { AppConfig, HttpConfig } from '@/types'
@@ -51,6 +53,11 @@ const message = useMessage()
 
 const saving = ref(false)
 const initialized = ref(false)
+
+// 脏检测：表单与已保存快照不一致时显示「未保存修改」，离开前弹确认
+const savedSnapshot = ref('')
+const isDirty = computed(() => JSON.stringify(form) !== savedSnapshot.value)
+useDirtyGuard(() => isDirty.value)
 
 const impersonateOptions: SelectOption[] = [
   { label: 'chrome（Chrome 指纹）', value: 'chrome' },
@@ -72,6 +79,7 @@ function initForm(cfg: AppConfig) {
   form.impersonate = h.impersonate
   form.timeout = h.timeout
   form.verify = h.verify
+  savedSnapshot.value = JSON.stringify(form)
 }
 
 watch(
@@ -96,6 +104,7 @@ async function handleSave() {
     const next = deepClone(configStore.config)
     next.http = { ...form }
     await configStore.save(next)
+    savedSnapshot.value = JSON.stringify(form)
     message.success('HTTP 配置已保存')
   } catch (e) {
     message.error(extractErrorMessage(e, 'HTTP 配置保存失败'))

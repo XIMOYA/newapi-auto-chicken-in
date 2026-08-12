@@ -14,6 +14,7 @@ web/src/views/DefaultsSettingsView.vue
       :updated-at="configStore.updatedAt"
       :show-reset="true"
       compact
+      :dirty="isDirty"
       @save="handleSave"
       @reset="handleReset"
     >
@@ -38,6 +39,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { NForm, NFormItem, NInputNumber, useMessage } from 'naive-ui'
 import ConfigCard from '@/components/ConfigCard.vue'
 import { useConfigStore } from '@/stores/config'
+import { useDirtyGuard } from '@/composables/useDirtyGuard'
 import { deepClone } from '@/utils/clone'
 import { extractErrorMessage } from '@/utils/error'
 import type { AppConfig, DefaultsConfig } from '@/types'
@@ -47,6 +49,11 @@ const message = useMessage()
 
 const saving = ref(false)
 const initialized = ref(false)
+
+// 脏检测：表单与已保存快照不一致时显示「未保存修改」，离开前弹确认
+const savedSnapshot = ref('')
+const isDirty = computed(() => JSON.stringify(form) !== savedSnapshot.value)
+useDirtyGuard(() => isDirty.value)
 
 const form = reactive<DefaultsConfig>({
   retry: 2,
@@ -70,6 +77,7 @@ function initForm(cfg: AppConfig) {
   const d = cfg.defaults
   form.retry = d.retry
   form.interval_seconds = [d.interval_seconds?.[0] ?? 3, d.interval_seconds?.[1] ?? 8]
+  savedSnapshot.value = JSON.stringify(form)
 }
 
 watch(
@@ -99,6 +107,7 @@ async function handleSave() {
     const next = deepClone(configStore.config)
     next.defaults = { ...form }
     await configStore.save(next)
+    savedSnapshot.value = JSON.stringify(form)
     message.success('全局默认配置已保存')
   } catch (e) {
     message.error(extractErrorMessage(e, '全局默认配置保存失败'))

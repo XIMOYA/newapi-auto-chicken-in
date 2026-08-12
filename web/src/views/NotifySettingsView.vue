@@ -16,6 +16,7 @@ web/src/views/NotifySettingsView.vue
       :updated-at="configStore.updatedAt"
       :show-reset="true"
       compact
+      :dirty="isDirty"
       @save="handleSave"
       @reset="handleReset"
     >
@@ -68,12 +69,13 @@ web/src/views/NotifySettingsView.vue
 </template>
 
 <script setup lang="ts">
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { NForm, NFormItem, NInput, NInputNumber, NSwitch, useMessage } from 'naive-ui'
 import ConfigCard from '@/components/ConfigCard.vue'
 import MaskedInput from '@/components/MaskedInput.vue'
 import DynamicStringList from '@/components/DynamicStringList.vue'
 import { useConfigStore } from '@/stores/config'
+import { useDirtyGuard } from '@/composables/useDirtyGuard'
 import { deepClone } from '@/utils/clone'
 import { extractErrorMessage } from '@/utils/error'
 import type { AppConfig, NotifyEmailConfig } from '@/types'
@@ -84,6 +86,11 @@ const message = useMessage()
 const saving = ref(false)
 const initialized = ref(false)
 const originalPassword = ref('')
+
+// 脏检测：表单与已保存快照不一致时显示「未保存修改」，离开前弹确认
+const savedSnapshot = ref('')
+const isDirty = computed(() => JSON.stringify(form) !== savedSnapshot.value)
+useDirtyGuard(() => isDirty.value)
 
 const form = reactive<NotifyEmailConfig>({
   enabled: false,
@@ -112,6 +119,7 @@ function initForm(cfg: AppConfig) {
   form.subject_prefix = e.subject_prefix
   form.timeout = e.timeout
   originalPassword.value = e.password
+  savedSnapshot.value = JSON.stringify(form)
 }
 
 watch(
@@ -143,6 +151,7 @@ async function handleSave() {
       }
     }
     await configStore.save(next)
+    savedSnapshot.value = JSON.stringify(form)
     message.success('邮件通知配置已保存')
   } catch (e) {
     message.error(extractErrorMessage(e, '邮件通知配置保存失败'))

@@ -15,6 +15,7 @@ web/src/views/AISettingsView.vue
       :updated-at="configStore.updatedAt"
       :show-reset="true"
       compact
+      :dirty="isDirty"
       @save="handleSave"
       @reset="handleReset"
     >
@@ -44,11 +45,12 @@ web/src/views/AISettingsView.vue
 </template>
 
 <script setup lang="ts">
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { NForm, NFormItem, NInput, NInputNumber, NSwitch, useMessage } from 'naive-ui'
 import ConfigCard from '@/components/ConfigCard.vue'
 import MaskedInput from '@/components/MaskedInput.vue'
 import { useConfigStore } from '@/stores/config'
+import { useDirtyGuard } from '@/composables/useDirtyGuard'
 import { deepClone } from '@/utils/clone'
 import { extractErrorMessage } from '@/utils/error'
 import type { AIConfig, AppConfig } from '@/types'
@@ -59,6 +61,11 @@ const message = useMessage()
 const saving = ref(false)
 const initialized = ref(false)
 const originalApiKey = ref('')
+
+// 脏检测：表单与已保存快照不一致时显示「未保存修改」，离开前弹确认
+const savedSnapshot = ref('')
+const isDirty = computed(() => JSON.stringify(form) !== savedSnapshot.value)
+useDirtyGuard(() => isDirty.value)
 
 const form = reactive<AIConfig>({
   enabled: false,
@@ -78,6 +85,7 @@ function initForm(cfg: AppConfig) {
   form.timeout = ai.timeout
   form.max_retries = ai.max_retries
   originalApiKey.value = ai.api_key
+  savedSnapshot.value = JSON.stringify(form)
 }
 
 watch(
@@ -106,6 +114,7 @@ async function handleSave() {
       api_key: form.api_key === '' ? originalApiKey.value : form.api_key
     }
     await configStore.save(next)
+    savedSnapshot.value = JSON.stringify(form)
     message.success('AI 配置已保存')
   } catch (e) {
     message.error(extractErrorMessage(e, 'AI 配置保存失败'))
