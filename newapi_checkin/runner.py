@@ -158,6 +158,7 @@ class Runner:
     def _set_parallelism(self, workers: int) -> None:
         """把传入的并发数写回选项（供 CLI/调度调用方设置）。"""
         self.options.parallelism = max(1, min(8, int(workers)))
+
     def run(self) -> int:
         accounts = self.cfg.select(self.options.account_names)
         if not accounts:
@@ -177,9 +178,43 @@ class Runner:
         log.step(f"开始{mode}，共 {len(accounts)} 个账号")
         workers = self._parallelism()
         if workers <= 1:
-            return self._run_serial(accounts)
-        log.info(f"账号级并行度 {workers}")
-        return self._run_parallel(accounts, workers)
+            exit_code = self._run_serial(accounts)
+        else:
+            log.info(f"账号级并行度 {workers}")
+            exit_code = self._run_parallel(accounts, workers)
+
+        # 邮件通知：无论成败都发；失败只 WARN 不影响退出码
+        self._send_notification()
+        return exit_code
+
+    def _send_notification(self) -> None:
+        """把本轮汇总表以 HTML 邮件发出。未配置/发送失败均降级为 WARN。"""
+        email_cfg = self.cfg.notify.email
+        if not email_cfg.enabled:
+            return
+        try:
+            from .notify import EmailNotifier, beijing_now, build_report_html, build_subject
+
+            date_str = beijing_now().strftime("%Y-%m-%d")
+            beijing_time = beijing_now().strftime("%Y-%m-%d %H:%M")
+            subject = build_subject(
+                email_cfg.subject_prefix, date_str,
+                failed_count=self.summary.failed, dry_run=self.options.dry_run,
+            )
+            html = build_report_html(
+                self.summary.rows,
+                date_str=date_str,
+                run_context="GitHub Actions" if not self.options.manual else "本地/桌面",
+                beijing_time=beijing_time,
+                dry_run=self.options.dry_run,
+            )
+            notifier = EmailNotifier(email_cfg)
+            if notifier.send(subject, html):
+                log.ok(f"结果邮件已发送到 {len(email_cfg.to_addrs)} 个收件人: {subject}")
+            else:
+                log.warn("结果邮件发送失败（已降级，不影响签到结果）")
+        except Exception as exc:  # noqa: BLE001 - 通知绝不能拖垮签到
+            log.warn(f"结果邮件生成异常: {type(exc).__name__}: {exc}")
 
     def _run_serial(self, accounts: list) -> int:
         total = len(accounts)

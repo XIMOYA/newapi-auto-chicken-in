@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 from .secure_config import ConfigEncryptionError, config_key_from_environment, decrypt_file
 from .proxy_pool import ProxyPoolConfig
+from .notify import EmailNotifyConfig
 
 
 def runtime_root() -> Path:
@@ -257,6 +258,19 @@ class Account:
 
 
 @dataclass
+class NotifyConfig:
+    email: EmailNotifyConfig = field(default_factory=EmailNotifyConfig)
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "NotifyConfig":
+        raw = raw if isinstance(raw, dict) else {}
+        return cls(email=EmailNotifyConfig.from_raw(raw.get("email")))
+
+    def to_dict(self) -> dict:
+        return {"email": self.email.to_dict()}
+
+
+@dataclass
 class Config:
     ai: AIConfig = field(default_factory=AIConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
@@ -265,6 +279,7 @@ class Config:
     security: SecurityConfig = field(default_factory=SecurityConfig)
     config_sync: ConfigSyncConfig = field(default_factory=ConfigSyncConfig)
     proxy_pool: ProxyPoolConfig = field(default_factory=ProxyPoolConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
     accounts: list = field(default_factory=list)
     source: Optional[Path] = None
     migrated_from: Optional[Path] = None
@@ -479,6 +494,7 @@ def build_config(raw: dict, source: Optional[Path] = None) -> Config:
     )
     config_sync = ConfigSyncConfig.from_raw(raw.get("config_sync"))
     proxy_pool = ProxyPoolConfig.from_raw(raw.get("proxy_pool"))
+    notify = NotifyConfig.from_raw(raw.get("notify"))
 
     accounts = _build_accounts(raw.get("accounts"), problems)
     if not accounts and not problems:
@@ -487,7 +503,7 @@ def build_config(raw: dict, source: Optional[Path] = None) -> Config:
     cfg = Config(
         ai=ai, browser=browser, http=http, defaults=defaults,
         security=security, config_sync=config_sync, proxy_pool=proxy_pool,
-        accounts=accounts, source=source,
+        notify=notify, accounts=accounts, source=source,
     )
     _apply_env(cfg)
 

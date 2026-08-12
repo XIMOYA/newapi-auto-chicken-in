@@ -21,10 +21,24 @@
     "enabled": false,
     "test_url": "https://api.ipify.org",
     "timeout": 8,
-    "max_workers": 8,
-    "max_proxies": 100,
+    "max_workers": 25,
+    "max_proxies": 250,
     "ip_swap_limit": 2,
     "sources": []
+  },
+  "notify": {
+    "email": {
+      "enabled": false,
+      "smtp_host": "smtp.aliyun.com",
+      "smtp_port": 465,
+      "use_ssl": true,
+      "username": "发件账号@example.com",
+      "password": "SMTP授权码或密码",
+      "from_addr": "发件账号@example.com",
+      "to_addrs": ["收件人1@example.com", "收件人2@example.com"],
+      "subject_prefix": "NewAPI 签到日报",
+      "timeout": 20
+    }
   },
   "ai": {
     "enabled": true,
