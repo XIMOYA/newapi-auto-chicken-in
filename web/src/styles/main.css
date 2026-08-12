@@ -110,14 +110,82 @@ body {
   transform: translateY(8px) scale(0.98);
 }
 .list-leave-active {
-  transition: opacity var(--ncf-dur-fast) var(--ncf-ease-in-out);
+  transition: opacity var(--ncf-dur-fast) var(--ncf-ease-in-out),
+    transform var(--ncf-dur-fast) var(--ncf-ease-in-out);
 }
 .list-leave-to {
   opacity: 0;
+  transform: translateY(-4px);
 }
 .list-move {
   transition: transform var(--ncf-dur-base) var(--ncf-ease-out);
 }
+
+/* 表格行进入：逐行上移淡入（配合 nth-child 延迟形成瀑布） */
+@keyframes row-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.n-data-table tbody tr {
+  animation: row-in 0.3s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+.n-data-table tbody tr:nth-child(1) { animation-delay: 0.02s; }
+.n-data-table tbody tr:nth-child(2) { animation-delay: 0.06s; }
+.n-data-table tbody tr:nth-child(3) { animation-delay: 0.1s; }
+.n-data-table tbody tr:nth-child(4) { animation-delay: 0.14s; }
+.n-data-table tbody tr:nth-child(5) { animation-delay: 0.18s; }
+.n-data-table tbody tr:nth-child(6) { animation-delay: 0.22s; }
+.n-data-table tbody tr:nth-child(7) { animation-delay: 0.26s; }
+.n-data-table tbody tr:nth-child(8) { animation-delay: 0.3s; }
+.n-data-table tbody tr:nth-child(9) { animation-delay: 0.34s; }
+.n-data-table tbody tr:nth-child(10) { animation-delay: 0.38s; }
+
+/* 侧边栏菜单项进入：逐项右移淡入 */
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.n-menu .n-menu-item-content {
+  animation: menu-in 0.3s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+.n-menu .n-menu-item-content:nth-child(1) { animation-delay: 0.03s; }
+.n-menu .n-menu-item-content:nth-child(2) { animation-delay: 0.07s; }
+.n-menu .n-menu-item-content:nth-child(3) { animation-delay: 0.11s; }
+.n-menu .n-menu-item-content:nth-child(4) { animation-delay: 0.15s; }
+.n-menu .n-menu-item-content:nth-child(5) { animation-delay: 0.19s; }
+.n-menu .n-menu-item-content:nth-child(6) { animation-delay: 0.23s; }
+.n-menu .n-menu-item-content:nth-child(7) { animation-delay: 0.27s; }
+.n-menu .n-menu-item-content:nth-child(8) { animation-delay: 0.31s; }
+.n-menu .n-menu-item-content:nth-child(9) { animation-delay: 0.35s; }
+
+/* 设置页表单字段进入：逐项上移淡入 */
+.settings-form .n-form-item {
+  animation: row-in 0.32s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+.settings-form .n-form-item:nth-child(1) { animation-delay: 0.04s; }
+.settings-form .n-form-item:nth-child(2) { animation-delay: 0.09s; }
+.settings-form .n-form-item:nth-child(3) { animation-delay: 0.14s; }
+.settings-form .n-form-item:nth-child(4) { animation-delay: 0.19s; }
+.settings-form .n-form-item:nth-child(5) { animation-delay: 0.24s; }
+.settings-form .n-form-item:nth-child(6) { animation-delay: 0.29s; }
+.settings-form .n-form-item:nth-child(7) { animation-delay: 0.34s; }
+.settings-form .n-form-item:nth-child(8) { animation-delay: 0.39s; }
+.settings-form .n-form-item:nth-child(9) { animation-delay: 0.44s; }
+.settings-form .n-form-item:nth-child(10) { animation-delay: 0.49s; }
+.settings-form .n-form-item:nth-child(11) { animation-delay: 0.54s; }
+.settings-form .n-form-item:nth-child(12) { animation-delay: 0.59s; }
 
 /* 卡片悬浮：轻微上浮 + 阴影增强 */
 .hover-lift {

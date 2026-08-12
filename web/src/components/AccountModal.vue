@@ -14,6 +14,7 @@ web/src/components/AccountModal.vue
     :title="isEdit ? '编辑签到账号' : '新增签到账号'"
     style="width: 640px"
     :mask-closable="false"
+    transition-preset="fade-in-scale-up"
     @update:show="(v: boolean) => emit('update:show', v)"
   >
     <n-form ref="formRef" :model="form" :rules="rules" label-placement="left" :label-width="110">

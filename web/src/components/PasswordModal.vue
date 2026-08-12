@@ -11,6 +11,7 @@ web/src/components/PasswordModal.vue
     title="修改密码"
     style="width: 460px"
     :mask-closable="false"
+    transition-preset="fade-in-scale-up"
     @update:show="(v: boolean) => emit('update:show', v)"
   >
     <n-form ref="formRef" :model="form" :rules="rules" label-placement="left" :label-width="90">

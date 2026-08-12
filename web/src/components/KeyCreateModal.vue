@@ -14,6 +14,7 @@ web/src/components/KeyCreateModal.vue
     :title="createdKey ? 'API Key 创建成功' : '创建 API Key'"
     style="width: 560px"
     :mask-closable="false"
+    transition-preset="fade-in-scale-up"
     @update:show="handleClose"
   >
     <n-form v-if="!createdKey" ref="formRef" :model="form" :rules="rules" label-placement="left" :label-width="90">
