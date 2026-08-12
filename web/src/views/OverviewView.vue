@@ -1,0 +1,422 @@
+<!--
+web/src/views/OverviewView.vue
+页面：配置总览
+职责：
+- 顶部统计卡：账号总数 / 启用数 / 代理池开关 / 邮件通知开关
+- 账号管理表格：多选、启停开关、打码 Cookie、手动隧道、编辑/删除
+- 新增/编辑账号弹窗；批量启用/停用/删除（带确认）
+数据来源：GET /api/config（经 config store）、PUT /api/config（保存）
+-->
+<template>
+  <div class="overview">
+    <!-- 统计卡 -->
+    <n-grid :cols="4" :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
+      <n-grid-item span="4 s:2 m:1">
+        <n-card :bordered="false" class="stat-card">
+          <div class="stat-inner">
+            <div class="stat-icon" style="background: #e8f0ff; color: #1e5eff"><n-icon size="22"><people-outline /></n-icon></div>
+            <div class="stat-meta">
+              <div class="stat-label">账号总数</div>
+              <div class="stat-value">{{ accountCount }}</div>
+            </div>
+          </div>
+        </n-card>
+      </n-grid-item>
+      <n-grid-item span="4 s:2 m:1">
+        <n-card :bordered="false" class="stat-card">
+          <div class="stat-inner">
+            <div class="stat-icon" style="background: #e8f9ef; color: #18a058"><n-icon size="22"><checkmark-circle-outline /></n-icon></div>
+            <div class="stat-meta">
+              <div class="stat-label">启用中</div>
+              <div class="stat-value">{{ enabledCount }}</div>
+            </div>
+          </div>
+        </n-card>
+      </n-grid-item>
+      <n-grid-item span="4 s:2 m:1">
+        <n-card :bordered="false" class="stat-card">
+          <div class="stat-inner">
+            <div class="stat-icon" style="background: #fdf3e7; color: #f0a020"><n-icon size="22"><layers-outline /></n-icon></div>
+            <div class="stat-meta">
+              <div class="stat-label">代理池开关</div>
+              <div class="stat-value">
+                <n-tag :type="proxyPoolEnabled ? 'success' : 'default'" :bordered="false" size="small">
+                  {{ proxyPoolEnabled ? '已启用' : '已停用' }}
+                </n-tag>
+              </div>
+            </div>
+          </div>
+        </n-card>
+      </n-grid-item>
+      <n-grid-item span="4 s:2 m:1">
+        <n-card :bordered="false" class="stat-card">
+          <div class="stat-inner">
+            <div class="stat-icon" style="background: #f0ecfe; color: #7c5cf0"><n-icon size="22"><mail-outline /></n-icon></div>
+            <div class="stat-meta">
+              <div class="stat-label">邮件通知开关</div>
+              <div class="stat-value">
+                <n-tag :type="notifyEnabled ? 'success' : 'default'" :bordered="false" size="small">
+                  {{ notifyEnabled ? '已启用' : '已停用' }}
+                </n-tag>
+              </div>
+            </div>
+          </div>
+        </n-card>
+      </n-grid-item>
+    </n-grid>
+
+    <!-- 账号管理 -->
+    <n-card :bordered="false" class="accounts-card">
+      <template #header>
+        <div class="card-header">
+          <div class="card-title">
+            签到账号
+            <n-tag v-if="selectedKeys.length" size="small" type="primary" :bordered="false">已选 {{ selectedKeys.length }} 项</n-tag>
+          </div>
+        </div>
+      </template>
+
+      <template #header-extra>
+        <n-space :size="8">
+          <n-button size="small" :disabled="!selectedKeys.length" :loading="saving" @click="batchToggle(true)">
+            批量启用
+          </n-button>
+          <n-button size="small" :disabled="!selectedKeys.length" :loading="saving" @click="batchToggle(false)">
+            批量停用
+          </n-button>
+          <n-button size="small" type="error" :disabled="!selectedKeys.length" :loading="saving" @click="batchDelete">
+            批量删除
+          </n-button>
+          <n-button size="small" type="primary" @click="openCreateModal">
+            <template #icon><n-icon><add-outline /></n-icon></template>
+            新增账号
+          </n-button>
+        </n-space>
+      </template>
+
+      <n-data-table
+        :columns="columns"
+        :data="tableData"
+        :loading="configStore.loading || saving"
+        :row-key="(row: AccountRow) => row._index"
+        v-model:selected-row-keys="selectedKeys"
+        :pagination="pagination"
+        striped
+        :bordered="false"
+        size="small"
+        :scroll-x="980"
+      />
+      <n-empty v-if="!configStore.loading && !accounts.length" class="table-empty" description="暂无签到账号，点击右上角「新增账号」开始添加" />
+    </n-card>
+
+    <account-modal v-model:show="modalVisible" :account="editingAccount" :submitting="submitting" @submit="handleAccountSubmit" />
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, h, ref } from 'vue'
+import {
+  NGrid, NGridItem, NCard, NIcon, NButton, NSpace, NDataTable, NTag, NSwitch, NEmpty,
+  useDialog, useMessage, type DataTableColumns, type PaginationProps
+} from 'naive-ui'
+import {
+  PeopleOutline, CheckmarkCircleOutline, LayersOutline, MailOutline, AddOutline,
+  EyeOutline, CreateOutline, TrashOutline
+} from '@vicons/ionicons5'
+import AccountModal from '@/components/AccountModal.vue'
+import { useConfigStore } from '@/stores/config'
+import { deepClone } from '@/utils/clone'
+import { extractErrorMessage } from '@/utils/error'
+import type { Account } from '@/types'
+
+interface AccountRow extends Account {
+  _index: number
+}
+
+const configStore = useConfigStore()
+const dialog = useDialog()
+const message = useMessage()
+
+const accounts = computed<Account[]>(() => configStore.config?.accounts ?? [])
+const accountCount = computed(() => accounts.value.length)
+const enabledCount = computed(() => accounts.value.filter((a) => a.enabled).length)
+const proxyPoolEnabled = computed(() => !!configStore.config?.proxy_pool?.enabled)
+const notifyEnabled = computed(() => !!configStore.config?.notify?.email?.enabled)
+
+const tableData = computed<AccountRow[]>(() => accounts.value.map((a, i) => ({ ...a, _index: i })))
+
+const selectedKeys = ref<number[]>([])
+const saving = ref(false)
+const modalVisible = ref(false)
+const submitting = ref(false)
+const editingAccount = ref<Account | null>(null)
+/** 编辑时对应的账号索引（-1 表示新增） */
+const editingIndex = ref(-1)
+
+const pagination: PaginationProps = { pageSize: 10, showSizePicker: true, pageSizes: [10, 20, 50] }
+
+function viewCookie(row: AccountRow) {
+  if (row.cookie === '' || row.cookie == null) {
+    message.info(`账号「${row.name}」未设置 Cookie`)
+    return
+  }
+  // 契约 §3：非空 Cookie 后端只返回 "***"，明文不回传
+  message.info(`账号「${row.name}」的 Cookie 已设置。出于安全原因，接口不回传明文 Cookie，如需更新请在编辑弹窗中输入新值。`)
+}
+
+function toggleEnabled(row: AccountRow, value: boolean) {
+  const target = accounts.value[row._index]
+  if (!target) return
+  target.enabled = value
+  persistAccounts(`${value ? '启用' : '停用'}账号「${row.name}」`)
+}
+
+const columns: DataTableColumns<AccountRow> = [
+  { type: 'selection', width: 44, fixed: 'left' },
+  { title: '名称', key: 'name', width: 130, fixed: 'left', ellipsis: { tooltip: true } },
+  {
+    title: '站点 URL',
+    key: 'url',
+    width: 210,
+    render: (row) =>
+      h('a', { href: row.url, target: '_blank', rel: 'noopener', class: 'url-link' }, row.url)
+  },
+  {
+    title: '启用',
+    key: 'enabled',
+    width: 84,
+    render: (row) =>
+      h(NSwitch, {
+        value: row.enabled,
+        size: 'small',
+        onUpdateValue: (v: boolean) => toggleEnabled(row, v)
+      })
+  },
+  {
+    title: '手动隧道(proxy)',
+    key: 'proxy',
+    width: 200,
+    ellipsis: { tooltip: true },
+    render: (row) => (row.proxy ? h('span', { class: 'mono-inline' }, row.proxy) : h('span', { class: 'muted' }, '未设置'))
+  },
+  {
+    title: 'Cookie',
+    key: 'cookie',
+    width: 190,
+    render: (row) => {
+      const text = row.cookie === '***' ? '***（已设置）' : row.cookie ? '已设置' : '未设置'
+      return h('div', { class: 'cookie-cell' }, [
+        h('span', { class: row.cookie ? 'cookie-masked' : 'muted' }, text),
+        h(
+          NButton,
+          { size: 'tiny', quaternary: true, circle: true, type: 'info', onClick: () => viewCookie(row), class: 'view-cookie-btn' },
+          { icon: () => h(NIcon, null, { default: () => h(EyeOutline) }) }
+        )
+      ])
+    }
+  },
+  {
+    title: '操作',
+    key: 'actions',
+    width: 140,
+    fixed: 'right',
+    render: (row) =>
+      h('div', { class: 'table-actions' }, [
+        h(
+          NButton,
+          { size: 'tiny', type: 'primary', secondary: true, onClick: () => openEditModal(row) },
+          { icon: () => h(NIcon, null, { default: () => h(CreateOutline) }), default: () => '编辑' }
+        ),
+        h(
+          NButton,
+          { size: 'tiny', type: 'error', secondary: true, onClick: () => confirmDelete(row) },
+          { icon: () => h(NIcon, null, { default: () => h(TrashOutline) }), default: () => '删除' }
+        )
+      ])
+  }
+]
+
+function openCreateModal() {
+  editingAccount.value = null
+  editingIndex.value = -1
+  modalVisible.value = true
+}
+
+function openEditModal(row: AccountRow) {
+  editingAccount.value = deepClone(row)
+  editingIndex.value = row._index
+  modalVisible.value = true
+}
+
+async function handleAccountSubmit(payload: Account) {
+  submitting.value = true
+  try {
+    if (editingIndex.value >= 0 && accounts.value[editingIndex.value]) {
+      // 编辑：按索引替换
+      accounts.value[editingIndex.value] = payload
+    } else {
+      // 新增
+      accounts.value.push(payload)
+    }
+    await persistAccounts(editingIndex.value >= 0 ? `账号「${payload.name}」已更新` : `账号「${payload.name}」已添加`)
+    modalVisible.value = false
+  } finally {
+    submitting.value = false
+  }
+}
+
+function confirmDelete(row: AccountRow) {
+  dialog.warning({
+    title: '删除账号',
+    content: `确定要删除签到账号「${row.name}」吗？该操作不可恢复。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: () => {
+      accounts.value.splice(row._index, 1)
+      selectedKeys.value = []
+      persistAccounts(`账号「${row.name}」已删除`)
+    }
+  })
+}
+
+function batchToggle(enable: boolean) {
+  if (!selectedKeys.value.length) return
+  const action = enable ? '启用' : '停用'
+  dialog.info({
+    title: `批量${action}`,
+    content: `确定要对选中的 ${selectedKeys.value.length} 个账号执行批量${action}吗？`,
+    positiveText: action,
+    negativeText: '取消',
+    onPositiveClick: () => {
+      selectedKeys.value.forEach((i) => {
+        if (accounts.value[i]) accounts.value[i].enabled = enable
+      })
+      const count = selectedKeys.value.length
+      selectedKeys.value = []
+      persistAccounts(`已批量${action} ${count} 个账号`)
+    }
+  })
+}
+
+function batchDelete() {
+  if (!selectedKeys.value.length) return
+  dialog.warning({
+    title: '批量删除',
+    content: `确定要删除选中的 ${selectedKeys.value.length} 个账号吗？该操作不可恢复。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: () => {
+      const indexes = [...selectedKeys.value].sort((a, b) => b - a)
+      indexes.forEach((i) => {
+        if (accounts.value[i]) accounts.value.splice(i, 1)
+      })
+      const count = indexes.length
+      selectedKeys.value = []
+      persistAccounts(`已批量删除 ${count} 个账号`)
+    }
+  })
+}
+
+async function persistAccounts(successTip?: string) {
+  if (!configStore.config) return
+  saving.value = true
+  try {
+    const next = deepClone(configStore.config)
+    await configStore.save(next)
+    if (successTip) message.success(successTip)
+  } catch (e) {
+    message.error(extractErrorMessage(e, '账号配置保存失败'))
+  } finally {
+    saving.value = false
+  }
+}
+</script>
+
+<style scoped>
+.overview {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 1200px;
+}
+
+.stat-card {
+  background: #fff;
+}
+
+.stat-inner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.stat-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stat-label {
+  font-size: 13px;
+  color: #8492a6;
+}
+
+.stat-value {
+  font-size: 24px;
+  font-weight: 700;
+  color: #1f2d3d;
+  line-height: 1.2;
+}
+
+.accounts-card {
+  background: #fff;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 16px;
+  font-weight: 600;
+  color: #1f2d3d;
+}
+
+.url-link {
+  color: #1e5eff;
+  text-decoration: none;
+}
+.url-link:hover {
+  text-decoration: underline;
+}
+
+.cookie-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cookie-masked {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  color: #48566a;
+}
+
+.muted {
+  color: #a3aec0;
+}
+
+.mono-inline {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  color: #48566a;
+}
+
+.table-empty {
+  padding: 40px 0;
+}
+</style>

@@ -1,0 +1,73 @@
+/* web/src/styles/main.css 全局样式 */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  background-color: #f0f2f7;
+  color: #1f2d3d;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 页面通用容器 */
+.page-container {
+  max-width: 1080px;
+}
+
+/* 统计卡片图标 */
+.stat-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  font-size: 22px;
+}
+
+/* 表格操作按钮间距 */
+.table-actions .n-button + .n-button {
+  margin-left: 8px;
+}
+
+/* 表单卡片间距 */
+.config-card + .config-card {
+  margin-top: 16px;
+}
+
+/* 滚动条美化 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #c3cbdc;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #a4aec7;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 打码字段提示 */
+.masked-tip {
+  margin-top: 6px;
+}
+
+/* 导出页等大文本区 */
+.mono-text {
+  font-family: 'JetBrains Mono', 'Consolas', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
