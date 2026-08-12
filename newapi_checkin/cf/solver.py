@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -148,20 +149,25 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
     if result is not None and result.kind == api.TURNSTILE_REQUIRED:
         # New API 的 Turnstile 中间件要求把当前 widget 生成的 token 放到
         # ?turnstile=...；token 是短时、一次性的，只在当前浏览器上下文立即使用。
-        clicked = driver.click_turnstile()
-        if not clicked and ai is not None:
-            clicked = _click_turnstile_with_ai(driver, ai)
-        if clicked:
-            log.debug("检测到站点要求 Turnstile，已尝试点击当前页面 widget")
-
-        wait = MANUAL_TIMEOUT if getattr(options, "manual", False) else cfg.browser.timeout
         token = driver.turnstile_token()
-        if not token and not clicked:
+        if not token:
+            # 页面上可能已有 Turnstile 组件（业务页或质询残留），先尝试直接点击
+            clicked = driver.click_turnstile()
+            if not clicked and ai is not None:
+                clicked = _click_turnstile_with_ai(driver, ai)
+            if clicked:
+                log.debug("检测到站点要求 Turnstile，已尝试点击当前页面 widget")
+            token = driver.turnstile_token()
+        if not token:
+            # 业务页面上通常没有 Turnstile（签到接口才要求），从站点状态接口读
+            # 公开 site key 后挂载官方 widget，再由交互循环主动应对质询。
             site_key = _turnstile_site_key(driver, account)
             if site_key and driver.mount_turnstile(site_key):
-                log.debug("已在当前页面挂载官方 Turnstile widget，等待真实 token")
+                log.debug("已在当前页面挂载官方 Turnstile widget，开始交互等待 token")
+
+        wait = MANUAL_TIMEOUT if getattr(options, "manual", False) else cfg.browser.timeout
         if not token:
-            token = driver.wait_for_turnstile_token(timeout=wait)
+            token = _wait_turnstile_token_interactive(driver, ai, wait)
         if token:
             result = _checkin_in_page(driver, account, token)
         else:
@@ -172,9 +178,9 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
                 )
             else:
                 detail = (
-                    "站点要求 Turnstile token，但无图形模式下当前页面没有生成有效 token；"
-                    "纯命令行不能人工完成验证，请使用站点 API/白名单，或在有交互桌面的"
-                    " --manual 模式完成一次验证后复用 profile"
+                    "站点要求 Turnstile token，但无图形模式下等待后没有生成有效 token；"
+                    "Turnstile 判定当前环境（数据中心 IP）不可信，进入交互质询且未能自动通过；"
+                    "可尝试给该账号配置住宅代理，或联系站点管理员关闭该要求"
                 )
             return SolveOutcome(False, "S4", cf=cf, api_result=result, detail=detail)
 
@@ -367,6 +373,59 @@ def _with_turnstile(path: str, token: Optional[str]) -> str:
              if key.lower() != "turnstile"]
     query.append(("turnstile", token))
     return urlunsplit(("", "", parts.path, urlencode(query), parts.fragment))
+
+
+def _wait_turnstile_token_interactive(driver: BrowserDriver, ai, timeout: int) -> str:
+    """交互式等待 Turnstile token，而不是干等。
+
+    Turnstile 在无头浏览器 + 数据中心 IP 下常进入交互式质询（勾选框/图片点选），
+    只调用 wait_for_turnstile_token 干等永远拿不到 token。这里循环地：
+      1. 轮询 token（官方 widget 自解时会回填）；
+      2. 节流点击复选框（幂等：已通过时点击无害，未通过时是必经第一步）；
+      3. 截图让 AI 判断是否出现图片点选质询并代为点选。
+    """
+    deadline = time.time() + max(1.0, float(timeout))
+    last_click = 0.0
+    grid_attempts = 0
+    while True:
+        token = driver.turnstile_token()
+        if token:
+            log.debug(f"已获得 Turnstile token（长度 {len(token)}，内容不打印）")
+            return token
+        if time.time() >= deadline:
+            return ""
+
+        # 1) 节流点击复选框（每 2.5s 最多一次）
+        now_ts = time.time()
+        if now_ts - last_click >= 2.5 and driver.find_element_box(TURNSTILE_SELECTORS):
+            if driver.click_turnstile():
+                last_click = now_ts
+                log.debug("已点击 Turnstile 复选框，等待自解")
+                time.sleep(1.2)
+                token = driver.turnstile_token()
+                if token:
+                    return token
+
+        # 2) AI 应对图片点选质询（最多 3 轮，避免烧太多视觉 token）
+        if ai is not None and grid_attempts < 3:
+            width, height = driver.viewport()
+            shot = driver.screenshot()
+            if shot:
+                points = ai.locate_grid(shot, width, height, "题目要求点选的所有图块")
+                if points:
+                    grid_attempts += 1
+                    clicked = 0
+                    for nx, ny in points[:9]:
+                        if driver.click_at(nx * width, ny * height):
+                            clicked += 1
+                    if clicked:
+                        log.info(f"AI 点选了 {clicked} 个图块，继续等待 token")
+                        time.sleep(2.0)
+                        token = driver.turnstile_token()
+                        if token:
+                            return token
+        time.sleep(1.0)
+    return ""
 
 
 def _turnstile_site_key(driver: BrowserDriver, account: Account) -> Optional[str]:
