@@ -11,7 +11,12 @@ web/src/App.vue
       <n-dialog-provider>
         <n-notification-provider>
           <n-loading-bar-provider>
-            <router-view />
+            <!-- 路由切换：上移淡入过渡（2 段移动，方向一致） -->
+            <router-view v-slot="{ Component }">
+              <transition name="fade-slide" mode="out-in" appear>
+                <component :is="Component" />
+              </transition>
+            </router-view>
           </n-loading-bar-provider>
         </n-notification-provider>
       </n-dialog-provider>

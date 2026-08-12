@@ -3,6 +3,14 @@
   box-sizing: border-box;
 }
 
+/* ===== 动效令牌（尊重系统减弱动效偏好）===== */
+:root {
+  --ncf-dur-fast: 0.18s;
+  --ncf-dur-base: 0.28s;
+  --ncf-ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ncf-ease-in-out: cubic-bezier(0.65, 0.05, 0.36, 1);
+}
+
 html,
 body,
 #app {
@@ -70,4 +78,81 @@ body {
   font-family: 'JetBrains Mono', 'Consolas', 'Courier New', monospace;
   font-size: 12px;
   line-height: 1.6;
+}
+
+/* ===== 通用动效 ===== */
+
+/* 卡片进入：上移 + 淡入 */
+.fade-slide-enter-active {
+  transition: opacity var(--ncf-dur-base) var(--ncf-ease-out),
+    transform var(--ncf-dur-base) var(--ncf-ease-out);
+}
+.fade-slide-enter-from {
+  opacity: 0;
+  transform: translateY(10px);
+}
+.fade-slide-leave-active {
+  transition: opacity var(--ncf-dur-fast) var(--ncf-ease-out),
+    transform var(--ncf-dur-fast) var(--ncf-ease-out);
+}
+.fade-slide-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+
+/* 列表逐项进入：间距 + 缩放淡入 */
+.list-enter-active {
+  transition: opacity var(--ncf-dur-base) var(--ncf-ease-out),
+    transform var(--ncf-dur-base) var(--ncf-ease-out);
+}
+.list-enter-from {
+  opacity: 0;
+  transform: translateY(8px) scale(0.98);
+}
+.list-leave-active {
+  transition: opacity var(--ncf-dur-fast) var(--ncf-ease-in-out);
+}
+.list-leave-to {
+  opacity: 0;
+}
+.list-move {
+  transition: transform var(--ncf-dur-base) var(--ncf-ease-out);
+}
+
+/* 卡片悬浮：轻微上浮 + 阴影增强 */
+.hover-lift {
+  transition: transform var(--ncf-dur-base) var(--ncf-ease-out),
+    box-shadow var(--ncf-dur-base) var(--ncf-ease-out);
+}
+.hover-lift:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 10px 28px rgba(30, 58, 138, 0.12);
+}
+
+/* 按钮按压反馈 */
+.press-scale:active {
+  transform: scale(0.97);
+  transition: transform var(--ncf-dur-fast) var(--ncf-ease-out);
+}
+
+/* 数字变化：小幅放大淡入 */
+.pop-number-enter-active {
+  transition: opacity var(--ncf-dur-base) var(--ncf-ease-out),
+    transform var(--ncf-dur-base) var(--ncf-ease-out);
+}
+.pop-number-enter-from {
+  opacity: 0;
+  transform: scale(1.25);
+}
+
+/* 尊重系统「减弱动效」偏好：一律禁用动画 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

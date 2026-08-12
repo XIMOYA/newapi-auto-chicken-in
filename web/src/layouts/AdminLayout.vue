@@ -19,7 +19,9 @@ web/src/layouts/AdminLayout.vue
       class="admin-sider"
     >
       <div class="brand" :class="{ 'brand--collapsed': collapsed }">
-        <n-icon size="26" class="brand-icon"><rocket-outline /></n-icon>
+        <transition name="pop-number" appear>
+          <n-icon size="26" class="brand-icon"><rocket-outline /></n-icon>
+        </transition>
         <transition name="fade">
           <div v-if="!collapsed" class="brand-text">
             <div class="brand-title">NewAPI 签到</div>
@@ -66,8 +68,7 @@ web/src/layouts/AdminLayout.vue
           <n-spin size="large" />
           <div class="loading-text">正在加载配置…</div>
         </div>
-      </n-layout-content>
-    </n-layout>
+      </n-layout-content>    </n-layout>
   </n-layout>
 
   <password-modal v-model:show="passwordModalVisible" />

@@ -10,29 +10,35 @@ web/src/views/LoginView.vue
   <div class="login-page">
     <div class="login-bg"></div>
     <div class="login-card">
-      <div class="login-brand">
-        <n-icon size="40" class="brand-icon"><rocket-outline /></n-icon>
-        <h1 class="brand-title">NewAPI 签到</h1>
-        <p class="brand-sub">配置管理平台</p>
-      </div>
+      <transition name="fade-slide" appear>
+        <div class="login-card-inner">
+          <div class="login-brand">
+            <transition name="pop-number" appear>
+              <n-icon size="40" class="brand-icon"><rocket-outline /></n-icon>
+            </transition>
+            <h1 class="brand-title">NewAPI 签到</h1>
+            <p class="brand-sub">配置管理平台</p>
+          </div>
 
-      <n-form ref="formRef" :model="form" :rules="rules" size="large" @keydown.enter.prevent="handleLogin">
-        <n-form-item path="username" :show-label="false">
-          <n-input v-model:value="form.username" placeholder="用户名" :disabled="loading" autocomplete="username">
-            <template #prefix><n-icon><person-outline /></n-icon></template>
-          </n-input>
-        </n-form-item>
-        <n-form-item path="password" :show-label="false">
-          <n-input v-model:value="form.password" type="password" show-password-on="click" placeholder="密码" :disabled="loading" autocomplete="current-password">
-            <template #prefix><n-icon><lock-closed-outline /></n-icon></template>
-          </n-input>
-        </n-form-item>
-        <n-button type="primary" block size="large" :loading="loading" class="login-btn" @click="handleLogin">
-          登 录
-        </n-button>
-      </n-form>
+          <n-form ref="formRef" :model="form" :rules="rules" size="large" @keydown.enter.prevent="handleLogin">
+            <n-form-item path="username" :show-label="false">
+              <n-input v-model:value="form.username" placeholder="用户名" :disabled="loading" autocomplete="username">
+                <template #prefix><n-icon><person-outline /></n-icon></template>
+              </n-input>
+            </n-form-item>
+            <n-form-item path="password" :show-label="false">
+              <n-input v-model:value="form.password" type="password" show-password-on="click" placeholder="密码" :disabled="loading" autocomplete="current-password">
+                <template #prefix><n-icon><lock-closed-outline /></n-icon></template>
+              </n-input>
+            </n-form-item>
+            <n-button type="primary" block size="large" :loading="loading" class="login-btn press-scale" @click="handleLogin">
+              登 录
+            </n-button>
+          </n-form>
 
-      <p class="login-tip">默认账号见后端配置，登录后请及时修改默认密码</p>
+          <p class="login-tip">默认账号见后端配置，登录后请及时修改默认密码</p>
+        </div>
+      </transition>
     </div>
   </div>
 </template>
@@ -112,6 +118,10 @@ async function handleLogin() {
   background: rgba(255, 255, 255, 0.97);
   border-radius: 14px;
   box-shadow: 0 24px 60px rgba(6, 18, 48, 0.45);
+}
+
+.login-card-inner {
+  width: 100%;
 }
 
 .login-brand {

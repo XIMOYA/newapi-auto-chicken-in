@@ -11,57 +11,22 @@ web/src/views/OverviewView.vue
   <div class="overview">
     <!-- 统计卡 -->
     <n-grid :cols="4" :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
-      <n-grid-item span="4 s:2 m:1">
-        <n-card :bordered="false" class="stat-card">
-          <div class="stat-inner">
-            <div class="stat-icon" style="background: #e8f0ff; color: #1e5eff"><n-icon size="22"><people-outline /></n-icon></div>
-            <div class="stat-meta">
-              <div class="stat-label">账号总数</div>
-              <div class="stat-value">{{ accountCount }}</div>
-            </div>
-          </div>
-        </n-card>
-      </n-grid-item>
-      <n-grid-item span="4 s:2 m:1">
-        <n-card :bordered="false" class="stat-card">
-          <div class="stat-inner">
-            <div class="stat-icon" style="background: #e8f9ef; color: #18a058"><n-icon size="22"><checkmark-circle-outline /></n-icon></div>
-            <div class="stat-meta">
-              <div class="stat-label">启用中</div>
-              <div class="stat-value">{{ enabledCount }}</div>
-            </div>
-          </div>
-        </n-card>
-      </n-grid-item>
-      <n-grid-item span="4 s:2 m:1">
-        <n-card :bordered="false" class="stat-card">
-          <div class="stat-inner">
-            <div class="stat-icon" style="background: #fdf3e7; color: #f0a020"><n-icon size="22"><layers-outline /></n-icon></div>
-            <div class="stat-meta">
-              <div class="stat-label">代理池开关</div>
-              <div class="stat-value">
-                <n-tag :type="proxyPoolEnabled ? 'success' : 'default'" :bordered="false" size="small">
-                  {{ proxyPoolEnabled ? '已启用' : '已停用' }}
-                </n-tag>
+      <n-grid-item v-for="card in statCards" :key="card.label" span="4 s:2 m:1">
+        <transition name="fade-slide" appear>
+          <n-card :bordered="false" class="stat-card hover-lift">
+            <div class="stat-inner">
+              <div class="stat-icon" :style="{ background: card.iconBg, color: card.iconColor }">
+                <n-icon size="22"><component :is="card.icon" /></n-icon>
+              </div>
+              <div class="stat-meta">
+                <div class="stat-label">{{ card.label }}</div>
+                <transition name="pop-number" appear>
+                  <div class="stat-value" :key="card.value">{{ card.value }}</div>
+                </transition>
               </div>
             </div>
-          </div>
-        </n-card>
-      </n-grid-item>
-      <n-grid-item span="4 s:2 m:1">
-        <n-card :bordered="false" class="stat-card">
-          <div class="stat-inner">
-            <div class="stat-icon" style="background: #f0ecfe; color: #7c5cf0"><n-icon size="22"><mail-outline /></n-icon></div>
-            <div class="stat-meta">
-              <div class="stat-label">邮件通知开关</div>
-              <div class="stat-value">
-                <n-tag :type="notifyEnabled ? 'success' : 'default'" :bordered="false" size="small">
-                  {{ notifyEnabled ? '已启用' : '已停用' }}
-                </n-tag>
-              </div>
-            </div>
-          </div>
-        </n-card>
+          </n-card>
+        </transition>
       </n-grid-item>
     </n-grid>
 
@@ -149,6 +114,38 @@ const accountCount = computed(() => accounts.value.length)
 const enabledCount = computed(() => accounts.value.filter((a) => a.enabled).length)
 const proxyPoolEnabled = computed(() => !!configStore.config?.proxy_pool?.enabled)
 const notifyEnabled = computed(() => !!configStore.config?.notify?.email?.enabled)
+
+/** 统计卡数据（含图标与配色），配合 v-for 渲染 + 进入动画 */
+const statCards = computed(() => [
+  {
+    label: '账号总数',
+    value: accountCount.value,
+    icon: PeopleOutline,
+    iconBg: '#e8f0ff',
+    iconColor: '#1e5eff'
+  },
+  {
+    label: '启用中',
+    value: enabledCount.value,
+    icon: CheckmarkCircleOutline,
+    iconBg: '#e8f9ef',
+    iconColor: '#18a058'
+  },
+  {
+    label: '代理池开关',
+    value: proxyPoolEnabled.value ? '已启用' : '已停用',
+    icon: LayersOutline,
+    iconBg: '#fdf3e7',
+    iconColor: '#f0a020'
+  },
+  {
+    label: '邮件通知开关',
+    value: notifyEnabled.value ? '已启用' : '已停用',
+    icon: MailOutline,
+    iconBg: '#f0ecfe',
+    iconColor: '#7c5cf0'
+  }
+])
 
 const tableData = computed<AccountRow[]>(() => accounts.value.map((a, i) => ({ ...a, _index: i })))
 
@@ -349,6 +346,14 @@ async function persistAccounts(successTip?: string) {
 
 .stat-card {
   background: #fff;
+}
+
+.stat-card.hover-lift {
+  transition: transform 0.28s cubic-bezier(0.22, 0.61, 0.36, 1), box-shadow 0.28s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.stat-card.hover-lift:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 10px 28px rgba(30, 58, 138, 0.12);
 }
 
 .stat-inner {
