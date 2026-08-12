@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .secure_config import ConfigEncryptionError, config_key_from_environment, decrypt_file
+from .proxy_pool import ProxyPoolConfig
 
 
 def runtime_root() -> Path:
@@ -263,6 +264,7 @@ class Config:
     defaults: Defaults = field(default_factory=Defaults)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     config_sync: ConfigSyncConfig = field(default_factory=ConfigSyncConfig)
+    proxy_pool: ProxyPoolConfig = field(default_factory=ProxyPoolConfig)
     accounts: list = field(default_factory=list)
     source: Optional[Path] = None
     migrated_from: Optional[Path] = None
@@ -476,6 +478,7 @@ def build_config(raw: dict, source: Optional[Path] = None) -> Config:
         interval_seconds=interval,
     )
     config_sync = ConfigSyncConfig.from_raw(raw.get("config_sync"))
+    proxy_pool = ProxyPoolConfig.from_raw(raw.get("proxy_pool"))
 
     accounts = _build_accounts(raw.get("accounts"), problems)
     if not accounts and not problems:
@@ -483,7 +486,8 @@ def build_config(raw: dict, source: Optional[Path] = None) -> Config:
 
     cfg = Config(
         ai=ai, browser=browser, http=http, defaults=defaults,
-        security=security, config_sync=config_sync, accounts=accounts, source=source,
+        security=security, config_sync=config_sync, proxy_pool=proxy_pool,
+        accounts=accounts, source=source,
     )
     _apply_env(cfg)
 

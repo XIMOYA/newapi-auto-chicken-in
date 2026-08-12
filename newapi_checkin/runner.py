@@ -55,10 +55,63 @@ class Runner:
         self._ip_cache: dict = {}
         self._ai = None
         self._ai_ready = False
+        self._pool = None
+        # 记录「由代理池分配」的代理：手动配置的代理出错时不换，池分配的才换
+        self._pooled_proxies: dict[str, str] = {}
 
     # ------------------------------------------------------------------ #
     # 懒加载资源
     # ------------------------------------------------------------------ #
+
+    def init_proxy_pool(self, desired: Optional[int] = None) -> None:
+        """抓取并测通代理池。失败/为空时降级直连，绝不中断签到。"""
+        if not self.cfg.proxy_pool.enabled:
+            log.debug("代理池未启用（proxy_pool.enabled=false）")
+            return
+        try:
+            from .proxy_pool import ProxyPool
+
+            self._pool = ProxyPool(self.cfg.proxy_pool)
+            count = self._pool.refresh(desired=desired)
+            if count:
+                log.ok(f"代理池就绪: {count} 个可用代理")
+            else:
+                log.warn(f"代理池为空，本次签到降级直连: {self._pool.last_error}")
+        except Exception as exc:  # noqa: BLE001 - 代理池是可降级项，绝不能中断签到
+            log.warn(f"代理池初始化失败，降级直连: {type(exc).__name__}: {exc}")
+            self._pool = None
+
+    def _assign_proxy(self, account: Account) -> None:
+        """给账号分配代理。手动配置的优先；否则从池随机取（一个账号一个 IP）。"""
+        if account.proxy:
+            return
+        if self._pool is None:
+            return
+        proxy = self._pool.acquire()
+        if proxy:
+            account.proxy = proxy
+            self._pooled_proxies[account.name] = proxy
+            log.debug(f"账号 {account.name} 已分配代理 {proxy}")
+        else:
+            log.warn(f"账号 {account.name} 未分配到代理，降级直连")
+
+    def _swap_proxy(self, account: Account) -> Optional[str]:
+        """目标站点连不上时换一个新代理；返回 None 表示没得换（降级直连）。"""
+        if self._pool is None:
+            return None
+        old = self._pooled_proxies.get(account.name)
+        if old:
+            self._pool.mark_bad(old)
+        self._pooled_proxies.pop(account.name, None)
+        account.proxy = None
+        proxy = self._pool.acquire()
+        if proxy:
+            account.proxy = proxy
+            self._pooled_proxies[account.name] = proxy
+            log.warn(f"账号 {account.name} 代理 {old or '<手动>'} 连目标站点失败，换用 {proxy}")
+            return proxy
+        log.warn(f"账号 {account.name} 代理连目标站点失败且池无剩余，降级直连")
+        return None
 
     def exit_ip(self, proxy: Optional[str]) -> Optional[str]:
         key = proxy or ""
@@ -107,6 +160,9 @@ class Runner:
         if not accounts:
             log.warn("没有启用的账号（检查 accounts[].enabled）")
             return 2
+
+        # 代理池是可选资源：抓取+测通失败只降级直连，不影响签到
+        self.init_proxy_pool(desired=len(accounts) + 10)
 
         mode = "dry-run 连通性检查" if self.options.dry_run else "签到"
         log.step(f"开始{mode}，共 {len(accounts)} 个账号")
@@ -195,6 +251,22 @@ class Runner:
             account.checkin_path = record.checkin_path
             log.debug(f"复用缓存签到路径 {record.checkin_path}")
 
+        # 一个账号一个 IP：先从代理池分配（手动配置的代理优先，不改动）
+        self._assign_proxy(account)
+
+        # 目标站点连不上（网络层失败）时换 IP 重试；业务失败（cookie/已签/风控）不换
+        swap_left = self.cfg.proxy_pool.ip_swap_limit if self._pool else 0
+        while True:
+            row = self._run_account_with_retries(account, record)
+            if (row.status == api.NETWORK_ERROR and swap_left > 0
+                    and account.name in self._pooled_proxies):
+                if self._swap_proxy(account):
+                    swap_left -= 1
+                    log.warn(f"账号 {account.name} 换 IP 后重试签到")
+                    continue
+            return row
+
+    def _run_account_with_retries(self, account: Account, record) -> log.SummaryRow:
         attempts = self.cfg.defaults.retry + 1
         row: Optional[log.SummaryRow] = None
         for attempt in range(1, attempts + 1):

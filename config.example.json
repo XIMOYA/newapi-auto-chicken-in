@@ -17,6 +17,15 @@
     "timeout": 20,
     "auto_before_checkin": true
   },
+  "proxy_pool": {
+    "enabled": false,
+    "test_url": "https://api.ipify.org",
+    "timeout": 8,
+    "max_workers": 8,
+    "max_proxies": 100,
+    "ip_swap_limit": 2,
+    "sources": []
+  },
   "ai": {
     "enabled": true,
     "base_url": "https://你的站点.com/v1",
