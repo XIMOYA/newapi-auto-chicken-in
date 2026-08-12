@@ -14,6 +14,7 @@ web/src/components/MaskedInput.vue
       :placeholder="isMasked ? '已设置，留空保持不变（输入新值可修改）' : placeholder"
       :clearable="true"
       :disabled="disabled"
+      :autosize="autosize"
     />
     <n-alert v-if="isMasked" type="info" :bordered="false" class="masked-tip">
       <template #icon>
@@ -40,12 +41,18 @@ const props = withDefaults(
     type?: 'text' | 'password' | 'textarea'
     customTip?: string
     disabled?: boolean
+    /**
+     * textarea 类型的自动高度：true = 跟随内容；
+     * { minRows, maxRows } = 最小/最大行数（默认 1 行起步，与其他单行框等高）
+     */
+    autosize?: boolean | { minRows: number; maxRows: number }
   }>(),
   {
     placeholder: '',
     type: 'text',
     customTip: '',
-    disabled: false
+    disabled: false,
+    autosize: undefined
   }
 )
 
