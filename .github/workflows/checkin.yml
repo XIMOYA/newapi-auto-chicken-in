@@ -101,8 +101,8 @@ jobs:
           print("config.json 已写入（校验通过）")
           PY
 
-      - name: 开始签到（headless 真无头 + 并行 2）
-        run: python main.py --headless --parallel 2 -v ${{ inputs.dry_run && '--dry-run' || '' }}
+      - name: 开始签到（headless 真无头 + 并行 5）
+        run: python main.py --headless --parallel 5 -v ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: 上传排障截图与页面快照（仅失败时）
         if: failure()

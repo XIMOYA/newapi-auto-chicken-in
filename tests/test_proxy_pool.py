@@ -57,8 +57,8 @@ class TestProxyPoolConfig:
         assert cfg.enabled is False
         assert cfg.test_url == "https://api.ipify.org"
         assert cfg.timeout == 8
-        assert cfg.max_workers == 8
-        assert cfg.max_proxies == 100
+        assert cfg.max_workers == 25
+        assert cfg.max_proxies == 250
         assert cfg.ip_swap_limit == 2
         assert cfg.sources == []  # 空 = 用内置默认源
 

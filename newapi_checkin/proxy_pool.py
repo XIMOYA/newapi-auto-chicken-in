@@ -62,8 +62,8 @@ class ProxyPoolConfig:
     enabled: bool = False
     test_url: str = DEFAULT_TEST_URL
     timeout: int = 8
-    max_workers: int = 8
-    max_proxies: int = 100      # 每次最多测通多少条（太多测太慢）
+    max_workers: int = 25
+    max_proxies: int = 250      # 每次最多测通多少条（太多测太慢）
     ip_swap_limit: int = 2      # 目标站点连不上时最多换几次 IP
     sources: list = field(default_factory=list)   # 空 = 用内置默认源
 
@@ -79,8 +79,8 @@ class ProxyPoolConfig:
             enabled=bool(raw.get("enabled", False)),
             test_url=str(raw.get("test_url") or DEFAULT_TEST_URL).strip() or DEFAULT_TEST_URL,
             timeout=max(2, min(60, _as_int(raw.get("timeout"), 8))),
-            max_workers=max(1, min(32, _as_int(raw.get("max_workers"), 8))),
-            max_proxies=max(1, min(1000, _as_int(raw.get("max_proxies"), 100))),
+            max_workers=max(1, min(32, _as_int(raw.get("max_workers"), 25))),
+            max_proxies=max(1, min(1000, _as_int(raw.get("max_proxies"), 250))),
             ip_swap_limit=max(0, min(10, _as_int(raw.get("ip_swap_limit"), 2))),
             sources=sources,
         )
@@ -214,7 +214,6 @@ class ProxyPool:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="probe") as pool:
             results = list(pool.map(self._test_one, candidates))
         return [proxy for proxy, ok in zip(candidates, results) if ok]
-
     def _test_one(self, proxy: str) -> bool:
         try:
             from curl_cffi import requests as cffi

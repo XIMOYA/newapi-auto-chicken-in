@@ -43,7 +43,7 @@ class RunOptions:
     use_ai: bool = True
     use_browser: bool = True
     verbose: bool = False
-    parallelism: int = 1
+    parallelism: int = 1          # 1 = 未显式指定，run() 里自动提升为默认 5
 
 
 class Runner:
@@ -155,11 +155,20 @@ class Runner:
             workers = 1
         return max(1, min(8, workers))
 
+    def _set_parallelism(self, workers: int) -> None:
+        """把传入的并发数写回选项（供 CLI/调度调用方设置）。"""
+        self.options.parallelism = max(1, min(8, int(workers)))
     def run(self) -> int:
         accounts = self.cfg.select(self.options.account_names)
         if not accounts:
             log.warn("没有启用的账号（检查 accounts[].enabled）")
             return 2
+
+        # 默认并行度 5：效率与资源占用折中（人工模式强制串行 1）
+        if not self.options.manual and self.options.parallelism in (None, 1, 0):
+            self._set_parallelism(5)
+        elif self.options.manual:
+            self._set_parallelism(1)
 
         # 代理池是可选资源：抓取+测通失败只降级直连，不影响签到
         self.init_proxy_pool(desired=len(accounts) + 10)
