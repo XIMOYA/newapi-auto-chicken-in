@@ -16,7 +16,7 @@ __pycache__/
 /camoufox-*.zip
 
 # 配置管理平台构建产物与依赖
-/server/ncf-server.exe
+/server/*.exe
 /server/data/
 /server/*.db
 /web/node_modules/
