@@ -68,6 +68,30 @@ def _split_accounts(values) -> list:
     return names
 
 
+def _maybe_sync_remote_config(cfg) -> None:
+    """签到前同步远程配置；失败只降级用本地配置，绝不中断签到。
+
+    仅在 config_sync.enabled 时请求远程配置管理平台（自建网站 / Gist / 任意 API）。
+    同步成功后 config.json 已被覆盖，调用方需重新 load_config()。
+    """
+    sync_cfg = getattr(cfg, "config_sync", None)
+    if sync_cfg is None or not getattr(sync_cfg, "enabled", False):
+        log.debug("远程配置同步未启用（config_sync.enabled=false）")
+        return
+    try:
+        from newapi_checkin.remote_sync import sync_remote_config
+
+        result = sync_remote_config()
+        if result.get("ok") and not result.get("skipped"):
+            log.ok(f"远程配置已同步: {result.get('message', '')}".rstrip())
+        elif not result.get("ok"):
+            log.warn(f"远程配置同步失败，继续使用本地配置: {result.get('error')}")
+        else:
+            log.debug("远程配置同步未启用或跳过")
+    except Exception as exc:  # noqa: BLE001 - 同步是可降级项，绝不能中断签到
+        log.warn(f"远程配置同步异常，继续使用本地配置: {type(exc).__name__}: {exc}")
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     log.setup(verbose=args.verbose, log_dir=LOGS_DIR)
@@ -77,6 +101,15 @@ def main(argv=None) -> int:
     except ConfigError as exc:
         log.err(str(exc))
         return 2
+
+    # 远程配置同步（Actions 场景的核心）：拉取成功后重新加载最新配置
+    _maybe_sync_remote_config(cfg)
+    if getattr(getattr(cfg, "config_sync", None), "enabled", False):
+        try:
+            cfg = load_config(Path(args.config) if args.config else None)
+        except ConfigError as exc:
+            log.err(f"远程同步后的配置无效: {exc}")
+            return 2
 
     if cfg.migrated_from is not None:
         log.warn(f"已把旧配置 {cfg.migrated_from.name} 迁移为 config.json，"
