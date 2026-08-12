@@ -18,12 +18,12 @@ web/src/views/LoginView.vue
 
       <n-form ref="formRef" :model="form" :rules="rules" size="large" @keydown.enter.prevent="handleLogin">
         <n-form-item path="username" :show-label="false">
-          <n-input v-model:value="form.username" placeholder="用户名" :disabled="loading">
+          <n-input v-model:value="form.username" placeholder="用户名" :disabled="loading" autocomplete="username">
             <template #prefix><n-icon><person-outline /></n-icon></template>
           </n-input>
         </n-form-item>
         <n-form-item path="password" :show-label="false">
-          <n-input v-model:value="form.password" type="password" show-password-on="click" placeholder="密码" :disabled="loading">
+          <n-input v-model:value="form.password" type="password" show-password-on="click" placeholder="密码" :disabled="loading" autocomplete="current-password">
             <template #prefix><n-icon><lock-closed-outline /></n-icon></template>
           </n-input>
         </n-form-item>

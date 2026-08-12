@@ -29,10 +29,11 @@ export const useConfigStore = defineStore('config', () => {
   }
 
   async function save(next: AppConfig) {
-    const res = await saveConfig(next)
-    config.value = next
-    updatedAt.value = res.updated_at
-    return res
+    await saveConfig(next)
+    // 保存成功后重新拉取：敏感字段（cookie/api_key/password/token）以
+    // 后端打码为准，避免明文残留在前端内存/界面上
+    await fetchConfig()
+    return { updated_at: updatedAt.value }
   }
 
   return { config, updatedAt, loading, fetchConfig, save }

@@ -105,8 +105,15 @@ web/src/views/OverviewView.vue
         :bordered="false"
         size="small"
         :scroll-x="980"
-      />
-      <n-empty v-if="!configStore.loading && !accounts.length" class="table-empty" description="暂无签到账号，点击右上角「新增账号」开始添加" />
+      >
+        <template #empty>
+          <n-empty
+            v-if="!configStore.loading"
+            class="table-empty"
+            description="暂无签到账号，点击右上角「新增账号」开始添加"
+          />
+        </template>
+      </n-data-table>
     </n-card>
 
     <account-modal v-model:show="modalVisible" :account="editingAccount" :submitting="submitting" @submit="handleAccountSubmit" />

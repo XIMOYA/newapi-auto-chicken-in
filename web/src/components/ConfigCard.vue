@@ -32,7 +32,7 @@ web/src/components/ConfigCard.vue
 </template>
 
 <script setup lang="ts">
-import { NIcon } from 'naive-ui'
+import { NButton, NCard, NIcon, NSpin, NTag } from 'naive-ui'
 import { SaveOutline } from '@vicons/ionicons5'
 
 defineProps<{

@@ -27,7 +27,7 @@ web/src/components/MaskedInput.vue
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { NIcon } from 'naive-ui'
+import { NAlert, NIcon, NInput } from 'naive-ui'
 import { LockClosedOutline } from '@vicons/ionicons5'
 
 const props = withDefaults(
