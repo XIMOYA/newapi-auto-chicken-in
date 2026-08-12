@@ -17,6 +17,8 @@ NewAPI 签到配置管理平台 · 服务入口
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"log"
 	"net/http"
 	"os"
@@ -25,12 +27,16 @@ import (
 func main() {
 	dbPath := getenv("NCF_DB_PATH", "./data/config.db")
 	addr := getenv("NCF_HTTP_ADDR", "127.0.0.1:8080")
+
+	// JWT 密钥：未设置时自动生成随机密钥，保证开箱即用；
+	// 重启后已签发的登录态会失效，生产环境请用环境变量固定。
 	jwtSecret := os.Getenv("NCF_JWT_SECRET")
 	if len(jwtSecret) < 32 {
-		log.Fatal("NCF_JWT_SECRET 未设置或长度不足 32 字符，请设置后再启动")
+		jwtSecret = randomHex(32)
+		log.Printf("NCF_JWT_SECRET 未设置，已自动生成随机密钥（重启后登录态失效；生产环境请固定该值）")
 	}
-	adminUser := os.Getenv("NCF_ADMIN_USER")
-	adminPass := os.Getenv("NCF_ADMIN_PASS")
+	adminUser := getenv("NCF_ADMIN_USER", "admin")
+	adminPass := getenv("NCF_ADMIN_PASS", "admin123456")
 
 	db, err := OpenDB(dbPath)
 	if err != nil {
@@ -51,15 +57,27 @@ func main() {
 
 	srv := NewServer(db, jwtSecret)
 	log.Printf("NewAPI 签到配置管理平台已启动，监听 %s（数据库: %s）", addr, dbPath)
+	log.Printf("初始管理员: %s / %s（仅首次创建，建议登录后修改密码）", adminUser, adminPass)
 	if dist := findDistDir(); dist != "" {
-		log.Printf("托管前端静态文件: %s", dist)
+		log.Printf("托管前端静态文件（外部目录，开发热更新）: %s", dist)
+	} else if hasEmbeddedFrontend() {
+		log.Printf("前端已嵌入二进制（单文件部署）")
 	} else {
-		log.Printf("未找到 web/dist，仅提供 API 服务")
+		log.Printf("未找到前端静态文件，仅提供 API 服务")
 	}
 
 	if err := http.ListenAndServe(addr, srv.routes()); err != nil {
 		log.Fatalf("HTTP 服务异常退出: %v", err)
 	}
+}
+
+// randomHex 生成 n 字节的随机十六进制字符串。
+func randomHex(n int) string {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(buf)
 }
 
 // getenv 读取环境变量，为空时返回默认值。

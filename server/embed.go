@@ -13,3 +13,9 @@ import "embed"
 
 //go:embed all:embed_dist
 var embeddedDist embed.FS
+
+// hasEmbeddedFrontend 判断二进制内是否嵌入了前端（index.html 存在）。
+func hasEmbeddedFrontend() bool {
+	_, err := embeddedDist.ReadFile("embed_dist/index.html")
+	return err == nil
+}
