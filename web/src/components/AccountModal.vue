@@ -18,6 +18,17 @@ web/src/components/AccountModal.vue
     @update:show="(v: boolean) => emit('update:show', v)"
   >
     <n-form ref="formRef" :model="form" :rules="rules" label-placement="left" :label-width="110">
+      <n-form-item label="选择站点" path="site_key">
+        <n-select
+          v-model:value="siteKey"
+          :options="siteOptions"
+          placeholder="可从站点预设选择（也可手动输入 URL）"
+          clearable
+          filterable
+          :disabled="isEdit"
+          @update:value="applySite"
+        />
+      </n-form-item>
       <n-form-item label="账号名称" path="name">
         <n-input v-model:value="form.name" placeholder="例如：站点A" />
       </n-form-item>
@@ -61,14 +72,16 @@ web/src/components/AccountModal.vue
 
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { NForm, NFormItem, NInput, NModal, NSwitch, NButton, type FormInst, type FormRules } from 'naive-ui'
+import { NForm, NFormItem, NInput, NModal, NSwitch, NButton, NSelect, type FormInst, type FormRules, type SelectOption } from 'naive-ui'
 import MaskedInput from './MaskedInput.vue'
-import type { Account } from '@/types'
+import type { Account, Site } from '@/types'
 
 const props = defineProps<{
   show: boolean
   /** 编辑对象；null 表示新增 */
   account: Account | null
+  /** 站点预设列表（供新增时选择自动带出路径） */
+  sites?: Site[]
   submitting?: boolean
 }>()
 
@@ -78,6 +91,50 @@ const emit = defineEmits<{
 }>()
 
 const isEdit = computed(() => props.account !== null)
+
+// 站点预设下拉选项
+const siteOptions = computed<SelectOption[]>(() =>
+  (props.sites ?? []).map((s, i) => ({
+    label: `${s.name}（${s.url}）`,
+    value: i
+  }))
+)
+const siteKey = ref<number | null>(null)
+
+/** 选择站点预设：自动带出 URL / 签到路径 / 浏览器路径（用户可改） */
+function applySite(index: number | null) {
+  if (index == null) return
+  const site = (props.sites ?? [])[index]
+  if (!site) return
+  form.url = site.url
+  if (site.checkin_path) form.checkin_path = site.checkin_path
+  if (site.browser_path) form.browser_path = site.browser_path
+}
+
+// 从现有账号/预设提取的公共路径（供手动输入 URL 时兜底默认）
+const commonCheckinPath = computed(() => {
+  const fromSites = (props.sites ?? []).map((s) => s.checkin_path).filter((p): p is string => !!p)
+  const candidates = [...fromSites]
+  if (candidates.length) {
+    const counts = new Map<string, number>()
+    for (const c of candidates) counts.set(c, (counts.get(c) ?? 0) + 1)
+    return [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0]
+  }
+  return ''
+})
+
+/** 手动输入 URL 时：匹配站点预设带出路径；否则用最常见的 checkin_path 兜底 */
+function watchUrlInput(value: string) {
+  const url = value.trim()
+  if (!url) return
+  const matched = (props.sites ?? []).find((s) => s.url.replace(/\/+$/, '') === url.replace(/\/+$/, ''))
+  if (matched) {
+    if (matched.checkin_path) form.checkin_path = matched.checkin_path
+    if (matched.browser_path) form.browser_path = matched.browser_path
+  } else if (!form.checkin_path && commonCheckinPath.value) {
+    form.checkin_path = commonCheckinPath.value
+  }
+}
 
 // 服务端返回的原始 cookie（可能是 "***"），用于打码判断与「留空保持不变」
 const originalCookie = computed(() => (props.account ? props.account.cookie : ''))
@@ -118,6 +175,7 @@ watch(
       form.checkin_path = props.account.checkin_path ?? ''
       form.browser_path = props.account.browser_path ?? ''
       form.enabled = props.account.enabled
+      siteKey.value = null
     } else {
       form.name = ''
       form.url = ''
@@ -127,8 +185,17 @@ watch(
       form.checkin_path = ''
       form.browser_path = ''
       form.enabled = true
+      siteKey.value = null
     }
     formRef.value?.restoreValidation()
+  }
+)
+
+// 手动输入 URL 时尝试带出路径（新增模式下）
+watch(
+  () => form.url,
+  (v) => {
+    if (!isEdit.value) watchUrlInput(v)
   }
 )
 
@@ -155,6 +222,13 @@ const rules: FormRules = {
   }
 }
 
+// 提交时补充 path 校验：不强制，但若是 "**" 也视为未设置
+function normalizePath(v: string) {
+  const t = v.trim()
+  if (!t || t === '***') return null
+  return t.startsWith('/') ? t : '/' + t
+}
+
 function handleSubmit() {
   formRef.value?.validate((errors) => {
     if (errors) return
@@ -166,8 +240,8 @@ function handleSubmit() {
       cookie: finalCookie,
       user_id: form.user_id.trim() === '' ? null : form.user_id.trim(),
       proxy: form.proxy.trim() === '' ? null : form.proxy.trim(),
-      checkin_path: form.checkin_path.trim() === '' ? null : form.checkin_path.trim(),
-      browser_path: form.browser_path.trim() === '' ? null : form.browser_path.trim(),
+      checkin_path: normalizePath(form.checkin_path),
+      browser_path: normalizePath(form.browser_path),
       enabled: form.enabled
     }
     emit('submit', payload)

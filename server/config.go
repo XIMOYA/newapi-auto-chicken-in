@@ -21,6 +21,7 @@ const MaskPlaceholder = "***"
 // Config 完整配置对象 = 契约文档中的顶层结构。
 type Config struct {
 	Accounts   []Account     `json:"accounts"`
+	Sites      []Site        `json:"sites"`
 	AI         AIConfig      `json:"ai"`
 	Browser    BrowserConfig `json:"browser"`
 	HTTP       HTTPConfig    `json:"http"`
@@ -29,6 +30,14 @@ type Config struct {
 	Notify     Notify        `json:"notify"`
 	ConfigSync ConfigSync    `json:"config_sync"`
 	Security   Security      `json:"security"`
+}
+
+// Site 站点预设：供新增账号时快速选择，自动带出 URL 与接口路径。
+type Site struct {
+	Name        string  `json:"name"`
+	URL         string  `json:"url"`
+	CheckinPath *string `json:"checkin_path"`
+	BrowserPath *string `json:"browser_path"`
 }
 
 // Account 签到账号：name/url/cookie 为必填（契约校验要求），其余为可选。
@@ -134,6 +143,7 @@ type Security struct {
 func DefaultConfig() Config {
 	return Config{
 		Accounts: []Account{},
+		Sites:    []Site{},
 		AI: AIConfig{
 			Enabled:    false,
 			BaseURL:    "",
@@ -279,6 +289,19 @@ func cloneConfig(c *Config) *Config {
 		}
 	}
 
+	cp.Sites = make([]Site, len(c.Sites))
+	for i, s := range c.Sites {
+		cp.Sites[i] = s
+		if s.CheckinPath != nil {
+			v := *s.CheckinPath
+			cp.Sites[i].CheckinPath = &v
+		}
+		if s.BrowserPath != nil {
+			v := *s.BrowserPath
+			cp.Sites[i].BrowserPath = &v
+		}
+	}
+
 	cp.Browser.Window = make([]int, len(c.Browser.Window))
 	copy(cp.Browser.Window, c.Browser.Window)
 
@@ -310,6 +333,7 @@ func cloneConfig(c *Config) *Config {
 // ValidateConfig 校验配置合法性（契约规则）：
 // - accounts 每个账号必须提供 name / url / cookie
 // - url 必须以 http:// 或 https:// 开头
+// - sites 每个站点必须提供 name / url
 // 返回第一个错误信息（供 400 响应使用）。
 func ValidateConfig(cfg *Config) error {
 	if cfg == nil {
@@ -328,6 +352,18 @@ func ValidateConfig(cfg *Config) error {
 		}
 		if strings.TrimSpace(a.Cookie) == "" {
 			return fmt.Errorf("accounts[%d].cookie 不能为空", i)
+		}
+	}
+	for i, s := range cfg.Sites {
+		if strings.TrimSpace(s.Name) == "" {
+			return fmt.Errorf("sites[%d].name 不能为空", i)
+		}
+		if strings.TrimSpace(s.URL) == "" {
+			return fmt.Errorf("sites[%d].url 不能为空", i)
+		}
+		lowerURL := strings.ToLower(strings.TrimSpace(s.URL))
+		if !strings.HasPrefix(lowerURL, "http://") && !strings.HasPrefix(lowerURL, "https://") {
+			return fmt.Errorf("sites[%d].url 必须以 http:// 或 https:// 开头", i)
 		}
 	}
 	return nil

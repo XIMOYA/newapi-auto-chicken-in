@@ -30,6 +30,42 @@ web/src/views/OverviewView.vue
       </n-grid-item>
     </n-grid>
 
+    <!-- 站点预设 -->
+    <n-card :bordered="false" class="sites-card">
+      <template #header>
+        <div class="card-header">
+          <div class="card-title">站点预设</div>
+          <n-tag v-if="sites.length" size="small" type="info" :bordered="false">共 {{ sites.length }} 个站点</n-tag>
+        </div>
+      </template>
+      <template #header-extra>
+        <n-button size="small" type="primary" @click="openSiteCreate">
+          <template #icon><n-icon><add-outline /></n-icon></template>
+          新增站点
+        </n-button>
+      </template>
+
+      <n-data-table
+        :columns="siteColumns"
+        :data="siteTableData"
+        :loading="configStore.loading || saving"
+        :row-key="(row: SiteRow) => row._index"
+        :pagination="sitePagination"
+        striped
+        :bordered="false"
+        size="small"
+        :scroll-x="820"
+      >
+        <template #empty>
+          <n-empty
+            v-if="!configStore.loading"
+            class="table-empty"
+            description="暂无站点预设。配置常用站点后，新增账号时可快速选择并自动带出路径。"
+          />
+        </template>
+      </n-data-table>
+    </n-card>
+
     <!-- 账号管理 -->
     <n-card :bordered="false" class="accounts-card">
       <template #header>
@@ -81,7 +117,8 @@ web/src/views/OverviewView.vue
       </n-data-table>
     </n-card>
 
-    <account-modal v-model:show="modalVisible" :account="editingAccount" :submitting="submitting" @submit="handleAccountSubmit" />
+    <account-modal v-model:show="modalVisible" :account="editingAccount" :submitting="submitting" :sites="sites" @submit="handleAccountSubmit" />
+    <site-modal v-model:show="siteModalVisible" :site="editingSite" @submit="handleSiteSubmit" />
   </div>
 </template>
 
@@ -93,15 +130,20 @@ import {
 } from 'naive-ui'
 import {
   PeopleOutline, CheckmarkCircleOutline, LayersOutline, MailOutline, AddOutline,
-  EyeOutline, CreateOutline, TrashOutline
+  EyeOutline, CreateOutline, TrashOutline, PlanetOutline
 } from '@vicons/ionicons5'
 import AccountModal from '@/components/AccountModal.vue'
+import SiteModal from '@/components/SiteModal.vue'
 import { useConfigStore } from '@/stores/config'
 import { deepClone } from '@/utils/clone'
 import { extractErrorMessage } from '@/utils/error'
-import type { Account } from '@/types'
+import type { Account, Site } from '@/types'
 
 interface AccountRow extends Account {
+  _index: number
+}
+
+interface SiteRow extends Site {
   _index: number
 }
 
@@ -110,6 +152,7 @@ const dialog = useDialog()
 const message = useMessage()
 
 const accounts = computed<Account[]>(() => configStore.config?.accounts ?? [])
+const sites = computed<Site[]>(() => configStore.config?.sites ?? [])
 const accountCount = computed(() => accounts.value.length)
 const enabledCount = computed(() => accounts.value.filter((a) => a.enabled).length)
 const proxyPoolEnabled = computed(() => !!configStore.config?.proxy_pool?.enabled)
@@ -148,6 +191,7 @@ const statCards = computed(() => [
 ])
 
 const tableData = computed<AccountRow[]>(() => accounts.value.map((a, i) => ({ ...a, _index: i })))
+const siteTableData = computed<SiteRow[]>(() => sites.value.map((s, i) => ({ ...s, _index: i })))
 
 const selectedKeys = ref<number[]>([])
 const saving = ref(false)
@@ -158,6 +202,93 @@ const editingAccount = ref<Account | null>(null)
 const editingIndex = ref(-1)
 
 const pagination: PaginationProps = { pageSize: 10, showSizePicker: true, pageSizes: [10, 20, 50] }
+const sitePagination: PaginationProps = { pageSize: 10, showSizePicker: true, pageSizes: [10, 20, 50] }
+
+// ---- 站点预设表格列 ----
+const siteColumns: DataTableColumns<SiteRow> = [
+  {
+    title: '名称',
+    key: 'name',
+    width: 160,
+    render: (row) =>
+      h('span', { class: 'site-name' }, [
+        h(NIcon, { size: 15, class: 'site-name-icon' }, { default: () => h(PlanetOutline) }),
+        ` ${row.name}`
+      ])
+  },
+  {
+    title: '站点 URL',
+    key: 'url',
+    width: 240,
+    render: (row) =>
+      h('a', { href: row.url, target: '_blank', rel: 'noopener', class: 'url-link' }, row.url)
+  },
+  { title: '签到路径', key: 'checkin_path', width: 200, render: (row) => (row.checkin_path ? h('span', { class: 'mono-inline' }, row.checkin_path) : h('span', { class: 'muted' }, '未设置')) },
+  { title: '浏览器入口', key: 'browser_path', width: 180, render: (row) => (row.browser_path ? h('span', { class: 'mono-inline' }, row.browser_path) : h('span', { class: 'muted' }, '/dashboard')) },
+  {
+    title: '操作',
+    key: 'actions',
+    width: 140,
+    fixed: 'right',
+    render: (row) =>
+      h('div', { class: 'table-actions' }, [
+        h(
+          NButton,
+          { size: 'tiny', type: 'primary', secondary: true, onClick: () => openSiteEdit(row) },
+          { icon: () => h(NIcon, null, { default: () => h(CreateOutline) }), default: () => '编辑' }
+        ),
+        h(
+          NButton,
+          { size: 'tiny', type: 'error', secondary: true, onClick: () => confirmSiteDelete(row) },
+          { icon: () => h(NIcon, null, { default: () => h(TrashOutline) }), default: () => '删除' }
+        )
+      ])
+  }
+]
+
+// ---- 站点预设 CRUD ----
+const siteModalVisible = ref(false)
+const editingSite = ref<Site | null>(null)
+const editingSiteIndex = ref(-1)
+
+function openSiteCreate() {
+  editingSite.value = null
+  editingSiteIndex.value = -1
+  siteModalVisible.value = true
+}
+
+function openSiteEdit(row: SiteRow) {
+  editingSite.value = deepClone(row)
+  editingSiteIndex.value = row._index
+  siteModalVisible.value = true
+}
+
+async function handleSiteSubmit(payload: Site) {
+  try {
+    if (editingSiteIndex.value >= 0 && sites.value[editingSiteIndex.value]) {
+      sites.value[editingSiteIndex.value] = payload
+    } else {
+      sites.value.push(payload)
+    }
+    await persistAccounts(editingSiteIndex.value >= 0 ? `站点预设「${payload.name}」已更新` : `站点预设「${payload.name}」已添加`)
+    siteModalVisible.value = false
+  } catch {
+    // persistAccounts 内部已提示错误
+  }
+}
+
+function confirmSiteDelete(row: SiteRow) {
+  dialog.warning({
+    title: '删除站点预设',
+    content: `确定要删除站点预设「${row.name}」吗？已存在的账号不受影响。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: () => {
+      sites.value.splice(row._index, 1)
+      persistAccounts(`站点预设「${row.name}」已删除`)
+    }
+  })
+}
 
 function viewCookie(row: AccountRow) {
   if (row.cookie === '' || row.cookie == null) {
@@ -382,6 +513,22 @@ async function persistAccounts(successTip?: string) {
 
 .accounts-card {
   background: #fff;
+}
+
+.sites-card {
+  background: #fff;
+}
+
+.site-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: #1f2d3d;
+}
+
+.site-name-icon {
+  color: #1e5eff;
 }
 
 .card-header {

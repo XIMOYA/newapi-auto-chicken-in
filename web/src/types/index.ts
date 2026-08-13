@@ -20,6 +20,13 @@ export interface Account {
   enabled: boolean
 }
 
+export interface Site {
+  name: string
+  url: string
+  checkin_path: string | null
+  browser_path: string | null
+}
+
 export interface AIConfig {
   enabled: boolean
   base_url: string
@@ -100,6 +107,7 @@ export interface SecurityConfig {
 
 export interface AppConfig {
   accounts: Account[]
+  sites: Site[]
   ai: AIConfig
   browser: BrowserConfig
   http: HttpConfig
