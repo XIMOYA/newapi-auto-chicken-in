@@ -66,6 +66,14 @@
     "retry": 2,
     "interval_seconds": [3, 8]
   },
+  "sites": [
+    {
+      "name": "GoRouter",
+      "url": "https://gorouter.app",
+      "checkin_path": "/api/user/checkin",
+      "browser_path": "/dashboard"
+    }
+  ],
   "accounts": [
     {
       "name": "站点A",

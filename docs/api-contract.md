@@ -10,7 +10,7 @@
   - 管理端：`Authorization: Bearer <JWT>`（登录后获得）
   - 拉取端：`Authorization: Bearer <API_KEY>`（仅 `/api/config/raw`）
 - 错误码：401 未认证 / 403 无权限 / 400 参数错误 / 404 不存在 / 500 服务器错误
-- 配置对象结构 = 完整 config JSON（含 `accounts` / `ai` / `browser` / `http` / `defaults` / `proxy_pool` / `notify` / `config_sync` / `security` 顶层键），见 `config.example.json` 为基底
+- 配置对象结构 = 完整 config JSON（含 `accounts` / `sites` / `ai` / `browser` / `http` / `defaults` / `proxy_pool` / `notify` / `config_sync` / `security` 顶层键），见 `config.example.json` 为基底
 
 ---
 
@@ -70,7 +70,7 @@
 
 规则：
 - 后端把 `"***"` 占位符还原为旧值（深合并）
-- 校验：`accounts` 必须有 `name` / `url` / `cookie`；URL 需 http(s) 开头
+- 校验：`accounts` 必须有 `name` / `url` / `cookie`；`sites` 必须有 `name` / `url`；URL 需 http(s) 开头
 - 校验通过才落库
 
 响应（200）：`{ "ok": true, "updated_at": "2026-08-12T10:00:00Z" }`
@@ -133,6 +133,7 @@
 ```json
 {
   "accounts": [],
+  "sites": [],
   "ai": { "enabled": false, "base_url": "", "api_key": "", "model": "gpt-4o-mini", "timeout": 60, "max_retries": 2 },
   "browser": { "driver": "camoufox", "headless": "virtual", "humanize": true, "timeout": 60, "keep_artifacts_on_fail": true, "locale": "zh-CN", "window": [1280, 800], "executable_path": null },
   "http": { "impersonate": "chrome", "timeout": 20, "verify": true },
