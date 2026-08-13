@@ -68,3 +68,15 @@ const inputValue = computed<string>({
   set: (v) => emit('update:modelValue', v)
 })
 </script>
+
+<style scoped>
+/* 关键：MaskedInput 外包了一层 div，不再是 NFormItem 的直接子级，
+   Naive UI 的「输入控件自动撑满宽度」规则不会生效。
+   必须显式让 wrapper 与内部 NInput 都占满 100%，否则宽度塌陷。 */
+.masked-input {
+  width: 100%;
+}
+.masked-input :deep(.n-input) {
+  width: 100%;
+}
+</style>

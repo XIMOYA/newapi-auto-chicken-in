@@ -29,7 +29,7 @@ web/src/components/AccountModal.vue
           v-model="form.cookie"
           :original-value="originalCookie"
           type="textarea"
-          :autosize="{ minRows: 1, maxRows: 6 }"
+          :autosize="{ minRows: 2, maxRows: 6 }"
           placeholder="粘贴完整 Cookie（如 session=...）"
           custom-tip="该账号 Cookie 已设置（出于安全原因接口不回传明文），留空保持不变，输入新值可修改"
         />
