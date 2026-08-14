@@ -25,15 +25,22 @@ import (
 )
 
 func main() {
+	// 自动加载 .env 文件（若存在），便于宝塔/手动部署：目录里放 .env 即可配置
+	if p := findEnvFile(); p != "" {
+		loadEnvFile(p)
+	}
+
 	dbPath := getenv("NCF_DB_PATH", "./data/config.db")
 	addr := getenv("NCF_HTTP_ADDR", "127.0.0.1:8080")
 
 	// JWT 密钥：未设置时自动生成随机密钥，保证开箱即用；
 	// 重启后已签发的登录态会失效，生产环境请用环境变量固定。
 	jwtSecret := os.Getenv("NCF_JWT_SECRET")
-	if len(jwtSecret) < 32 {
+	if jwtSecret == "" {
 		jwtSecret = randomHex(32)
 		log.Printf("NCF_JWT_SECRET 未设置，已自动生成随机密钥（重启后登录态失效；生产环境请固定该值）")
+	} else if len(jwtSecret) < 32 {
+		log.Printf("NCF_JWT_SECRET 长度不足 32 字符（当前 %d），已按所设值使用；建议使用至少 32 字符的强密钥", len(jwtSecret))
 	}
 	adminUser := getenv("NCF_ADMIN_USER", "admin")
 	adminPass := getenv("NCF_ADMIN_PASS", "admin123456")
