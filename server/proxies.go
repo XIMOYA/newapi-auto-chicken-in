@@ -1,0 +1,493 @@
+/*
+server/proxies.go
+服务器端代理池：SQLite 数据层 + 抓取/测通/刷新逻辑
+
+职责：
+- proxies 表：保存抓取到的代理条目（来源 / host:port / 延迟 / 存活状态 / 时间）
+- FetchProxiesFromSources：并发抓取所有配置的 sources，解析 host:port
+- TestProxyLatency：对单个代理打 test_url 测通并返回延迟（毫秒）
+- RefreshProxies：全量刷新流程（抓取 → 去重 → 并发测通 → 按延迟排序 → 截断保存）
+- 后台协程：按 refresh_minutes 周期调用 RefreshProxies（由 main 启动）
+
+安全边界：测通只打配置的 test_url（默认 api.ipify.org），绝不打目标站点。
+*/
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ProxyEntry 一条代理记录。
+type ProxyEntry struct {
+	ID          int64  `json:"id"`
+	Source      string `json:"source"`
+	Addr        string `json:"addr"` // host:port
+	LatencyMs   int    `json:"latency_ms"`
+	Alive       bool   `json:"alive"`
+	LastChecked string `json:"last_checked_at"`
+	LastAliveAt string `json:"last_alive_at,omitempty"`
+}
+
+var ipPortRe = regexp.MustCompile(`\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\b`)
+
+// createProxiesTable 建 proxies 表（幂等）。
+func createProxiesTable(db *sql.DB) error {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS proxies (
+		id            INTEGER PRIMARY KEY AUTOINCREMENT,
+		source        TEXT    NOT NULL,
+		addr          TEXT    NOT NULL,
+		latency_ms    INTEGER NOT NULL DEFAULT 0,
+		alive         INTEGER NOT NULL DEFAULT 0,
+		last_checked  TEXT    NOT NULL,
+		last_alive_at TEXT
+	)`)
+	if err != nil {
+		return fmt.Errorf("建 proxies 表失败: %w", err)
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_proxies_addr ON proxies(addr)`)
+	if err != nil {
+		return fmt.Errorf("建 proxies 索引失败: %w", err)
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_proxies_alive ON proxies(alive)`)
+	if err != nil {
+		return fmt.Errorf("建 proxies alive 索引失败: %w", err)
+	}
+	return nil
+}
+
+// parseProxyLines 从文本/HTML 提取 host:port 列表（兼容纯文本行与 89ip HTML）。
+func parseProxyLines(text string) []string {
+	out := []string{}
+	for _, m := range ipPortRe.FindAllStringSubmatch(text, -1) {
+		ip, port := m[1], m[2]
+		if !validIP(ip) || !validPort(port) {
+			continue
+		}
+		out = append(out, ip+":"+port)
+	}
+	return out
+}
+
+func validIP(ip string) bool {
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) == 0 || len(p) > 3 {
+			return false
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		n := 0
+		for _, c := range p {
+			n = n*10 + int(c-'0')
+		}
+		if n > 255 {
+			return false
+		}
+	}
+	return true
+}
+
+func validPort(port string) bool {
+	if len(port) == 0 || len(port) > 5 {
+		return false
+	}
+	for _, c := range port {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	n := 0
+	for _, c := range port {
+		n = n*10 + int(c-'0')
+	}
+	return n >= 1 && n <= 65535
+}
+
+// ProxyManager 代理池管理：并发安全，持有 DB 引用与最近一次刷新结果。
+type ProxyManager struct {
+	db      *sql.DB
+	mu      sync.RWMutex
+	lastRun time.Time
+	lastErr string
+	running bool
+}
+
+func NewProxyManager(db *sql.DB) *ProxyManager {
+	return &ProxyManager{db: db}
+}
+
+// LastRun / LastError 供状态接口展示。
+func (m *ProxyManager) LastRun() time.Time { m.mu.RLock(); defer m.mu.RUnlock(); return m.lastRun }
+func (m *ProxyManager) LastError() string  { m.mu.RLock(); defer m.mu.RUnlock(); return m.lastErr }
+func (m *ProxyManager) IsRunning() bool    { m.mu.RLock(); defer m.mu.RUnlock(); return m.running }
+
+// fetchSource 抓取单个代理源，返回 host:port 列表。
+func fetchSource(url string, timeout int) []string {
+	client := &http.Client{Timeout: time.Duration(timeout) * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Printf("[proxy] 抓取源失败 %s: %v", url, err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[proxy] 源 %s HTTP %d", url, resp.StatusCode)
+		return nil
+	}
+	// 读全部 body（文本可能较大，但远小于 Go 默认内存限制）
+	buf := new(strings.Builder)
+	if _, err := copyBody(buf, resp.Body); err != nil {
+		log.Printf("[proxy] 读源 %s 失败: %v", url, err)
+		return nil
+	}
+	return parseProxyLines(buf.String())
+}
+
+// testProxyLatency 测一个代理：GET test_url，返回延迟毫秒；失败返回 -1。
+func testProxyLatency(addr, testURL string, timeout int) int {
+	proxyURL := "http://" + addr
+	client := &http.Client{
+		Timeout: time.Duration(timeout) * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(mustParseURL("http://" + proxyURL)),
+		},
+	}
+	start := time.Now()
+	resp, err := client.Get(testURL)
+	if err != nil {
+		return -1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return -1
+	}
+	// 读一点 body 确保链路真的通
+	one := make([]byte, 16)
+	_, _ = resp.Body.Read(one)
+	return int(time.Since(start).Milliseconds())
+}
+
+// RefreshProxies 全量刷新：抓取 → 去重 → 并发测通 → 按延迟排序 → 截断保存。
+// 返回可用代理数；saveLimit<=0 时默认 100。
+// 受 refreshBudget 时间盒约束：到点就停止测通，用已测结果继续（避免几千条
+// 候选把后台线程拖死，与 Python 端 REFRESH_BUDGET_SECONDS 语义一致）。
+const refreshBudget = 90 * time.Second
+
+func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error) {
+	m.mu.Lock()
+	if m.running {
+		m.mu.Unlock()
+		return 0, fmt.Errorf("代理池刷新已在进行中")
+	}
+	m.running = true
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.running = false
+		m.lastRun = time.Now()
+		m.mu.Unlock()
+	}()
+
+	started := time.Now()
+	sources := cfg.Sources
+	if len(sources) == 0 {
+		sources = defaultProxySources
+	}
+	if saveLimit <= 0 {
+		saveLimit = 100
+	}
+	testURL := cfg.TestURL
+	if testURL == "" {
+		testURL = "https://api.ipify.org"
+	}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 8
+	}
+
+	// 1) 并发抓取所有源
+	seen := map[string]string{} // addr -> source（首次出现的源保留）
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, src := range sources {
+		wg.Add(1)
+		go func(s string) {
+			defer wg.Done()
+			items := fetchSource(s, timeout)
+			mu.Lock()
+			for _, addr := range items {
+				if _, ok := seen[addr]; !ok {
+					seen[addr] = s
+				}
+			}
+			mu.Unlock()
+		}(src)
+	}
+	wg.Wait()
+	if len(seen) == 0 {
+		m.mu.Lock()
+		m.lastErr = "所有代理源均未返回可用条目"
+		m.mu.Unlock()
+		return 0, nil
+	}
+
+	// 2) 并发测通（限制并发数；到达时间盒就提前收手）
+	type item struct{ addr, source string }
+	all := make([]item, 0, len(seen))
+	for addr, src := range seen {
+		all = append(all, item{addr, src})
+	}
+	workers := cfg.MaxWorkers
+	if workers <= 0 {
+		workers = 25
+	}
+	results := make([]ProxyEntry, 0, len(all))
+	var mu2 sync.Mutex
+	sem := make(chan struct{}, workers)
+	var wg2 sync.WaitGroup
+	var hitBudget bool
+	for _, it := range all {
+		if time.Since(started) > refreshBudget {
+			hitBudget = true
+			break
+		}
+		wg2.Add(1)
+		go func(it item) {
+			defer wg2.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			latency := testProxyLatency(it.addr, testURL, timeout)
+			alive := latency >= 0
+			mu2.Lock()
+			results = append(results, ProxyEntry{
+				Source:      it.source,
+				Addr:        it.addr,
+				LatencyMs:   maxInt(0, latency),
+				Alive:       alive,
+				LastChecked: time.Now().UTC().Format(time.RFC3339),
+				LastAliveAt: time.Now().UTC().Format(time.RFC3339),
+			})
+			mu2.Unlock()
+		}(it)
+	}
+	wg2.Wait()
+	if hitBudget {
+		log.Printf("[proxy] 刷新到达时间盒 %s，测试了 %d/%d 条候选", refreshBudget, len(results), len(all))
+	}
+
+	// 3) 排序：alive 在前，按延迟升序；dead 在后
+	sortProxies(results)
+
+	// 4) 截断保存：只保留前 saveLimit 条（alive 优先，凑不齐也保留 dead 以便观察）
+	if len(results) > saveLimit {
+		results = results[:saveLimit]
+	}
+
+	// 5) 写库：清空旧表再插入（简单、一致；并发写用单连接串行，安全）
+	if err := m.replaceAll(results); err != nil {
+		return 0, err
+	}
+	aliveCount := 0
+	for _, r := range results {
+		if r.Alive {
+			aliveCount++
+		}
+	}
+	m.mu.Lock()
+	m.lastErr = ""
+	m.mu.Unlock()
+	return aliveCount, nil
+}
+
+// replaceAll 清空 proxies 表并写入新结果（单事务）。
+func (m *ProxyManager) replaceAll(entries []ProxyEntry) error {
+	tx, err := m.db.Begin()
+	if err != nil {
+		return fmt.Errorf("开启事务: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.Exec(`DELETE FROM proxies`); err != nil {
+		return fmt.Errorf("清空 proxies: %w", err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO proxies (source, addr, latency_ms, alive, last_checked, last_alive_at) VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("准备插入: %w", err)
+	}
+	defer stmt.Close()
+	for _, e := range entries {
+		lastAlive := sql.NullString{}
+		if e.Alive {
+			lastAlive = sql.NullString{String: e.LastAliveAt, Valid: true}
+		}
+		if _, err := stmt.Exec(e.Source, e.Addr, e.LatencyMs, boolToInt(e.Alive), e.LastChecked, lastAlive); err != nil {
+			return fmt.Errorf("插入代理: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务: %w", err)
+	}
+	return nil
+}
+
+// ListProxies 查询代理列表。aliveOnly=true 只返回可用；orderByLatency=true 按延迟排序。
+func (m *ProxyManager) ListProxies(aliveOnly bool, limit int) ([]ProxyEntry, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	q := `SELECT id, source, addr, latency_ms, alive, last_checked, COALESCE(last_alive_at,'') FROM proxies`
+	if aliveOnly {
+		q += ` WHERE alive = 1`
+	}
+	q += ` ORDER BY alive DESC, latency_ms ASC LIMIT ?`
+	rows, err := m.db.Query(q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ProxyEntry{}
+	for rows.Next() {
+		var e ProxyEntry
+		if err := rows.Scan(&e.ID, &e.Source, &e.Addr, &e.LatencyMs, &e.Alive, &e.LastChecked, &e.LastAliveAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ProxyStats 各源统计。
+type ProxyStats struct {
+	Total    int            `json:"total"`
+	Alive    int            `json:"alive"`
+	BySource map[string]int `json:"by_source"`
+}
+
+// Stats 统计可用/总数/按源分布。
+func (m *ProxyManager) Stats() (ProxyStats, error) {
+	var st ProxyStats
+	st.BySource = map[string]int{}
+	rows, err := m.db.Query(`SELECT source, alive, COUNT(*) FROM proxies GROUP BY source, alive`)
+	if err != nil {
+		return st, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var src string
+		var alive bool
+		var n int
+		if err := rows.Scan(&src, &alive, &n); err != nil {
+			return st, err
+		}
+		st.Total += n
+		st.BySource[src] += n
+		if alive {
+			st.Alive += n
+		}
+	}
+	return st, rows.Err()
+}
+
+// AvailableAddrs 返回当前可用代理地址列表（供 Actions 预取）。
+func (m *ProxyManager) AvailableAddrs(limit int) []string {
+	if limit <= 0 {
+		limit = 100
+	}
+	entries, err := m.ListProxies(true, limit)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Addr)
+	}
+	return out
+}
+
+// --- helpers ---
+
+func sortProxies(entries []ProxyEntry) {
+	// 简单排序：alive 优先，再按延迟升序（不引额外依赖）
+	for i := 1; i < len(entries); i++ {
+		for j := i; j > 0; j-- {
+			a, b := entries[j-1], entries[j]
+			better := false
+			if a.Alive != b.Alive {
+				better = a.Alive // alive 在前
+			} else if a.LatencyMs != b.LatencyMs {
+				better = a.LatencyMs < b.LatencyMs
+			} else {
+				better = a.Addr < b.Addr
+			}
+			if better {
+				break
+			}
+			entries[j-1], entries[j] = b, a
+		}
+	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func mustParseURL(raw string) *url.URL {
+	u, err := url.Parse(raw)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
+var defaultProxySources = []string{
+	"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+	"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+	"https://raw.githubusercontent.com/proxy4parsing/proxy-list/main/http.txt",
+	"https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+	"https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+	"https://www.89ip.cn/tqdl.html?api=1&num=200",
+}
+
+func copyBody(dst *strings.Builder, src io.Reader) (int64, error) {
+	// 简化实现：读进 []byte 再写入 builder
+	buf := make([]byte, 32*1024)
+	var total int64
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			dst.Write(buf[:n])
+			total += int64(n)
+		}
+		if err != nil {
+			if err == io.EOF {
+				return total, nil
+			}
+			return total, err
+		}
+	}
+}

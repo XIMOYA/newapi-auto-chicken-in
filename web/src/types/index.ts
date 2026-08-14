@@ -66,6 +66,14 @@ export interface ProxyPoolConfig {
   max_proxies: number
   ip_swap_limit: number
   sources: string[]
+  /** 服务器端代理池后台刷新间隔（分钟），0=关闭自动刷新 */
+  refresh_minutes: number
+  /** 服务器端最多保留多少条可用代理 */
+  save_limit: number
+  /** 后台刷新时是否测通 */
+  auto_test: boolean
+  /** Actions 预取地址提示（供展示） */
+  remote_url: string
 }
 
 export interface NotifyEmailConfig {
@@ -174,6 +182,27 @@ export interface CreateKeyResult {
   id: number
   name: string
   key: string
+}
+
+// ===== 代理池 =====
+
+export interface ProxyEntry {
+  id: number
+  source: string
+  addr: string
+  latency_ms: number
+  alive: boolean
+  last_checked_at: string
+  last_alive_at?: string
+}
+
+export interface ProxyStatsResult {
+  total: number
+  alive: number
+  by_source: Record<string, number>
+  last_run: string
+  last_error: string
+  running: boolean
 }
 
 // ===== 导出 =====

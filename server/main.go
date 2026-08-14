@@ -18,10 +18,12 @@ package main
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"log"
 	"net/http"
 	"os"
+	"time"
 )
 
 func main() {
@@ -73,9 +75,43 @@ func main() {
 		log.Printf("未找到前端静态文件，仅提供 API 服务")
 	}
 
+	// 代理池后台刷新：按 proxy_pool.refresh_minutes 周期抓取+测通（可配置，<=0 关闭）
+	startProxyRefresher(db, srv.proxies)
+
 	if err := http.ListenAndServe(addr, srv.routes()); err != nil {
 		log.Fatalf("HTTP 服务异常退出: %v", err)
 	}
+}
+
+// startProxyRefresher 启动后台协程：按配置周期刷新代理池。
+// refresh_minutes <= 0 时仅保留手动刷新能力。
+func startProxyRefresher(db *sql.DB, mgr *ProxyManager) {
+	go func() {
+		// 启动后立即刷一次，让页面/Actions 第一时间有数据
+		cfg, _, err := LoadConfig(db)
+		if err == nil {
+			if _, rerr := mgr.RefreshProxies(cfg.ProxyPool, cfg.ProxyPool.SaveLimit); rerr != nil {
+				log.Printf("[proxy] 启动刷新失败: %v", rerr)
+			}
+		}
+		for {
+			cfg, _, err = LoadConfig(db)
+			if err != nil {
+				time.Sleep(60 * time.Second)
+				continue
+			}
+			interval := cfg.ProxyPool.RefreshMinutes
+			if interval <= 0 {
+				// 后台刷新关闭：睡长一点再检查（避免空转），随时可被手动触发
+				time.Sleep(10 * time.Minute)
+				continue
+			}
+			time.Sleep(time.Duration(interval) * time.Minute)
+			if _, rerr := mgr.RefreshProxies(cfg.ProxyPool, cfg.ProxyPool.SaveLimit); rerr != nil {
+				log.Printf("[proxy] 周期刷新失败: %v", rerr)
+			}
+		}
+	}()
 }
 
 // randomHex 生成 n 字节的随机十六进制字符串。

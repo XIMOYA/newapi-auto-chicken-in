@@ -108,6 +108,9 @@ func createSchema(db *sql.DB) error {
 			return fmt.Errorf("建表失败: %w", err)
 		}
 	}
+	if err := createProxiesTable(db); err != nil {
+		return err
+	}
 	return nil
 }
 

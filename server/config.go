@@ -96,6 +96,14 @@ type ProxyPool struct {
 	MaxProxies  int      `json:"max_proxies"`
 	IPSwapLimit int      `json:"ip_swap_limit"`
 	Sources     []string `json:"sources"`
+	// 服务器端代理池后台刷新：服务常驻抓取+测通，供页面展示与 Actions 预取。
+	// RefreshMinutes <= 0 表示关闭后台刷新（仅手动/页面触发）。
+	RefreshMinutes int  `json:"refresh_minutes"`
+	SaveLimit      int  `json:"save_limit"` // 最多保留多少条可用代理（默认 100）
+	AutoTest       bool `json:"auto_test"`  // 后台刷新时是否测通+测延迟（默认 true）
+	// 给 Actions 用的预取地址（remote_url 是给 Python 端 config 用的展示字段，
+	// 实际 Actions 通过 /api/proxies/available 取）。
+	RemoteURL string `json:"remote_url"`
 }
 
 // Notify 通知配置。
@@ -172,13 +180,17 @@ func DefaultConfig() Config {
 			IntervalSeconds: []int{3, 8},
 		},
 		ProxyPool: ProxyPool{
-			Enabled:     false,
-			TestURL:     "https://api.ipify.org",
-			Timeout:     8,
-			MaxWorkers:  25,
-			MaxProxies:  250,
-			IPSwapLimit: 2,
-			Sources:     []string{},
+			Enabled:        false,
+			TestURL:        "https://api.ipify.org",
+			Timeout:        8,
+			MaxWorkers:     25,
+			MaxProxies:     250,
+			IPSwapLimit:    2,
+			Sources:        []string{},
+			RefreshMinutes: 30,
+			SaveLimit:      100,
+			AutoTest:       true,
+			RemoteURL:      "",
 		},
 		Notify: Notify{
 			Email: EmailConfig{

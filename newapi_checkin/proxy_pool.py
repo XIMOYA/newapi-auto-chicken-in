@@ -71,6 +71,12 @@ class ProxyPoolConfig:
     max_proxies: int = 250      # 已废弃：测通不再设数量上限，保留只为配置兼容
     ip_swap_limit: int = 2      # 目标站点连不上时最多换几次 IP
     sources: list = field(default_factory=list)   # 空 = 用内置默认源
+    # 服务器端代理池预取：配置管理平台已提前抓取+测通，签到前直接拉现成列表，
+    # 省去本地抓源+测通（remote_url 非空且请求成功时优先使用，失败降级本地抓取）
+    remote_url: str = ""
+    remote_token: str = ""
+    remote_token_header: str = "Authorization"
+    remote_token_prefix: str = "Bearer"
 
     @classmethod
     def from_raw(cls, raw: Optional[dict]) -> "ProxyPoolConfig":
@@ -89,6 +95,10 @@ class ProxyPoolConfig:
             max_proxies=max(1, min(100000, _as_int(raw.get("max_proxies"), 250))),
             ip_swap_limit=max(0, min(10, _as_int(raw.get("ip_swap_limit"), 2))),
             sources=sources,
+            remote_url=str(raw.get("remote_url") or "").strip(),
+            remote_token=str(raw.get("remote_token") or "").strip(),
+            remote_token_header=str(raw.get("remote_token_header") or "Authorization").strip() or "Authorization",
+            remote_token_prefix=str(raw.get("remote_token_prefix") or "Bearer").strip(),
         )
 
     def to_dict(self) -> dict:
@@ -100,6 +110,10 @@ class ProxyPoolConfig:
             "max_proxies": self.max_proxies,
             "ip_swap_limit": self.ip_swap_limit,
             "sources": list(self.sources),
+            "remote_url": self.remote_url,
+            "remote_token": self.remote_token,
+            "remote_token_header": self.remote_token_header,
+            "remote_token_prefix": self.remote_token_prefix,
         }
 
 
@@ -132,7 +146,68 @@ class ProxyPool:
         return list(self.cfg.sources or DEFAULT_SOURCES)
 
     def refresh(self, desired: Optional[int] = None) -> int:
-        """抓取所有源 -> 去重 -> 并发测通 -> 保留可用。返回可用数量。
+        """获取可用代理。优先服务器预取列表（remote_url），失败降级本地抓源测通。
+
+        服务器（配置管理平台）已提前抓取+测通并保存可用列表，直接拉取可以
+        省掉「现场抓 6 个源 + 并发测通」的几十秒。连不上的仍由上层 mark_bad
+        换 IP 兜底，不会变差。
+        """
+        if self.cfg.remote_url:
+            remote = self._fetch_remote()
+            if remote:
+                with self._lock:
+                    self._available = list(remote)
+                    self._used.clear()
+                    self._bad.clear()
+                log.ok(f"代理池就绪（服务器预取）: {len(remote)} 个可用代理")
+                return len(remote)
+            log.warn(f"服务器代理池预取失败/为空，降级本地抓取: {self.last_error or 'remote_url 无返回'}")
+
+        return self._refresh_local(desired)
+
+    def _fetch_remote(self) -> Optional[list]:
+        """请求配置管理平台 /api/proxies/available，返回可用代理地址列表。"""
+        from curl_cffi import requests as cffi
+
+        headers = {"Accept": "application/json, text/plain, */*"}
+        if self.cfg.remote_token:
+            prefix = self.cfg.remote_token_prefix.strip()
+            headers[self.cfg.remote_token_header] = f"{prefix} {self.cfg.remote_token}".strip()
+        try:
+            resp = cffi.get(
+                self.cfg.remote_url,
+                headers=headers,
+                timeout=self.cfg.timeout,
+                impersonate="chrome",
+                verify=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 预取是可降级项
+            self.last_error = f"远程代理预取请求失败: {type(exc).__name__}: {exc}"
+            log.debug(self.last_error)
+            return None
+        if resp.status_code != 200:
+            self.last_error = f"远程代理预取 HTTP {resp.status_code}"
+            log.debug(self.last_error)
+            return None
+        try:
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"远程代理预取响应非 JSON: {type(exc).__name__}: {exc}"
+            log.debug(self.last_error)
+            return None
+        raw_list = data.get("proxies") if isinstance(data, dict) else None
+        if not isinstance(raw_list, (list, tuple)) or not raw_list:
+            self.last_error = "远程代理预取返回空列表"
+            return None
+        addrs = [str(p).strip() for p in raw_list if str(p).strip()]
+        if not addrs:
+            self.last_error = "远程代理预取列表为空"
+            return None
+        log.debug(f"远程代理预取: {len(addrs)} 条（来源 {data.get('checked_at', '?')}）")
+        return addrs
+
+    def _refresh_local(self, desired: Optional[int] = None) -> int:
+        """本地抓取所有源 -> 去重 -> 并发测通 -> 保留可用。返回可用数量。
 
         免费代理源列表通常把「刚测过/存活率高」的排在前面，所以抽样用
         「按源轮转」而不是随机：优先各源最前面的几条，存活率更高。

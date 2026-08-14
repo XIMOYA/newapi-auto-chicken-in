@@ -26,15 +26,16 @@ import (
 // serverVersion 健康检查接口返回的版本号。
 const serverVersion = "1.0.0"
 
-// Server 服务依赖：数据库连接与 JWT 签名密钥。
+// Server 服务依赖：数据库连接、JWT 签名密钥与代理池管理器。
 type Server struct {
 	db        *sql.DB
 	jwtSecret []byte
+	proxies   *ProxyManager
 }
 
 // NewServer 构造服务实例；jwtSecret 为 JWT 签名密钥（main 已校验长度）。
 func NewServer(db *sql.DB, jwtSecret string) *Server {
-	return &Server{db: db, jwtSecret: []byte(jwtSecret)}
+	return &Server{db: db, jwtSecret: []byte(jwtSecret), proxies: NewProxyManager(db)}
 }
 
 // routes 注册全部 HTTP 路由并返回根 Handler。
@@ -57,6 +58,12 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/export", s.requireJWT(s.handleExport))
 	mux.HandleFunc("PUT /api/password", s.requireJWT(s.handlePassword))
 	mux.HandleFunc("POST /api/auth/verify-password", s.requireJWT(s.handleVerifyPassword))
+
+	// 代理池管理
+	mux.HandleFunc("GET /api/proxies", s.requireJWT(s.handleListProxies))
+	mux.HandleFunc("GET /api/proxies/available", s.requireAPIKey(s.handleAvailableProxies))
+	mux.HandleFunc("GET /api/proxies/stats", s.requireJWT(s.handleProxyStats))
+	mux.HandleFunc("POST /api/proxies/refresh", s.requireJWT(s.handleRefreshProxies))
 
 	mux.Handle("/", s.staticHandler())
 	return mux
@@ -113,9 +120,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// 配置
+// 辅助
 // ---------------------------------------------------------------------------
-
 // handleGetConfig GET /api/config（JWT）—— 返回打码后的配置与更新时间。
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	cfg, updatedAt, err := LoadConfig(s.db)
@@ -506,8 +512,86 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// 辅助
+// 代理池管理接口
 // ---------------------------------------------------------------------------
+
+// handleListProxies GET /api/proxies（JWT）—— 代理列表（页面展示）。
+// 支持 ?alive=1 只返回可用、?limit=N 数量、?source=xxx 按来源过滤。
+func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
+	aliveOnly := r.URL.Query().Get("alive") == "1"
+	limit := 500
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 2000 {
+			limit = n
+		}
+	}
+	entries, err := s.proxies.ListProxies(aliveOnly, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "查询代理列表失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"proxies": entries,
+		"total":   len(entries),
+	})
+}
+
+// handleAvailableProxies GET /api/proxies/available（API Key）—— Actions 预取可用代理列表。
+// 返回 {"proxies": ["ip:port", ...], "count": N, "checked_at": "..."}。
+func (s *Server) handleAvailableProxies(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 2000 {
+			limit = n
+		}
+	}
+	addrs := s.proxies.AvailableAddrs(limit)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"proxies":    addrs,
+		"count":      len(addrs),
+		"checked_at": s.proxies.LastRun().UTC().Format(time.RFC3339),
+	})
+}
+
+// handleProxyStats GET /api/proxies/stats（JWT）—— 统计与最近刷新状态。
+func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
+	st, err := s.proxies.Stats()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "统计代理失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total":      st.Total,
+		"alive":      st.Alive,
+		"by_source":  st.BySource,
+		"last_run":   s.proxies.LastRun().UTC().Format(time.RFC3339),
+		"last_error": s.proxies.LastError(),
+		"running":    s.proxies.IsRunning(),
+	})
+}
+
+// handleRefreshProxies POST /api/proxies/refresh（JWT）—— 手动触发一次刷新。
+func (s *Server) handleRefreshProxies(w http.ResponseWriter, r *http.Request) {
+	if s.proxies.IsRunning() {
+		writeError(w, http.StatusConflict, "代理池刷新已在进行中")
+		return
+	}
+	cfg, _, err := LoadConfig(s.db)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "服务器内部错误")
+		return
+	}
+	limit := cfg.ProxyPool.SaveLimit
+	go func() {
+		alive, rerr := s.proxies.RefreshProxies(cfg.ProxyPool, limit)
+		if rerr != nil {
+			log.Printf("[proxy] 手动刷新失败: %v", rerr)
+		} else {
+			log.Printf("[proxy] 手动刷新完成，可用代理 %d 条", alive)
+		}
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "代理池刷新已开始"})
+}
 
 // writeJSON 以指定状态码输出 JSON 响应（统一 Content-Type）。
 func writeJSON(w http.ResponseWriter, status int, v any) {
