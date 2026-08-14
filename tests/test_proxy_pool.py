@@ -89,19 +89,45 @@ class TestProxyPoolConfig:
 
 
 class TestProxyPoolAllocation:
-    def test_acquire_never_repeats_until_exhausted(self):
+    """核心约定：优先独占；池子用尽时共用，绝不返回「直连」。"""
+
+    def test_acquire_prefers_exclusive_ips(self):
         pool = ProxyPool(ProxyPoolConfig())
         pool._available = ["a:80", "b:80", "c:80"]
         picked = {pool.acquire() for _ in range(3)}
         assert picked == {"a:80", "b:80", "c:80"}
-        assert pool.acquire() is None  # 用尽 -> None（上层降级直连）
+
+    def test_exhausted_pool_shares_instead_of_returning_none(self):
+        pool = ProxyPool(ProxyPoolConfig())
+        pool._available = ["a:80", "b:80"]
+        first, second = pool.acquire(), pool.acquire()
+        third = pool.acquire()
+        assert third is not None                 # 宁可共用也不直连
+        assert third in {first, second}
+
+    def test_sharing_is_spread_across_ips(self):
+        """共用时挑当前账号数最少的 IP，别把所有账号堆到同一个出口上。"""
+        pool = ProxyPool(ProxyPoolConfig())
+        pool._available = ["a:80", "b:80"]
+        pool.acquire()
+        pool.acquire()
+        extra = [pool.acquire() for _ in range(4)]
+        assert sorted(extra) == ["a:80", "a:80", "b:80", "b:80"]
+        assert pool._share_count == {"a:80": 3, "b:80": 3}
+
+    def test_returns_none_only_when_everything_is_blacklisted(self):
+        pool = ProxyPool(ProxyPoolConfig())
+        pool._available = ["a:80"]
+        pool.mark_bad("a:80")
+        assert pool.acquire() is None
 
     def test_mark_bad_excludes_proxy(self):
         pool = ProxyPool(ProxyPoolConfig())
         pool._available = ["a:80", "b:80"]
         pool.mark_bad("a:80")
-        first = pool.acquire()
-        assert first == "b:80"
+        assert pool.acquire() == "b:80"
+        assert pool.acquire() == "b:80"           # 只剩 b -> 共用 b
+        pool.mark_bad("b:80")
         assert pool.acquire() is None
 
     def test_mark_bad_after_acquire(self):
@@ -111,11 +137,14 @@ class TestProxyPoolAllocation:
         pool.mark_bad(first)
         assert pool.acquire() != first
 
-    def test_has_available(self):
+    def test_has_available_vs_has_exclusive(self):
         pool = ProxyPool(ProxyPoolConfig())
         pool._available = ["a:80"]
-        assert pool.has_available() is True
+        assert pool.has_exclusive() is True
         pool.acquire()
+        assert pool.has_exclusive() is False      # 没有空闲的了
+        assert pool.has_available() is True       # 但还能共用
+        pool.mark_bad("a:80")
         assert pool.has_available() is False
 
 
@@ -204,12 +233,28 @@ def test_network_error_swaps_proxy_and_retries(monkeypatch, tmp_path):
     assert "p1:80" in runner._pool._bad  # 失败代理被拉黑
 
 
-def test_pool_exhausted_falls_back_to_direct(monkeypatch, tmp_path):
+def test_pool_exhausted_skips_account_instead_of_going_direct(monkeypatch, tmp_path):
+    """启用代理池 = 必须走代理：一个代理都拿不到时跳过账号，不暴露真实 IP。"""
     runner = _make_runner(monkeypatch, tmp_path, pool_proxies=[])
     account = runner.cfg.accounts[0]
 
-    def fake_attempt(acct, record):
-        assert acct.proxy is None  # 没分配到代理 -> 直连
+    def fake_attempt(_acct, _record):
+        raise AssertionError("没有代理时不该发起签到")
+
+    monkeypatch.setattr(runner, "_attempt", fake_attempt)
+    row = runner._run_account(account)
+    assert row.status == "skipped"
+    assert "不降级直连" in row.detail
+    assert account.proxy is None
+
+
+def test_direct_still_works_when_pool_disabled(monkeypatch, tmp_path):
+    """没启用代理池就是用户自己选择直连，不能被「必须走代理」挡住。"""
+    runner = _make_runner(monkeypatch, tmp_path, pool_proxies=None, pool_enabled=False)
+    account = runner.cfg.accounts[0]
+
+    def fake_attempt(acct, _record):
+        assert acct.proxy is None
         return runner_mod.log.SummaryRow(acct.name, "success", "S1", "ok")
 
     monkeypatch.setattr(runner, "_attempt", fake_attempt)
@@ -326,43 +371,75 @@ class TestProbeEarlyStop:
         assert alive == []
 
 
-class TestDynamicAccountScaling:
-    """账号数量是动态的：目标 IP 数、候选取样量都要随账号数一起放大。"""
+class TestFullSweep:
+    """测通不设数量上限：抓到多少条就全测多少条。"""
 
-    def test_candidate_sampling_scales_with_account_count(self, monkeypatch):
+    def test_tests_every_fetched_candidate(self, monkeypatch):
         found = [f"10.0.{i // 250}.{i % 250}:8080" for i in range(4000)]
         pool = ProxyPool(ProxyPoolConfig(max_proxies=100, max_workers=8))
         monkeypatch.setattr(pool, "_fetch_all_sources", lambda: [found])
-        seen = []
+        seen = {}
 
-        def fake_test_many(batch, need=None, deadline=None):
-            seen.append(len(batch))
-            return list(batch[:3])          # 每批只有 3 条活的，逼它继续补测
+        def fake_test_many(candidates, need=None, deadline=None):
+            seen["count"] = len(candidates)
+            seen["need"] = need
+            return list(candidates[:37])
 
         monkeypatch.setattr(pool, "_test_many", fake_test_many)
-        # 60 个账号 + 10 换 IP 余量
         count = pool.refresh(desired=70)
-        assert count > 0
-        # 目标 70 条、每批只通 3 条 -> 必须测很多批，而不是固定 4 轮就收手
-        assert len(seen) > 4
-        assert all(size <= 100 for size in seen)   # 每批不超过 max_proxies
+        assert count == 37
+        assert seen["count"] == 4000        # 全量，不再按目标数取样
+        assert seen["need"] is None        # 也不再「凑够就收手」
 
-    def test_refresh_is_time_boxed(self, monkeypatch):
+    def test_max_proxies_no_longer_caps_the_sweep(self, monkeypatch):
+        found = [f"10.0.0.{i}:8080" for i in range(200)]
+        pool = ProxyPool(ProxyPoolConfig(max_proxies=5, max_workers=4))
+        monkeypatch.setattr(pool, "_fetch_all_sources", lambda: [found])
+        sizes = []
+        monkeypatch.setattr(
+            pool, "_test_many",
+            lambda candidates, need=None, deadline=None: (sizes.append(len(candidates)),
+                                                          list(candidates))[1],
+        )
+        assert pool.refresh(desired=10) == 200
+        assert sizes == [200]              # 一次测完，不再分批
+
+    def test_cross_source_dedup(self, monkeypatch):
+        pool = ProxyPool(ProxyPoolConfig(max_workers=4))
+        monkeypatch.setattr(
+            pool, "_fetch_all_sources",
+            lambda: [["1.1.1.1:80", "2.2.2.2:80"], ["2.2.2.2:80", "3.3.3.3:80"]],
+        )
+        monkeypatch.setattr(
+            pool, "_test_many",
+            lambda candidates, need=None, deadline=None: list(candidates),
+        )
+        assert pool.refresh() == 3
+
+    def test_deadline_is_derived_from_workload(self, monkeypatch):
+        """时间盒按「波数 × 单条超时」推导，只兜底卡死，不再充当数量上限。"""
         import time
 
-        found = [f"10.0.0.{i}:8080" for i in range(200)]
-        pool = ProxyPool(ProxyPoolConfig(max_proxies=10, max_workers=4))
+        found = [f"10.0.0.{i}:8080" for i in range(20)]
+        pool = ProxyPool(ProxyPoolConfig(max_workers=5, timeout=3))
         monkeypatch.setattr(pool, "_fetch_all_sources", lambda: [found])
-        monkeypatch.setattr(proxy_pool_mod, "REFRESH_BUDGET_SECONDS", 0.5)
+        captured = {}
 
-        def slow_batch(batch, need=None, deadline=None):
-            time.sleep(0.2)
-            return []
+        def fake_test_many(candidates, need=None, deadline=None):
+            captured["budget"] = deadline - time.monotonic()
+            return list(candidates)
 
-        monkeypatch.setattr(pool, "_test_many", slow_batch)
-        started = time.monotonic()
-        pool.refresh(desired=500)
-        assert time.monotonic() - started < 3.0
+        monkeypatch.setattr(pool, "_test_many", fake_test_many)
+        pool.refresh()
+        # 20 条 / 5 并发 = 4 波，4 × 3s + 余量
+        expected = 4 * 3 + proxy_pool_mod.REFRESH_SLACK_SECONDS
+        assert abs(captured["budget"] - expected) < 1.0
+
+    def test_empty_sources_report_error(self, monkeypatch):
+        pool = ProxyPool(ProxyPoolConfig())
+        monkeypatch.setattr(pool, "_fetch_all_sources", lambda: [])
+        assert pool.refresh() == 0
+        assert pool.last_error
 
 
 class TestOneProxyPerAccount:
@@ -410,19 +487,46 @@ class TestOneProxyPerAccount:
         assert first.proxy == "http://fixed.example.com:8080"
         assert second.proxy == "p1:80"
 
-    def test_shortage_is_reported_upfront(self, monkeypatch, tmp_path):
-        """池子不够时必须提前说清楚，别让「一账号一 IP」悄悄退化。"""
+    def test_shortage_says_accounts_will_share_not_go_direct(self, monkeypatch, tmp_path):
+        """池子不够时提前说清楚：多出来的账号共用 IP，而不是降级直连。"""
         runner = _make_runner(monkeypatch, tmp_path, pool_proxies=[])
         warnings = []
         monkeypatch.setattr(runner_mod.log, "warn", warnings.append)
-        runner._warn_proxy_shortage(3, 10)
-        assert warnings and "只有 3 个" in warnings[0] and "7 个将降级直连" in warnings[0]
+        runner._report_proxy_capacity(3, 10)
+        assert warnings
+        assert "只有 3 个" in warnings[0]
+        assert "7 个会与它们共用 IP" in warnings[0]
+        assert "不会降级直连" in warnings[0]
+
+    def test_exhausted_pool_shares_across_accounts(self, monkeypatch, tmp_path):
+        """代理比账号少时，多出来的账号共用已分配的 IP，不会拿到 None。"""
+        runner = _make_runner(monkeypatch, tmp_path, pool_proxies=None)
+        pool = ProxyPool(ProxyPoolConfig(enabled=True))
+        pool._available = ["10.0.0.1:8080"]
+        runner._pool = pool
+        first, second = runner.cfg.accounts
+        runner._assign_proxy(first)
+        runner._assign_proxy(second)
+        assert first.proxy == "10.0.0.1:8080"
+        assert second.proxy == "10.0.0.1:8080"      # 共用同一个出口 IP
+        assert pool._share_count["10.0.0.1:8080"] == 2
+
+    def test_swap_keeps_old_proxy_when_pool_is_empty(self, monkeypatch, tmp_path):
+        """换不到新代理时保留原代理继续重试，绝不清空成直连。"""
+        runner = _make_runner(monkeypatch, tmp_path, pool_proxies=None)
+        pool = ProxyPool(ProxyPoolConfig(enabled=True))
+        pool._available = ["10.0.0.1:8080"]
+        runner._pool = pool
+        account = runner.cfg.accounts[0]
+        runner._assign_proxy(account)
+        assert runner._swap_proxy(account) is None
+        assert account.proxy == "10.0.0.1:8080"     # 没有被清空
 
     def test_sufficient_pool_reports_headroom(self, monkeypatch, tmp_path):
         runner = _make_runner(monkeypatch, tmp_path, pool_proxies=[])
         infos = []
         monkeypatch.setattr(runner_mod.log, "info", infos.append)
-        runner._warn_proxy_shortage(15, 10)
+        runner._report_proxy_capacity(15, 10)
         assert infos and "一账号一 IP" in infos[0] and "余量 5" in infos[0]
 
     def test_swapped_proxy_is_never_reassigned(self, monkeypatch, tmp_path):

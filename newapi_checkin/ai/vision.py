@@ -4,7 +4,9 @@
   - temperature=0，先试 response_format=json_object，模型不支持就自动降级到 prompt 约束
   - 输出用 loose_json 容错解析（剥 ``` 围栏、提取首个平衡 JSON）
   - 有限重试；仍失败就返回 None，让上层降级到 S4，AI 绝不是单点故障
-  - 请求超时会进入 TIMEOUT_COOLDOWN 秒的全局避让：超时通常意味着模型侧过载
+  - 请求走该账号的代理（见 use_proxy），不让视觉调用暴露真实出口 IP；
+    代理不通时自动改走直连，AI 依旧不是单点故障
+  - 直连请求超时会进入 TIMEOUT_COOLDOWN 秒的全局避让：超时通常意味着模型侧过载
     或限流，立刻重发只会加重拥塞，所以让所有线程一起等一会儿再继续
   - 日志里 api_key 一律脱敏
 """
@@ -14,8 +16,9 @@ from __future__ import annotations
 import base64
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Iterator, Optional, Tuple
 
 from curl_cffi import requests as cffi
 
@@ -76,6 +79,8 @@ class VisionClient:
         # 超时避让：所有线程共享同一个解禁时刻
         self._cooldown_lock = threading.Lock()
         self._cooldown_until = 0.0
+        # 每个工作线程各自绑定自己账号的代理（见 use_proxy）
+        self._local = threading.local()
         self._session = cffi.Session(
             timeout=cfg.timeout,
             headers={
@@ -84,6 +89,27 @@ class VisionClient:
                 "Accept": "application/json",
             },
         )
+
+    # ------------------------------------------------------------------ #
+    # 代理绑定：AI 请求跟着账号走同一个出口 IP
+    # ------------------------------------------------------------------ #
+
+    def current_proxy(self) -> Optional[str]:
+        return getattr(self._local, "proxy", None)
+
+    @contextmanager
+    def use_proxy(self, proxy: Optional[str]) -> Iterator[None]:
+        """在代码块内让**本线程**的 AI 请求走指定代理，退出时还原。"""
+        previous = self.current_proxy()
+        self._local.proxy = proxy or None
+        try:
+            yield
+        finally:
+            self._local.proxy = previous
+
+    @staticmethod
+    def _proxies(proxy: Optional[str]) -> dict:
+        return {"proxies": {"http": proxy, "https": proxy}} if proxy else {}
 
     # ------------------------------------------------------------------ #
     # 超时避让
@@ -151,6 +177,8 @@ class VisionClient:
         started = time.monotonic()
         # 避让休眠是主动让路，不该算进请求预算里
         paused = 0.0
+        proxy = self.current_proxy()
+        proxy_dead = False
         for attempt in range(1, attempts + 1):
             # 每次发请求前都尊重全局避让：别人刚超时，本线程也一起等
             paused += self._wait_cooldown()
@@ -158,14 +186,23 @@ class VisionClient:
             if remaining <= 0.5:
                 log.debug(f"AI 调用预算 {budget:.0f}s 已用尽（第 {attempt}/{attempts} 次前）")
                 break
+            use_proxy = None if proxy_dead else proxy
+            # 代理不通时会一直挂到超时，所以只给它一半预算，留出直连兜底的时间
+            limit = min(remaining, max(5.0, budget * 0.5)) if use_proxy else remaining
             payload = self._payload(prompt, images, detail, max_tokens)
             try:
                 with self._post_lock:
                     resp = self._session.post(self.cfg.chat_url, json=payload,
-                                              timeout=remaining)
+                                              timeout=limit, **self._proxies(use_proxy))
             except Exception as exc:  # noqa: BLE001
-                if is_timeout(exc):
-                    # 超时基本等于模型侧过载/限流，立刻重发只会加重拥塞
+                if use_proxy:
+                    # 经代理失败说明代理有问题，不能据此判定 AI 端点过载，
+                    # 所以不进避让，直接改走直连
+                    proxy_dead = True
+                    log.warn(f"AI 请求经代理失败({attempt}/{attempts})，改为直连重试: "
+                             f"{type(exc).__name__}: {exc}"[:160])
+                elif is_timeout(exc):
+                    # 直连也超时基本等于模型侧过载/限流，立刻重发只会加重拥塞
                     self._enter_cooldown()
                     log.warn(f"AI 请求超时({attempt}/{attempts})，"
                              f"避让 {TIMEOUT_COOLDOWN:.0f}s 后再继续")
@@ -280,7 +317,9 @@ class VisionClient:
     def ping(self) -> Tuple[bool, str]:
         """doctor 用：验证接口连通与鉴权。"""
         try:
-            resp = self._session.get(self.cfg.models_url)
+            with self._post_lock:
+                resp = self._session.get(self.cfg.models_url,
+                                         **self._proxies(self.current_proxy()))
         except Exception as exc:  # noqa: BLE001
             return False, f"{type(exc).__name__}: {exc}"
         if resp.status_code >= 400:

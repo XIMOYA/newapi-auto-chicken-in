@@ -72,7 +72,7 @@ class Runner:
 
     def init_proxy_pool(self, desired: Optional[int] = None,
                         accounts: Optional[int] = None) -> None:
-        """抓取并测通代理池。失败/为空时降级直连，绝不中断签到。"""
+        """抓取并测通代理池。启用了代理池就意味着「必须走代理」，不再降级直连。"""
         if not self.cfg.proxy_pool.enabled:
             log.debug("代理池未启用（proxy_pool.enabled=false）")
             return
@@ -83,28 +83,35 @@ class Runner:
             count = self._pool.refresh(desired=desired)
             if count:
                 log.ok(f"代理池就绪: {count} 个可用代理")
-                self._warn_proxy_shortage(count, accounts)
+                self._report_proxy_capacity(count, accounts)
             else:
-                log.warn(f"代理池为空，本次签到降级直连: {self._pool.last_error}")
-        except Exception as exc:  # noqa: BLE001 - 代理池是可降级项，绝不能中断签到
-            log.warn(f"代理池初始化失败，降级直连: {type(exc).__name__}: {exc}")
+                log.err(f"代理池为空: {self._pool.last_error}；"
+                        f"已要求必须走代理，本轮所有账号都会被跳过（不降级直连）")
+        except Exception as exc:  # noqa: BLE001 - 初始化异常不能让进程崩掉
+            log.err(f"代理池初始化失败: {type(exc).__name__}: {exc}；"
+                    f"已要求必须走代理，本轮所有账号都会被跳过（不降级直连）")
             self._pool = None
 
-    def _warn_proxy_shortage(self, count: int, accounts: Optional[int]) -> None:
-        """账号数超过可用代理数时提前说清楚，别让「一账号一 IP」悄悄退化成共用直连。"""
+    def _proxy_required(self) -> bool:
+        """启用代理池 = 必须走代理：宁可多个账号共用一个 IP，也不直连。"""
+        return bool(self.cfg.proxy_pool.enabled)
+
+    def _report_proxy_capacity(self, count: int, accounts: Optional[int]) -> None:
+        """提前说清楚有多少账号能独占 IP、多少要共用。"""
         if not accounts:
             return
         if count >= accounts:
             log.info(f"一账号一 IP：{accounts} 个账号 / {count} 个可用代理，"
                      f"余量 {count - accounts} 个可用于换 IP")
             return
+        share = accounts - count
         log.warn(f"可用代理只有 {count} 个，少于 {accounts} 个账号："
-                 f"前 {count} 个账号各分到独立 IP，其余 {accounts - count} 个将降级直连"
-                 f"（共用本机出口 IP）。可调大 proxy_pool.max_proxies / 增加 sources，"
-                 f"或给这些账号在 accounts[].proxy 里配置固定代理")
+                 f"前 {count} 个账号各独占一个 IP，其余 {share} 个会与它们共用 IP"
+                 f"（不会降级直连）。想让每个账号都独占就调大 proxy_pool.max_workers "
+                 f"以测通更多候选、或增加 sources")
 
     def _assign_proxy(self, account: Account) -> None:
-        """给账号分配代理。手动配置的优先；否则从池随机取（一个账号一个 IP）。"""
+        """给账号分配代理。手动配置的优先；否则从池里取（用尽时共用，绝不直连）。"""
         if account.proxy:
             log.debug("使用手动配置的代理")
             return
@@ -115,19 +122,19 @@ class Runner:
             account.proxy = proxy
             with self._state_lock:
                 self._pooled_proxies[account.name] = proxy
-            log.info(f"已分配独立代理 {proxy}")
+            log.info(f"已分配代理 {proxy}")
         else:
-            log.warn("未分配到代理，降级直连（与其他直连账号共用出口 IP）")
+            log.err("代理池里没有任何可用代理，且已要求必须走代理")
 
     def _swap_proxy(self, account: Account) -> Optional[str]:
-        """目标站点连不上时换一个新代理；返回 None 表示没得换（降级直连）。"""
+        """换一个新代理。拿不到替代品时保留原代理，绝不清空成直连。"""
         if self._pool is None:
             return None
         with self._state_lock:
-            old = self._pooled_proxies.pop(account.name, None)
+            old = self._pooled_proxies.get(account.name)
         if old:
             self._pool.mark_bad(old)
-        account.proxy = None
+        # 先拿到替代品再切换：拿不到就继续用原来的，宁可重试失败也不直连
         proxy = self._pool.acquire()
         if proxy:
             account.proxy = proxy
@@ -135,7 +142,8 @@ class Runner:
                 self._pooled_proxies[account.name] = proxy
             log.warn(f"代理 {old or '<手动>'} 连目标站点失败，换用 {proxy}")
             return proxy
-        log.warn("代理连目标站点失败且池无剩余，降级直连")
+        log.warn(f"代理 {old or '<手动>'} 连目标站点失败，但池里已无其他可用代理，"
+                 f"继续用它重试（不降级直连）")
         return None
 
     def exit_ip(self, proxy: Optional[str]) -> Optional[str]:
@@ -396,6 +404,11 @@ class Runner:
 
         # 一个账号一个 IP：先从代理池分配（手动配置的代理优先，不改动）
         self._assign_proxy(account)
+        if self._proxy_required() and not account.proxy:
+            # 启用代理池就意味着不许直连；拿不到任何代理时跳过而不是暴露真实 IP
+            log.err("没有任何可用代理，跳过该账号（proxy_pool.enabled=true 不允许直连）")
+            return log.SummaryRow(account.name, "skipped", "-",
+                                  "无可用代理，按配置不降级直连")
         with self._state_lock:
             self._browser_attempts[account.name] = 0
 
@@ -509,24 +522,34 @@ class Runner:
 
     def _solve_guarded(self, solve, account: Account, ip: Optional[str]):
         """在浏览器并发信号量的保护下调用过盾流程。"""
+        ai = self.ai()
+
         def _call():
             return solve(
                 cfg=self.cfg,
                 account=account,
                 exit_ip=ip,
                 options=self.options,
-                ai=self.ai(),
+                ai=ai,
             )
+
+        def _call_bound():
+            """AI 请求也走该账号的代理，别让视觉调用泄露真实出口 IP。"""
+            binder = getattr(ai, "use_proxy", None)
+            if binder is None or not account.proxy:
+                return _call()
+            with binder(account.proxy):
+                return _call()
 
         gate = self._browser_gate
         if gate is None:
-            return _call()
+            return _call_bound()
         started = time.monotonic()
         with gate:
             waited = time.monotonic() - started
             if waited > 1.0:
                 log.debug(f"等待浏览器并发配额 {waited:.1f}s")
-            return _call()
+            return _call_bound()
 
     def _solve(self, account: Account, record, ip: Optional[str],
                blocked: api.ApiResult) -> log.SummaryRow:

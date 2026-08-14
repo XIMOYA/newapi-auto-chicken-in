@@ -25,10 +25,8 @@ from . import logger as log
 # 目标站点无关的纯测通接口
 DEFAULT_TEST_URL = "https://api.ipify.org"
 
-# 抓取+测通的总时长上限：账号多时要尽量凑够 IP，但不能无限拖住签到开始
-REFRESH_BUDGET_SECONDS = 45
-# 免费代理的存活率通常只有 5%~10%，候选池要按目标数放大取样才可能凑够
-CANDIDATE_MULTIPLIER = 20
+# 测通不设数量上限，时间盒按工作量推导，这里只是额外留出的余量（秒）
+REFRESH_SLACK_SECONDS = 15
 
 # 默认代理源。sources 配置为空时用这里；填了就替换
 DEFAULT_SOURCES = (
@@ -69,8 +67,8 @@ class ProxyPoolConfig:
     enabled: bool = False
     test_url: str = DEFAULT_TEST_URL
     timeout: int = 8
-    max_workers: int = 25
-    max_proxies: int = 250      # 每次最多测通多少条（太多测太慢）
+    max_workers: int = 25       # 并发测通数。候选上千时把它调大才跑得快
+    max_proxies: int = 250      # 已废弃：测通不再设数量上限，保留只为配置兼容
     ip_swap_limit: int = 2      # 目标站点连不上时最多换几次 IP
     sources: list = field(default_factory=list)   # 空 = 用内置默认源
 
@@ -86,8 +84,9 @@ class ProxyPoolConfig:
             enabled=bool(raw.get("enabled", False)),
             test_url=str(raw.get("test_url") or DEFAULT_TEST_URL).strip() or DEFAULT_TEST_URL,
             timeout=max(2, min(60, _as_int(raw.get("timeout"), 8))),
-            max_workers=max(1, min(32, _as_int(raw.get("max_workers"), 25))),
-            max_proxies=max(1, min(1000, _as_int(raw.get("max_proxies"), 250))),
+            # 上限放宽到 512：全量测通几千条候选时，25 并发要跑十几分钟
+            max_workers=max(1, min(512, _as_int(raw.get("max_workers"), 25))),
+            max_proxies=max(1, min(100000, _as_int(raw.get("max_proxies"), 250))),
             ip_swap_limit=max(0, min(10, _as_int(raw.get("ip_swap_limit"), 2))),
             sources=sources,
         )
@@ -119,6 +118,8 @@ class ProxyPool:
         self._available: list[str] = []
         self._used: set[str] = set()
         self._bad: set[str] = set()
+        # 代理 -> 正在用它的账号数。池子用尽时按这个值把账号摊到各 IP 上
+        self._share_count: dict[str, int] = {}
         self._lock = threading.RLock()
         self.last_error = ""
 
@@ -140,8 +141,8 @@ class ProxyPool:
         抓源是并发的：串行逐个抓时，每个源超时一次就要白等 timeout 秒，
         6 个源最坏能在签到开始前白占将近一分钟。
 
-        账号数越多需要的独立 IP 越多，所以候选取样量按目标数放大；整个过程被
-        REFRESH_BUDGET_SECONDS 时间盒约束，凑不够就凑多少算多少（上层降级直连）。
+        测通不设数量上限：抓到多少条就全测多少条，也不会「凑够目标就收手」。
+        时间盒按工作量推导（波数 × 单条超时），只用来兜住卡死，不再充当数量上限。
         """
         started = time.monotonic()
         per_source = self._fetch_all_sources()
@@ -151,44 +152,29 @@ class ProxyPool:
             log.warn(self.last_error)
             return 0
 
-        alive: list[str] = []
-        # 目标可用数：够账号数 + 换 IP 余量即可，避免无限测通拖时间
-        target = max(desired or 0, 10, min(self.cfg.max_proxies, 30))
-        total_found = sum(len(entries) for entries in per_source)
-        candidate_limit = min(total_found, max(target * CANDIDATE_MULTIPLIER,
-                                              self.cfg.max_proxies))
-        # 轮转合并候选，优先各源最新鲜的条目
-        candidates = self._round_robin(per_source, candidate_limit)
-        deadline = started + REFRESH_BUDGET_SECONDS
-        rounds = 0
-        while candidates and len(alive) < target:
-            remaining = deadline - time.monotonic()
-            if remaining <= 1.0:
-                log.warn(f"代理池测通已用满 {REFRESH_BUDGET_SECONDS}s 预算，"
-                         f"以当前 {len(alive)} 个可用代理继续")
-                break
-            batch = candidates[: self.cfg.max_proxies]
-            candidates = candidates[self.cfg.max_proxies :]
-            rounds += 1
-            batch_alive = self._test_many(batch, need=target - len(alive),
-                                         deadline=deadline)
-            alive.extend(batch_alive)
-            log.info(
-                f"代理池第 {rounds} 轮: 测 {len(batch)} 条，新通 {len(batch_alive)} 条"
-                f"（累计 {len(alive)}/{target}）"
-            )
+        # 全量候选：只做跨源去重，不截断
+        candidates = self._round_robin(per_source)
+        workers = max(1, min(self.cfg.max_workers, len(candidates)))
+        waves = -(-len(candidates) // workers)          # 向上取整
+        # 理论最坏耗时 = 波数 × 单条超时；再留一点余量。这不是数量上限，
+        # 只在探测整体卡死时兜底，正常情况下会在此之前自然跑完。
+        budget = waves * max(1, self.cfg.timeout) + REFRESH_SLACK_SECONDS
+        log.info(f"代理池开始测通 {len(candidates)} 条候选"
+                 f"（并发 {workers}，预计最多 {budget:.0f}s）")
+        alive = self._test_many(candidates, deadline=started + budget)
 
         with self._lock:
             self._available = alive
             self._used.clear()
             self._bad.clear()
+            self._share_count.clear()
+        elapsed = time.monotonic() - started
         if not alive:
             self.last_error = "代理候选均未通过连通性测试"
             log.warn(self.last_error)
             return 0
-        log.debug(f"代理池测通完成: {len(alive)} 个可用代理，"
-                  f"候选 {candidate_limit}/{total_found} 条，"
-                  f"耗时 {time.monotonic() - started:.1f}s")
+        log.info(f"代理池测通完成: {len(alive)}/{len(candidates)} 条可用，"
+                 f"耗时 {elapsed:.1f}s")
         return len(alive)
 
     def _fetch_all_sources(self) -> list[list[str]]:
@@ -227,12 +213,12 @@ class ProxyPool:
         return found
 
     @staticmethod
-    def _round_robin(per_source: list[list[str]], limit: int) -> list[str]:
-        """按源轮转合并去重，优先各源前部的条目，最多取 limit 条。"""
+    def _round_robin(per_source: list[list[str]], limit: Optional[int] = None) -> list[str]:
+        """按源轮转合并去重，优先各源前部的条目。limit 为 None 表示全取。"""
         out: list[str] = []
         seen: set[str] = set()
         idx = 0
-        while len(out) < limit:
+        while limit is None or len(out) < limit:
             progressed = False
             for entries in per_source:
                 if idx < len(entries):
@@ -241,7 +227,7 @@ class ProxyPool:
                     if item not in seen:
                         seen.add(item)
                         out.append(item)
-                        if len(out) >= limit:
+                        if limit is not None and len(out) >= limit:
                             return out
             if not progressed:
                 break
@@ -277,7 +263,7 @@ class ProxyPool:
         return alive
 
     def available_count(self) -> int:
-        """当前还能分配出去的代理数量（未使用且未拉黑）。"""
+        """当前还能独占分配的代理数量（未使用且未拉黑）。"""
         with self._lock:
             return sum(1 for p in self._available if p not in self._used and p not in self._bad)
 
@@ -301,17 +287,28 @@ class ProxyPool:
     # ------------------------------------------------------------------ #
 
     def acquire(self) -> Optional[str]:
-        """随机分配一个未使用且未拉黑的代理；没有则返回 None（上层降级直连）。"""
+        """分配一个代理。优先独占；池子用尽时复用已分配的，绝不返回「直连」。
+
+        调用方的要求是「宁可几个账号共用一个代理 IP，也不要降级直连」，所以只有
+        池里连一个未拉黑的代理都没有时才返回 None。共用时挑「当前使用账号数最少」
+        的那个，把账号尽量摊平到各个出口 IP 上。
+        """
         with self._lock:
-            candidates = [
-                p for p in self._available
-                if p not in self._used and p not in self._bad
-            ]
-            if not candidates:
+            healthy = [p for p in self._available if p not in self._bad]
+            if not healthy:
                 return None
-            proxy = random.choice(candidates)
-            self._used.add(proxy)
-            return proxy
+            fresh = [p for p in healthy if p not in self._used]
+            if fresh:
+                proxy = random.choice(fresh)
+                self._used.add(proxy)
+                self._share_count[proxy] = 1
+                return proxy
+            # 池已用尽：复用被共用得最少的那个
+            proxy = min(healthy, key=lambda p: self._share_count.get(p, 1))
+            self._share_count[proxy] = self._share_count.get(proxy, 1) + 1
+            shared = self._share_count[proxy]
+        log.warn(f"代理池已无空闲 IP，改为共用 {proxy}（该 IP 上已有 {shared} 个账号）")
+        return proxy
 
     def mark_bad(self, proxy: Optional[str]) -> None:
         """目标站点连不上时拉黑该代理，之后不再分配。"""
@@ -319,7 +316,14 @@ class ProxyPool:
             return
         with self._lock:
             self._bad.add(proxy)
+            self._share_count.pop(proxy, None)
 
     def has_available(self) -> bool:
+        """还有没有「未拉黑」的代理可分配（含可共用的）。"""
+        with self._lock:
+            return any(p not in self._bad for p in self._available)
+
+    def has_exclusive(self) -> bool:
+        """还有没有完全空闲、可独占分配的代理。"""
         with self._lock:
             return any(p not in self._used and p not in self._bad for p in self._available)

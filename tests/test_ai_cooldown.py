@@ -21,14 +21,24 @@ class FakeResp:
 
 
 class FakeSession:
-    """按脚本返回响应或抛异常，并记录每次请求的 timeout。"""
+    """按脚本返回响应或抛异常，并记录每次请求的 timeout 与 proxies。"""
 
     def __init__(self, script):
         self.script = list(script)
-        self.calls: list = []
+        self.calls: list = []          # 每次请求的 timeout
+        self.proxies: list = []        # 每次请求的 proxies
 
-    def post(self, url, json=None, timeout=None, **_kwargs):
+    def post(self, url, json=None, timeout=None, **kwargs):
         self.calls.append(timeout)
+        self.proxies.append(kwargs.get("proxies"))
+        item = self.script.pop(0) if self.script else FakeResp()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def get(self, url, **kwargs):
+        self.calls.append(None)
+        self.proxies.append(kwargs.get("proxies"))
         item = self.script.pop(0) if self.script else FakeResp()
         if isinstance(item, BaseException):
             raise item
@@ -134,3 +144,80 @@ class TestCooldown:
         for thread in threads:
             thread.join()
         assert time.monotonic() - started < 0.9
+
+
+class TestAIProxy:
+    """AI 视觉请求跟着账号走代理，别让它暴露真实出口 IP。"""
+
+    def test_no_proxy_by_default(self, monkeypatch):
+        client, session = _client([FakeResp()], monkeypatch)
+        assert client.classify_page(b"png").state == "passed"
+        assert session.proxies == [None]
+
+    def test_uses_bound_proxy(self, monkeypatch):
+        client, session = _client([FakeResp()], monkeypatch)
+        with client.use_proxy("10.0.0.1:8080"):
+            client.classify_page(b"png")
+        assert session.proxies[0] == {
+            "http": "10.0.0.1:8080", "https": "10.0.0.1:8080",
+        }
+
+    def test_binding_is_restored_on_exit(self, monkeypatch):
+        client, _session = _client([FakeResp()], monkeypatch)
+        with client.use_proxy("a:1"):
+            with client.use_proxy("b:2"):
+                assert client.current_proxy() == "b:2"
+            assert client.current_proxy() == "a:1"
+        assert client.current_proxy() is None
+
+    def test_falls_back_to_direct_when_proxy_fails(self, monkeypatch):
+        """代理挂了不能让 AI 变成单点故障，要自动改走直连。"""
+        client, session = _client([RuntimeError("proxy connect failed"), FakeResp()],
+                                 monkeypatch)
+        with client.use_proxy("dead:9999"):
+            assert client.classify_page(b"png").state == "passed"
+        assert session.proxies[0] is not None       # 第一次走代理
+        assert session.proxies[1] is None          # 第二次直连
+
+    def test_proxied_attempt_leaves_budget_for_fallback(self, monkeypatch):
+        """代理不通会一直挂到超时，所以只能占用一半预算。"""
+        client, session = _client([RuntimeError("timeout"), FakeResp()], monkeypatch,
+                                 timeout=20)
+        with client.use_proxy("slow:1"):
+            client.classify_page(b"png")
+        assert session.calls[0] <= 10.0 + 0.01
+        assert session.calls[1] > 10.0
+
+    def test_proxy_failure_does_not_trigger_ai_cooldown(self, monkeypatch):
+        """经代理超时说明代理有问题，不能据此判定 AI 端点过载。"""
+        client, _session = _client([TimeoutLike("timed out"), FakeResp()], monkeypatch,
+                                   cooldown=5.0)
+        started = time.monotonic()
+        with client.use_proxy("dead:1"):
+            assert client.classify_page(b"png").state == "passed"
+        assert time.monotonic() - started < 1.0
+        assert client._cooldown_left() == 0.0
+
+    def test_binding_is_thread_local(self, monkeypatch):
+        client, session = _client([FakeResp(), FakeResp()], monkeypatch)
+        barrier = threading.Barrier(2)
+
+        def worker(proxy):
+            with client.use_proxy(proxy):
+                barrier.wait()
+                client.classify_page(b"png")
+
+        threads = [threading.Thread(target=worker, args=(p,))
+                   for p in ("p1:80", "p2:80")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert sorted(item["http"] for item in session.proxies) == ["p1:80", "p2:80"]
+
+    def test_ping_honours_bound_proxy(self, monkeypatch):
+        client, session = _client([FakeResp()], monkeypatch)
+        with client.use_proxy("p:80"):
+            ok, _message = client.ping()
+        assert ok is True
+        assert session.proxies[0] == {"http": "p:80", "https": "p:80"}
