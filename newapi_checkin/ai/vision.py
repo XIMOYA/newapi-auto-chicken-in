@@ -4,6 +4,8 @@
   - temperature=0，先试 response_format=json_object，模型不支持就自动降级到 prompt 约束
   - 输出用 loose_json 容错解析（剥 ``` 围栏、提取首个平衡 JSON）
   - 有限重试；仍失败就返回 None，让上层降级到 S4，AI 绝不是单点故障
+  - 请求超时会进入 TIMEOUT_COOLDOWN 秒的全局避让：超时通常意味着模型侧过载
+    或限流，立刻重发只会加重拥塞，所以让所有线程一起等一会儿再继续
   - 日志里 api_key 一律脱敏
 """
 
@@ -21,6 +23,32 @@ from .. import logger as log
 from ..config import AIConfig
 from ..utils import clamp, loose_json
 from . import prompts
+
+# AI 请求超时后的避让时长（秒）。避让是全局的：并行签到时所有账号共用同一个
+# AI 端点，一个线程超时说明端点已经吃不消，其他线程也该一起让一让。
+TIMEOUT_COOLDOWN = 10.0
+
+try:  # curl_cffi 的超时异常层级在不同版本里略有差异，缺失时退回错误码/文案判断
+    from curl_cffi.requests.exceptions import Timeout as _CurlTimeout
+except (ImportError, AttributeError):  # pragma: no cover - 取决于依赖版本
+    _CurlTimeout = ()
+
+_TIMEOUT_CURL_CODE = 28          # CURLE_OPERATION_TIMEDOUT
+_TIMEOUT_TEXTS = ("timed out", "timeout", "operation too slow")
+
+
+def is_timeout(exc: BaseException) -> bool:
+    """判断一个请求异常是不是超时。类型 -> curl 错误码 -> 文案，逐层兜底。"""
+    if _CurlTimeout and isinstance(exc, _CurlTimeout):
+        return True
+    code = getattr(exc, "code", None)
+    try:
+        if code is not None and int(code) == _TIMEOUT_CURL_CODE:
+            return True
+    except (TypeError, ValueError):
+        pass
+    text = str(exc).lower()
+    return any(marker in text for marker in _TIMEOUT_TEXTS)
 
 
 @dataclass
@@ -45,6 +73,9 @@ class VisionClient:
         # Runner 在并行签到时共用同一个 VisionClient，curl_cffi 的 Session
         # 不保证线程安全，这里串行化实际请求。
         self._post_lock = threading.Lock()
+        # 超时避让：所有线程共享同一个解禁时刻
+        self._cooldown_lock = threading.Lock()
+        self._cooldown_until = 0.0
         self._session = cffi.Session(
             timeout=cfg.timeout,
             headers={
@@ -53,6 +84,32 @@ class VisionClient:
                 "Accept": "application/json",
             },
         )
+
+    # ------------------------------------------------------------------ #
+    # 超时避让
+    # ------------------------------------------------------------------ #
+
+    def _enter_cooldown(self) -> float:
+        """进入避让期，返回本次设定的解禁时刻。"""
+        with self._cooldown_lock:
+            self._cooldown_until = max(self._cooldown_until,
+                                       time.monotonic() + TIMEOUT_COOLDOWN)
+            return self._cooldown_until
+
+    def _cooldown_left(self) -> float:
+        with self._cooldown_lock:
+            return max(0.0, self._cooldown_until - time.monotonic())
+
+    def _wait_cooldown(self) -> float:
+        """还在避让期内就先等满，返回实际等待秒数（不计入请求预算）。"""
+        waited = 0.0
+        while True:
+            left = self._cooldown_left()
+            if left <= 0:
+                return waited
+            log.warn(f"AI 处于超时避让期，等待 {left:.1f}s 后再请求")
+            time.sleep(left)
+            waited += left
 
     def close(self) -> None:
         try:
@@ -92,8 +149,12 @@ class VisionClient:
         # 整个任务共享 cfg.timeout 这一份预算：重试不再线性放大等待时间
         budget = max(1.0, float(self.cfg.timeout))
         started = time.monotonic()
+        # 避让休眠是主动让路，不该算进请求预算里
+        paused = 0.0
         for attempt in range(1, attempts + 1):
-            remaining = budget - (time.monotonic() - started)
+            # 每次发请求前都尊重全局避让：别人刚超时，本线程也一起等
+            paused += self._wait_cooldown()
+            remaining = budget - (time.monotonic() - started - paused)
             if remaining <= 0.5:
                 log.debug(f"AI 调用预算 {budget:.0f}s 已用尽（第 {attempt}/{attempts} 次前）")
                 break
@@ -103,7 +164,14 @@ class VisionClient:
                     resp = self._session.post(self.cfg.chat_url, json=payload,
                                               timeout=remaining)
             except Exception as exc:  # noqa: BLE001
-                log.debug(f"AI 请求异常({attempt}/{attempts}): {type(exc).__name__}: {exc}")
+                if is_timeout(exc):
+                    # 超时基本等于模型侧过载/限流，立刻重发只会加重拥塞
+                    self._enter_cooldown()
+                    log.warn(f"AI 请求超时({attempt}/{attempts})，"
+                             f"避让 {TIMEOUT_COOLDOWN:.0f}s 后再继续")
+                    paused += self._wait_cooldown()
+                else:
+                    log.debug(f"AI 请求异常({attempt}/{attempts}): {type(exc).__name__}: {exc}")
                 continue
 
             if resp.status_code in (400, 415, 422) and self._json_mode:
