@@ -50,7 +50,7 @@ def test_scheduler_persists_config_atomically(tmp_path):
         "account_names": ["A"],
         "run_on_start": False,
         "headless": True,
-        "parallelism": 2,
+        "parallelism": 3,
     }
     assert not service.config_path.with_name("scheduler.json.tmp").exists()
 
@@ -65,9 +65,9 @@ def test_scheduler_migrates_legacy_account_selection(tmp_path):
     service = SchedulerService(path, lambda names, manual: {"ok": True})
 
     assert service.config.account_names == ()
-    assert service.config.parallelism == 2
+    assert service.config.parallelism == 3
     assert '"account_names": []' in path.read_text(encoding="utf-8")
-    assert '"parallelism": 2' in path.read_text(encoding="utf-8")
+    assert '"parallelism": 3' in path.read_text(encoding="utf-8")
 
 
 def test_scheduler_prevents_concurrent_runs(tmp_path):

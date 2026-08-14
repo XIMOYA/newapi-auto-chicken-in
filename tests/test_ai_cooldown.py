@@ -21,28 +21,32 @@ class FakeResp:
 
 
 class FakeSession:
-    """按脚本返回响应或抛异常，并记录每次请求的 timeout 与 proxies。"""
+    """按脚本返回响应或抛异常，并记录每次请求的 timeout 与 proxies。
+
+    生产代码里每个线程各有一个 session，测试为了断言方便共用一个假对象，
+    所以这里自己加锁保护脚本队列。
+    """
 
     def __init__(self, script):
         self.script = list(script)
         self.calls: list = []          # 每次请求的 timeout
         self.proxies: list = []        # 每次请求的 proxies
+        self._lock = threading.Lock()
+
+    def _next(self, timeout, proxies):
+        with self._lock:
+            self.calls.append(timeout)
+            self.proxies.append(proxies)
+            item = self.script.pop(0) if self.script else FakeResp()
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
     def post(self, url, json=None, timeout=None, **kwargs):
-        self.calls.append(timeout)
-        self.proxies.append(kwargs.get("proxies"))
-        item = self.script.pop(0) if self.script else FakeResp()
-        if isinstance(item, BaseException):
-            raise item
-        return item
+        return self._next(timeout, kwargs.get("proxies"))
 
     def get(self, url, **kwargs):
-        self.calls.append(None)
-        self.proxies.append(kwargs.get("proxies"))
-        item = self.script.pop(0) if self.script else FakeResp()
-        if isinstance(item, BaseException):
-            raise item
-        return item
+        return self._next(None, kwargs.get("proxies"))
 
     def close(self):
         pass
@@ -221,3 +225,77 @@ class TestAIProxy:
             ok, _message = client.ping()
         assert ok is True
         assert session.proxies[0] == {"http": "p:80", "https": "p:80"}
+
+
+class TestPerThreadSession:
+    """一线程一 session：并行签到时几个账号的视觉调用不该互相排队。"""
+
+    def test_each_thread_gets_its_own_session(self, monkeypatch):
+        monkeypatch.setattr(vision_mod, "TIMEOUT_COOLDOWN", 0.01)
+        cfg = AIConfig(enabled=True, base_url="https://relay.example.com/v1",
+                       api_key="sk-test", model="gpt-4o-mini", timeout=5, max_retries=0)
+        client = VisionClient(cfg)
+        created = []
+        monkeypatch.setattr(client, "_new_session",
+                            lambda: created.append(FakeSession([FakeResp()])) or created[-1])
+        seen = []
+
+        def worker():
+            seen.append(id(client._session))
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert len(set(seen)) == 4          # 四个线程四个不同 session
+        assert len(created) == 4
+
+    def test_same_thread_reuses_its_session(self, monkeypatch):
+        cfg = AIConfig(enabled=True, base_url="https://relay.example.com/v1",
+                       api_key="sk-test", model="gpt-4o-mini", timeout=5, max_retries=0)
+        client = VisionClient(cfg)
+        monkeypatch.setattr(client, "_new_session", lambda: FakeSession([FakeResp()]))
+        assert client._session is client._session
+
+    def test_close_closes_every_thread_session(self, monkeypatch):
+        cfg = AIConfig(enabled=True, base_url="https://relay.example.com/v1",
+                       api_key="sk-test", model="gpt-4o-mini", timeout=5, max_retries=0)
+        client = VisionClient(cfg)
+        closed = []
+
+        class Closable(FakeSession):
+            def close(self):
+                closed.append(self)
+
+        monkeypatch.setattr(client, "_new_session", lambda: Closable([FakeResp()]))
+        threads = [threading.Thread(target=lambda: client._session) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        client.close()
+        assert len(closed) == 3
+
+    def test_concurrent_calls_are_not_serialised(self, monkeypatch):
+        """三个线程各发一次请求，总耗时应接近单次，而不是三次相加。"""
+        monkeypatch.setattr(vision_mod, "TIMEOUT_COOLDOWN", 0.01)
+        cfg = AIConfig(enabled=True, base_url="https://relay.example.com/v1",
+                       api_key="sk-test", model="gpt-4o-mini", timeout=10, max_retries=0)
+        client = VisionClient(cfg)
+
+        class SlowSession(FakeSession):
+            def post(self, url, json=None, timeout=None, **kwargs):
+                time.sleep(0.3)
+                return FakeResp()
+
+        monkeypatch.setattr(client, "_new_session", lambda: SlowSession([]))
+        started = time.monotonic()
+        threads = [threading.Thread(target=lambda: client.classify_page(b"png"))
+                   for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.8               # 串行的话至少 0.9s

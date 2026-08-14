@@ -49,4 +49,5 @@ def test_runner_parallelism_is_clamped_to_safe_range(tmp_path, monkeypatch):
     monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
     runner = runner_mod.Runner(cfg, runner_mod.RunOptions(parallelism=99, use_ai=False, use_browser=False))
 
-    assert runner._parallelism() == 8
+    assert runner._parallelism() == runner_mod.MAX_ACCOUNT_PARALLELISM
+    assert runner_mod.MAX_ACCOUNT_PARALLELISM == 16

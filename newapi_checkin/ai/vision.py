@@ -65,30 +65,50 @@ class PageVerdict:
 
 
 class VisionClient:
-    # 一次任务（分类/定位/OCR）允许消耗的总时长上限系数：
-    # cfg.timeout 是「单次请求」上限，重试会把它乘上 max_retries+1，
-    # 所以这里把 cfg.timeout 直接当作整个任务的预算，避免 60s 变成 180s。
+    # cfg.timeout 被当作「整个任务」的预算而不是单次请求上限，避免重试把 60s
+    # 放大成 180s；每个工作线程各自持有一个 curl session，避免并行时互相排队。
     def __init__(self, cfg: AIConfig):
         if not cfg.ready:
             raise ValueError("AI 配置不完整（base_url / api_key / model）")
         self.cfg = cfg
         self._json_mode = True
-        # Runner 在并行签到时共用同一个 VisionClient，curl_cffi 的 Session
-        # 不保证线程安全，这里串行化实际请求。
-        self._post_lock = threading.Lock()
         # 超时避让：所有线程共享同一个解禁时刻
         self._cooldown_lock = threading.Lock()
         self._cooldown_until = 0.0
         # 每个工作线程各自绑定自己账号的代理（见 use_proxy）
         self._local = threading.local()
-        self._session = cffi.Session(
-            timeout=cfg.timeout,
+        # curl_cffi 的 Session 不保证线程安全。用「一线程一 session」而不是加全局锁：
+        # 加锁会把几个账号的视觉调用串起来排队，单次预算 60s，排队几分钟很常见。
+        self._sessions: dict[int, object] = {}
+        self._sessions_lock = threading.Lock()
+        self._session_override = None
+
+    def _new_session(self):
+        return cffi.Session(
+            timeout=self.cfg.timeout,
             headers={
-                "Authorization": f"Bearer {cfg.api_key}",
+                "Authorization": f"Bearer {self.cfg.api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             },
         )
+
+    @property
+    def _session(self):
+        """当前线程专属的 session（测试可以整体覆盖）。"""
+        if self._session_override is not None:
+            return self._session_override
+        ident = threading.get_ident()
+        with self._sessions_lock:
+            session = self._sessions.get(ident)
+            if session is None:
+                session = self._new_session()
+                self._sessions[ident] = session
+            return session
+
+    @_session.setter
+    def _session(self, value) -> None:
+        self._session_override = value
 
     # ------------------------------------------------------------------ #
     # 代理绑定：AI 请求跟着账号走同一个出口 IP
@@ -138,10 +158,17 @@ class VisionClient:
             waited += left
 
     def close(self) -> None:
-        try:
-            self._session.close()
-        except Exception:  # noqa: BLE001
-            pass
+        """关闭所有线程创建过的 session。"""
+        with self._sessions_lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        if self._session_override is not None:
+            sessions.append(self._session_override)
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------ #
     # 底层调用
@@ -191,9 +218,8 @@ class VisionClient:
             limit = min(remaining, max(5.0, budget * 0.5)) if use_proxy else remaining
             payload = self._payload(prompt, images, detail, max_tokens)
             try:
-                with self._post_lock:
-                    resp = self._session.post(self.cfg.chat_url, json=payload,
-                                              timeout=limit, **self._proxies(use_proxy))
+                resp = self._session.post(self.cfg.chat_url, json=payload,
+                                          timeout=limit, **self._proxies(use_proxy))
             except Exception as exc:  # noqa: BLE001
                 if use_proxy:
                     # 经代理失败说明代理有问题，不能据此判定 AI 端点过载，
@@ -317,9 +343,8 @@ class VisionClient:
     def ping(self) -> Tuple[bool, str]:
         """doctor 用：验证接口连通与鉴权。"""
         try:
-            with self._post_lock:
-                resp = self._session.get(self.cfg.models_url,
-                                         **self._proxies(self.current_proxy()))
+            resp = self._session.get(self.cfg.models_url,
+                                     **self._proxies(self.current_proxy()))
         except Exception as exc:  # noqa: BLE001
             return False, f"{type(exc).__name__}: {exc}"
         if resp.status_code >= 400:

@@ -17,7 +17,7 @@ DEFAULT_SCHEDULE = {
     "account_names": [],
     "run_on_start": False,
     "headless": True,
-    "parallelism": 2,
+    "parallelism": 3,
 }
 
 
@@ -54,7 +54,7 @@ class ScheduleConfig:
     account_names: tuple[str, ...] = ()
     run_on_start: bool = False
     headless: bool = True
-    parallelism: int = 2
+    parallelism: int = 3
 
     @classmethod
     def from_dict(cls, raw: Optional[dict]) -> "ScheduleConfig":

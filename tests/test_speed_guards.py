@@ -235,7 +235,14 @@ class TestBrowserConcurrency:
 
     def test_auto_browser_workers_stay_small(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, parallelism=8)
-        assert 1 <= runner._browser_workers() <= 3
+        assert 1 <= runner._browser_workers() <= runner_mod.MAX_BROWSER_PARALLELISM
+
+    def test_auto_browser_workers_leave_one_core_free(self, tmp_path, monkeypatch):
+        """自动值 = 核心数 - 1，留一个核给 Python 编排和系统。"""
+        runner = _make_runner(tmp_path, monkeypatch, parallelism=16)
+        for cores, expected in ((1, 1), (2, 1), (4, 3), (8, 4), (32, 4)):
+            monkeypatch.setattr(runner_mod.os, "cpu_count", lambda c=cores: c)
+            assert runner._browser_workers() == expected
 
     def test_gate_limits_concurrent_solves(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
@@ -278,7 +285,8 @@ class TestExplicitParallelism:
         monkeypatch.setattr(runner, "_run_account",
                             lambda account: _row(account.name, api.SUCCESS))
         assert runner.run() == 0
-        assert runner.options.parallelism == 5
+        assert runner.options.parallelism == runner_mod.DEFAULT_ACCOUNT_PARALLELISM
+        assert runner_mod.DEFAULT_ACCOUNT_PARALLELISM == 3
 
 
 class TestExitIpProbe:

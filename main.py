@@ -9,7 +9,7 @@
     python main.py --manual           人工兜底：等你手动过盾后保存 profile
     python main.py --no-ai            关掉 AI 辅助
     python main.py --no-browser       只走 HTTP 快路径，不启浏览器
-    python main.py --parallel 5       账号级并行度（默认 5）
+    python main.py --parallel 3       账号级并行度（默认 3，最大 16）
     python main.py --browser-parallel 2   浏览器实例并发上限（默认按 CPU 推导）
     python main.py -v                 详细日志
 
@@ -55,12 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-browser", dest="use_browser", action="store_false", default=True,
                         help="禁用浏览器过盾，只走 HTTP 快路径")
     parser.add_argument(
-        "--parallel", type=int, choices=range(1, 9), default=None, metavar="N",
-        help="同时签到的账号数（1-8，默认 5；人工模式强制为 1）",
+        "--parallel", type=int, choices=range(1, 17), default=None, metavar="N",
+        help="同时签到的账号数（1-16，默认 3；人工模式强制为 1）",
     )
     parser.add_argument(
         "--browser-parallel", type=int, choices=range(1, 9), default=None, metavar="N",
-        help="同时运行的浏览器实例数上限（默认按 CPU 核数推导，最多 3）",
+        help="同时运行的浏览器实例数上限（默认按 CPU 核数推导：核数-1，最多 4）",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="详细日志")
     parser.add_argument("--version", action="version", version=f"newapi-checkin {__version__}")
@@ -158,7 +158,7 @@ def main(argv=None) -> int:
         use_browser=args.use_browser,
         verbose=args.verbose,
         parallelism=1 if args.manual else (args.parallel or 1),
-        # 显式传了 --parallel 就照做（包括 --parallel 1 强制串行），没传才用默认 5
+        # 显式传了 --parallel 就照做（包括 --parallel 1 强制串行），没传才用默认 3
         parallelism_explicit=args.parallel is not None and not args.manual,
         browser_parallelism=args.browser_parallel or 0,
     )

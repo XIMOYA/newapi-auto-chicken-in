@@ -30,6 +30,12 @@ _RETRYABLE = (api.NETWORK_ERROR, api.CF_BLOCKED, api.UNKNOWN)
 # 这些结果说明请求本身通了，换策略也不会变，直接结束
 _SETTLED = (api.SUCCESS, api.ALREADY_DONE, api.AUTH_FAILED, api.FAILED)
 
+# 未显式指定 --parallel 时的账号级并发数
+DEFAULT_ACCOUNT_PARALLELISM = 3
+# 账号级并发的硬上限。账号阶段主要在等网络，开大代价很小
+MAX_ACCOUNT_PARALLELISM = 16
+# 浏览器实例并发的自动推导上限（每个实例约占一个核心）
+MAX_BROWSER_PARALLELISM = 4
 # 单账号最多启动几次浏览器过盾。浏览器冷启动 + 质询等待是整条链路里最贵的一步，
 # 换 IP 不会重置这份配额，所以「换 IP 不计入重试」不会把浏览器开销放大。
 _BROWSER_ATTEMPTS_PER_ACCOUNT = 2
@@ -44,7 +50,7 @@ class RunOptions:
     use_ai: bool = True
     use_browser: bool = True
     verbose: bool = False
-    parallelism: int = 1          # 1 = 未显式指定，run() 里自动提升为默认 5
+    parallelism: int = 1          # 1 = 未显式指定，run() 里自动提升为默认并发数
     parallelism_explicit: bool = False   # True = 调用方明确要求这个并发数，不再自动提升
     browser_parallelism: int = 0         # 0 = 按 CPU 自动推导；浏览器实例的并发上限
 
@@ -184,25 +190,28 @@ class Runner:
     # ------------------------------------------------------------------ #
 
     def _parallelism(self) -> int:
-        """账号级并发数，钳制在 [1, 8]；人工模式强制串行。"""
+        """账号级并发数，钳制在 [1, MAX_ACCOUNT_PARALLELISM]；人工模式强制串行。"""
         if self.options.manual:
             return 1
         try:
             workers = int(self.options.parallelism)
         except (TypeError, ValueError):
             workers = 1
-        return max(1, min(8, workers))
+        return max(1, min(MAX_ACCOUNT_PARALLELISM, workers))
 
     def _set_parallelism(self, workers: int) -> None:
         """把传入的并发数写回选项（供 CLI/调度调用方设置）。"""
-        self.options.parallelism = max(1, min(8, int(workers)))
+        self.options.parallelism = max(1, min(MAX_ACCOUNT_PARALLELISM, int(workers)))
 
     def _browser_workers(self) -> int:
         """浏览器实例的并发上限。
 
-        账号级并行度不能直接当作浏览器并行度：每个 Camoufox/Chromium 实例大致要吃
-        掉一个核心和几百 MB 内存，在 2~4 核的 runner 上开 5 个只会互相抢 CPU，
-        单个实例反而被拖慢好几倍。HTTP 快路径可以高并发，浏览器不行。
+        账号级并发可以开很大——HTTP 快路径几乎不吃 CPU，纯等网络。但浏览器不行：
+        每个 Camoufox/Chromium 实例大致要吃掉一个核心和几百 MB 内存，超配之后
+        单个实例会被拖慢好几倍，总耗时反而更长。
+
+        所以自动值取「核心数 - 1」（留一个核给 Python 编排和系统），上限 4：
+          2 核 -> 1、4 核 -> 3、8 核及以上 -> 4
         """
         accounts_workers = self._parallelism()
         configured = 0
@@ -212,7 +221,7 @@ class Runner:
             configured = 0
         if configured > 0:
             return max(1, min(accounts_workers, configured))
-        auto = max(1, min(3, (os.cpu_count() or 2) // 2))
+        auto = max(1, min(MAX_BROWSER_PARALLELISM, (os.cpu_count() or 2) - 1))
         return max(1, min(accounts_workers, auto))
 
     def _take_browser_attempt(self, account: Account) -> bool:
@@ -243,14 +252,14 @@ class Runner:
             log.warn("没有启用的账号（检查 accounts[].enabled）")
             return 2
 
-        # 默认并行度 5：效率与资源占用折中（人工模式强制串行 1）
+        # 未显式指定时用 DEFAULT_ACCOUNT_PARALLELISM（人工模式强制串行 1）
         if self.options.manual:
             self._set_parallelism(1)
         elif (not getattr(self.options, "parallelism_explicit", False)
                 and self.options.parallelism in (None, 1, 0)):
-            self._set_parallelism(5)
+            self._set_parallelism(DEFAULT_ACCOUNT_PARALLELISM)
 
-        # 代理池是可选资源：抓取+测通失败只降级直连，不影响签到
+        # 代理池：启用后就必须走代理，拿不到代理的账号会被跳过而不是直连
         # desired 比账号数多 10：留出换 IP 的余量，账号越多目标越大
         self.init_proxy_pool(desired=len(accounts) + 10, accounts=len(accounts))
 

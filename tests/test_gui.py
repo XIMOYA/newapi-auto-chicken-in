@@ -33,7 +33,7 @@ def test_close_to_tray_is_silent(monkeypatch):
     window = gui_module.MainWindow(smoke_test=True)
     assert window.minimumWidth() <= 760
     assert window.minimumHeight() <= 540
-    assert window.parallel_spin.value() == 2
+    assert window.parallel_spin.value() == 3
     assert window.sync_auto_check.isChecked() is True
     assert window.sync_token_edit.echoMode().name == "Password"
     notifications = []
@@ -105,7 +105,7 @@ def test_schedule_save_uses_all_enabled_accounts(monkeypatch):
     assert captured["command"] == "set_schedule"
     assert captured["payload"]["schedule"]["account_names"] == []
     assert captured["payload"]["schedule"]["times"] == ["10:30", "18:00"]
-    assert captured["payload"]["schedule"]["parallelism"] == 2
+    assert captured["payload"]["schedule"]["parallelism"] == 3
 
     window._closing = True
     window.tray.hide()

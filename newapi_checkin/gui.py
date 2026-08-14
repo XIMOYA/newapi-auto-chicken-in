@@ -581,7 +581,7 @@ else:
             self.times_edit.textEdited.connect(self._mark_schedule_dirty)
             self.parallel_spin = QSpinBox()
             self.parallel_spin.setRange(1, 8)
-            self.parallel_spin.setValue(2)
+            self.parallel_spin.setValue(3)
             self.parallel_spin.setSuffix(" 个账号")
             self.parallel_spin.setToolTip(
                 "同时签到的账号数。账号多时调高能显著缩短总耗时；"
