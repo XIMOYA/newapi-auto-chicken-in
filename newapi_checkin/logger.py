@@ -28,6 +28,7 @@ console = Console(theme=_THEME, highlight=False, soft_wrap=False)
 
 _VERBOSE = False
 _LOG_FILE: Optional[Path] = None
+_LOG_HANDLE = None
 _LOG_LOCK = threading.RLock()
 _RECENT_LOGS = deque(maxlen=1000)
 _LISTENERS: list[Callable[[str], None]] = []
@@ -35,11 +36,35 @@ _LISTENERS: list[Callable[[str], None]] = []
 
 def setup(verbose: bool = False, log_dir: Optional[Path] = None) -> None:
     """初始化日志。log_dir 非空时同时把纯文本日志落盘（便于 cron 排查）。"""
-    global _VERBOSE, _LOG_FILE
+    global _VERBOSE, _LOG_FILE, _LOG_HANDLE
     _VERBOSE = verbose
-    if log_dir is not None:
-        log_dir.mkdir(parents=True, exist_ok=True)
+    if log_dir is None:
+        return
+    log_dir.mkdir(parents=True, exist_ok=True)
+    with _LOG_LOCK:
+        _close_handle()
         _LOG_FILE = log_dir / f"{datetime.now():%Y-%m-%d}.log"
+        try:
+            # 常开句柄：并行签到时每条日志都 open/close 会放大成上千次 syscall
+            _LOG_HANDLE = _LOG_FILE.open("a", encoding="utf-8", buffering=1)
+        except OSError:
+            _LOG_HANDLE = None
+
+
+def _close_handle() -> None:
+    global _LOG_HANDLE
+    if _LOG_HANDLE is not None:
+        try:
+            _LOG_HANDLE.close()
+        except OSError:
+            pass
+        _LOG_HANDLE = None
+
+
+def shutdown() -> None:
+    """关闭日志文件句柄（进程退出或切换日志目录前调用）。"""
+    with _LOG_LOCK:
+        _close_handle()
 
 
 def subscribe(listener: Callable[[str], None]) -> Callable[[], None]:
@@ -78,16 +103,23 @@ def _emit(markup: str, plain: str) -> None:
     with _LOG_LOCK:
         _RECENT_LOGS.append(timestamped)
         listeners = list(_LISTENERS)
+        handle = _LOG_HANDLE
+        if handle is not None:
+            try:
+                handle.write(timestamped + "\n")
+            except (OSError, ValueError):
+                _close_handle()
+        elif _LOG_FILE is not None:
+            # setup() 没能拿到常开句柄时退回逐条追加，保证日志不丢
+            try:
+                with _LOG_FILE.open("a", encoding="utf-8") as fh:
+                    fh.write(timestamped + "\n")
+            except OSError:
+                pass
     for listener in listeners:
         try:
             listener(timestamped)
         except Exception:
-            pass
-    if _LOG_FILE is not None:
-        try:
-            with _LOG_FILE.open("a", encoding="utf-8") as fh:
-                fh.write(timestamped + "\n")
-        except OSError:
             pass
 
 

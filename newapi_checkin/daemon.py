@@ -397,6 +397,8 @@ class DaemonServer:
                 use_browser=True,
                 verbose=False,
                 parallelism=1 if manual else scheduled_parallelism,
+                # 调度里配的并发数是用户的明确意愿，包括「就要串行 1」
+                parallelism_explicit=not manual,
             )
             runner = Runner(cfg, options)
             exit_code = runner.run()

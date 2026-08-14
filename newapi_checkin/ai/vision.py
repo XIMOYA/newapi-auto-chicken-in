@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import base64
+import threading
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -32,11 +34,17 @@ class PageVerdict:
 
 
 class VisionClient:
+    # 一次任务（分类/定位/OCR）允许消耗的总时长上限系数：
+    # cfg.timeout 是「单次请求」上限，重试会把它乘上 max_retries+1，
+    # 所以这里把 cfg.timeout 直接当作整个任务的预算，避免 60s 变成 180s。
     def __init__(self, cfg: AIConfig):
         if not cfg.ready:
             raise ValueError("AI 配置不完整（base_url / api_key / model）")
         self.cfg = cfg
         self._json_mode = True
+        # Runner 在并行签到时共用同一个 VisionClient，curl_cffi 的 Session
+        # 不保证线程安全，这里串行化实际请求。
+        self._post_lock = threading.Lock()
         self._session = cffi.Session(
             timeout=cfg.timeout,
             headers={
@@ -81,10 +89,19 @@ class VisionClient:
             return None
 
         attempts = max(1, self.cfg.max_retries + 1)
+        # 整个任务共享 cfg.timeout 这一份预算：重试不再线性放大等待时间
+        budget = max(1.0, float(self.cfg.timeout))
+        started = time.monotonic()
         for attempt in range(1, attempts + 1):
+            remaining = budget - (time.monotonic() - started)
+            if remaining <= 0.5:
+                log.debug(f"AI 调用预算 {budget:.0f}s 已用尽（第 {attempt}/{attempts} 次前）")
+                break
             payload = self._payload(prompt, images, detail, max_tokens)
             try:
-                resp = self._session.post(self.cfg.chat_url, json=payload)
+                with self._post_lock:
+                    resp = self._session.post(self.cfg.chat_url, json=payload,
+                                              timeout=remaining)
             except Exception as exc:  # noqa: BLE001
                 log.debug(f"AI 请求异常({attempt}/{attempts}): {type(exc).__name__}: {exc}")
                 continue

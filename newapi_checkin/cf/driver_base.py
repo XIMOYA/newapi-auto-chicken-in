@@ -169,19 +169,63 @@ class BrowserDriver:
         return PageState(url=url, title=title, html=html,
                          challenge=detect.page_challenge_type(html, title, url))
 
+    # 轮询期间用的轻量探针：整页 HTML 留在浏览器里扫，只把命中结果传回来。
+    # 业务页面（SPA）的 content() 动辄几 MB，每秒拉一次纯属浪费。
+    _PROBE_SCRIPT = """
+    (markers) => {
+      const root = document.documentElement;
+      const html = ((root && root.outerHTML) || '').toLowerCase();
+      const has = (list) => {
+        for (let i = 0; i < list.length; i++) {
+          if (html.indexOf(list[i]) >= 0) return true;
+        }
+        return false;
+      };
+      return {
+        url: location.href,
+        title: document.title || '',
+        challenge: has(markers.challenge),
+        js: has(markers.js),
+        turnstile: has(markers.turnstile),
+        waf: has(markers.waf),
+        login: has(markers.login),
+        password: html.indexOf('type="password"') >= 0
+          || html.indexOf("type='password'") >= 0,
+      };
+    }
+    """
+
+    def quick_state(self) -> PageState:
+        """轻量状态判定。驱动不支持时自动退回 state()（整页 HTML）。"""
+        try:
+            probe = self.page.evaluate(self._PROBE_SCRIPT, detect.probe_markers())
+            challenge = detect.classify_probe(probe)
+        except Exception as exc:  # noqa: BLE001 - 探针不可用就退回完整判定，不能影响结果
+            log.debug(f"轻量状态探针不可用，退回整页判定: {type(exc).__name__}: {exc}")
+            return self.state()
+        return PageState(url=str(probe.get("url") or ""), title=str(probe.get("title") or ""),
+                         html="", challenge=challenge)
+
     def wait_until_passed(self, timeout: Optional[int] = None, poll: float = 1.0) -> PageState:
-        """轮询等待质询自解，而不是固定 sleep。"""
+        """轮询等待质询自解，而不是固定 sleep。
+
+        轮询间隔按 1.5 倍递增（上限 3s）：刚开始密集探测以便尽早发现自解，
+        长时间没动静时降频，把 60s 内的几十次整页探测压到十几次。
+        """
         limit = timeout if timeout is not None else self.cfg.browser.timeout
         deadline = time.time() + max(1.0, float(limit))
-        state = self.state()
+        state = self.quick_state()
         last = state.challenge
+        interval = max(0.05, float(poll))
         while True:
             if state.passed or state.challenge in (detect.WAF_BLOCK, detect.LOGIN_REQUIRED):
                 return state
-            if time.time() >= deadline:
+            now_ts = time.time()
+            if now_ts >= deadline:
                 return state
-            time.sleep(poll)
-            state = self.state()
+            time.sleep(min(interval, max(0.05, deadline - now_ts)))
+            interval = min(3.0, interval * 1.5)
+            state = self.quick_state()
             if state.challenge != last:
                 log.debug(f"页面状态变化: {state.brief()}")
                 last = state.challenge

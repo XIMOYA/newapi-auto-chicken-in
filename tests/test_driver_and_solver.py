@@ -298,6 +298,70 @@ class TestPageState:
         assert ctx.closed is True
 
 
+class ProbePage(FakePage):
+    """支持轻量探针的假页面：轮询时不该再拉整页 HTML。"""
+
+    def __init__(self, frames=None, **kwargs):
+        super().__init__(frames=frames, **kwargs)
+        self.content_calls = 0
+        self.probe_calls = 0
+
+    def content(self):
+        self.content_calls += 1
+        return super().content()
+
+    def evaluate(self, script, arg=None):
+        if "markers.challenge" in script:
+            self.probe_calls += 1
+            title, html = self._advance()
+            low = html.lower()
+            return {
+                "url": self.url,
+                "title": title,
+                "challenge": any(m in low for m in arg["challenge"]),
+                "js": any(m in low for m in arg["js"]),
+                "turnstile": any(m in low for m in arg["turnstile"]),
+                "waf": any(m in low for m in arg["waf"]),
+                "login": any(m in low for m in arg["login"]),
+                "password": 'type="password"' in low,
+            }
+        return super().evaluate(script, arg)
+
+
+class TestLightweightProbe:
+    def test_quick_state_avoids_pulling_full_html(self, wired):
+        page = ProbePage([CHALLENGE])
+        _, _, driver = build(page)
+        with driver:
+            state = driver.quick_state()
+        assert state.challenge == detect.MANAGED_CHALLENGE
+        assert page.probe_calls == 1
+        assert page.content_calls == 0
+
+    def test_wait_until_passed_uses_probe(self, wired):
+        page = ProbePage([CHALLENGE, CHALLENGE, NORMAL])
+        _, _, driver = build(page)
+        with driver:
+            state = driver.wait_until_passed(timeout=3, poll=0.01)
+        assert state.passed is True
+        assert page.content_calls == 0
+
+    def test_falls_back_to_full_html_when_probe_unsupported(self, wired):
+        page = FakePage([CHALLENGE])   # evaluate 对探针脚本会抛错
+        _, _, driver = build(page)
+        with driver:
+            assert driver.quick_state().challenge == detect.MANAGED_CHALLENGE
+
+    def test_probe_backoff_reduces_poll_count(self, wired):
+        """长时间不变化时轮询要降频，而不是死磕每秒一次。"""
+        page = ProbePage([CHALLENGE])
+        _, _, driver = build(page)
+        with driver:
+            driver.wait_until_passed(timeout=3, poll=0.2)
+        # 固定 0.2s 间隔会探测 ~15 次；1.5 倍退避应该明显更少
+        assert page.probe_calls <= 9
+
+
 class TestSessionHarvest:
     def test_cookie_dict_filters_foreign_domains(self, wired):
         cookies = [

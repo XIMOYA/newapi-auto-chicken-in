@@ -579,6 +579,15 @@ else:
             self.times_edit = QLineEdit()
             self.times_edit.setPlaceholderText("例如：09:00, 18:30")
             self.times_edit.textEdited.connect(self._mark_schedule_dirty)
+            self.parallel_spin = QSpinBox()
+            self.parallel_spin.setRange(1, 8)
+            self.parallel_spin.setValue(2)
+            self.parallel_spin.setSuffix(" 个账号")
+            self.parallel_spin.setToolTip(
+                "同时签到的账号数。账号多时调高能显著缩短总耗时；"
+                "需要过盾的站点多时不建议超过 CPU 核数的一半。"
+            )
+            self.parallel_spin.valueChanged.connect(self._mark_schedule_dirty)
             self.enabled_check.clicked.connect(self._mark_schedule_dirty)
             self.run_start_check.clicked.connect(self._mark_schedule_dirty)
             grid.addWidget(self.enabled_check, 0, 0, 1, 2)
@@ -587,6 +596,8 @@ else:
             grid.addWidget(self.autostart_check, 3, 0, 1, 2)
             grid.addWidget(QLabel("每日时间点"), 4, 0)
             grid.addWidget(self.times_edit, 4, 1)
+            grid.addWidget(QLabel("并发签到数"), 5, 0)
+            grid.addWidget(self.parallel_spin, 5, 1)
             layout.addWidget(settings)
 
             account_hint = QFrame()
@@ -815,6 +826,9 @@ else:
             self.headless_check.setEnabled(False)
             self.headless_check.setToolTip("定时签到和立即签到固定使用无头浏览器；手动验证才会显示浏览器窗口。")
             self.times_edit.setText(", ".join(schedule.times))
+            self.parallel_spin.blockSignals(True)
+            self.parallel_spin.setValue(max(1, min(8, int(schedule.parallelism))))
+            self.parallel_spin.blockSignals(False)
             self.schedule_hint.setText("已从 daemon 同步；定时任务使用所有启用账号")
 
         def _apply_schedule_response(self, response: dict) -> None:
@@ -1128,6 +1142,9 @@ else:
                 "account_names": [],
                 "run_on_start": self.run_start_check.isChecked(),
                 "headless": True,
+                # 不带这一项时 ScheduleConfig 会回落到默认 2，等于每次保存都把
+                # 用户调高的并发度重置掉
+                "parallelism": self.parallel_spin.value(),
             }
             try:
                 ScheduleConfig.from_dict(raw)

@@ -32,6 +32,8 @@ from .session_store import CFSession, cookie_expiry
 MANUAL_TIMEOUT = 300          # S5 人工兜底最长等待
 AI_ROUNDS = 3                 # S3 最多来回几轮
 SHORT_WAIT = 30               # 每次交互后等待质询自解的上限
+AI_ASSIST_BUDGET = 150        # S3 整段（含所有轮次与 AI 请求）的总时长上限
+AI_CALL_RESERVE = 5           # 剩余时间不足这么多秒时不再发起新的 AI 请求
 
 
 @dataclass
@@ -202,7 +204,13 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
 
 def _ai_assist(driver: BrowserDriver, cfg: Config, ai, state: PageState) -> PageState:
     wait = min(SHORT_WAIT, cfg.browser.timeout)
+    # S3 每轮都要截图 + 调模型，没有总预算时「3 轮 × 重试 × 60s」可以跑到十分钟，
+    # 而且完全绕过 browser.timeout。这里给整段 S3 一个绝对截止时间。
+    deadline = time.monotonic() + AI_ASSIST_BUDGET
     for round_no in range(1, AI_ROUNDS + 1):
+        if time.monotonic() >= deadline:
+            log.warn(f"S3 已用满 {AI_ASSIST_BUDGET}s 预算，停止 AI 辅助")
+            break
         shot = driver.screenshot()
         if not shot:
             log.debug("截图为空，S3 无法继续")
@@ -383,8 +391,11 @@ def _wait_turnstile_token_interactive(driver: BrowserDriver, ai, timeout: int) -
       1. 轮询 token（官方 widget 自解时会回填）；
       2. 节流点击复选框（幂等：已通过时点击无害，未通过时是必经第一步）；
       3. 截图让 AI 判断是否出现图片点选质询并代为点选。
+
+    截止时间在「发起 AI 请求之前」也要检查一次：一次视觉调用可能占掉几十秒，
+    只在循环顶部检查会让实际耗时远远超出传入的 timeout。
     """
-    deadline = time.time() + max(1.0, float(timeout))
+    deadline = time.monotonic() + max(1.0, float(timeout))
     last_click = 0.0
     grid_attempts = 0
     while True:
@@ -392,11 +403,11 @@ def _wait_turnstile_token_interactive(driver: BrowserDriver, ai, timeout: int) -
         if token:
             log.debug(f"已获得 Turnstile token（长度 {len(token)}，内容不打印）")
             return token
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             return ""
 
         # 1) 节流点击复选框（每 2.5s 最多一次）
-        now_ts = time.time()
+        now_ts = time.monotonic()
         if now_ts - last_click >= 2.5 and driver.find_element_box(TURNSTILE_SELECTORS):
             if driver.click_turnstile():
                 last_click = now_ts
@@ -407,7 +418,8 @@ def _wait_turnstile_token_interactive(driver: BrowserDriver, ai, timeout: int) -
                     return token
 
         # 2) AI 应对图片点选质询（最多 3 轮，避免烧太多视觉 token）
-        if ai is not None and grid_attempts < 3:
+        if (ai is not None and grid_attempts < 3
+                and deadline - time.monotonic() > AI_CALL_RESERVE):
             width, height = driver.viewport()
             shot = driver.screenshot()
             if shot:
@@ -424,7 +436,10 @@ def _wait_turnstile_token_interactive(driver: BrowserDriver, ai, timeout: int) -
                         token = driver.turnstile_token()
                         if token:
                             return token
-        time.sleep(1.0)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return ""
+        time.sleep(min(1.0, remaining))
     return ""
 
 

@@ -14,7 +14,9 @@ from __future__ import annotations
 import random
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -22,6 +24,11 @@ from . import logger as log
 
 # 目标站点无关的纯测通接口
 DEFAULT_TEST_URL = "https://api.ipify.org"
+
+# 抓取+测通的总时长上限：账号多时要尽量凑够 IP，但不能无限拖住签到开始
+REFRESH_BUDGET_SECONDS = 45
+# 免费代理的存活率通常只有 5%~10%，候选池要按目标数放大取样才可能凑够
+CANDIDATE_MULTIPLIER = 20
 
 # 默认代理源。sources 配置为空时用这里；填了就替换
 DEFAULT_SOURCES = (
@@ -129,27 +136,15 @@ class ProxyPool:
         免费代理源列表通常把「刚测过/存活率高」的排在前面，所以抽样用
         「按源轮转」而不是随机：优先各源最前面的几条，存活率更高。
         第一轮测通不足时自动补测下一批，直到达到目标或候选耗尽。
-        """
-        per_source: list[list[str]] = []
-        for source in self.sources:
-            try:
-                from curl_cffi import requests as cffi
 
-                resp = cffi.get(
-                    source, timeout=self.cfg.timeout,
-                    impersonate="chrome", verify=True,
-                )
-                if resp.status_code != 200:
-                    log.debug(f"代理源 {source} HTTP {resp.status_code}，跳过")
-                    continue
-                found = parse_proxy_lines(resp.text)
-                if not found:
-                    log.debug(f"代理源 {source} 未提取到代理，跳过")
-                    continue
-                per_source.append(found)
-                log.debug(f"代理源 {source}: 提取 {len(found)} 条")
-            except Exception as exc:  # noqa: BLE001 - 单个源失败不影响整体
-                log.debug(f"代理源 {source} 抓取失败: {type(exc).__name__}: {exc}")
+        抓源是并发的：串行逐个抓时，每个源超时一次就要白等 timeout 秒，
+        6 个源最坏能在签到开始前白占将近一分钟。
+
+        账号数越多需要的独立 IP 越多，所以候选取样量按目标数放大；整个过程被
+        REFRESH_BUDGET_SECONDS 时间盒约束，凑不够就凑多少算多少（上层降级直连）。
+        """
+        started = time.monotonic()
+        per_source = self._fetch_all_sources()
 
         if not per_source:
             self.last_error = "所有代理源都未返回可用条目"
@@ -159,19 +154,28 @@ class ProxyPool:
         alive: list[str] = []
         # 目标可用数：够账号数 + 换 IP 余量即可，避免无限测通拖时间
         target = max(desired or 0, 10, min(self.cfg.max_proxies, 30))
-        rounds = 0
-        max_rounds = 4
+        total_found = sum(len(entries) for entries in per_source)
+        candidate_limit = min(total_found, max(target * CANDIDATE_MULTIPLIER,
+                                              self.cfg.max_proxies))
         # 轮转合并候选，优先各源最新鲜的条目
-        candidates = self._round_robin(per_source, target * max_rounds)
-        while candidates and len(alive) < target and rounds < max_rounds:
+        candidates = self._round_robin(per_source, candidate_limit)
+        deadline = started + REFRESH_BUDGET_SECONDS
+        rounds = 0
+        while candidates and len(alive) < target:
+            remaining = deadline - time.monotonic()
+            if remaining <= 1.0:
+                log.warn(f"代理池测通已用满 {REFRESH_BUDGET_SECONDS}s 预算，"
+                         f"以当前 {len(alive)} 个可用代理继续")
+                break
             batch = candidates[: self.cfg.max_proxies]
             candidates = candidates[self.cfg.max_proxies :]
             rounds += 1
-            batch_alive = self._test_many(batch)
+            batch_alive = self._test_many(batch, need=target - len(alive),
+                                         deadline=deadline)
             alive.extend(batch_alive)
             log.info(
                 f"代理池第 {rounds} 轮: 测 {len(batch)} 条，新通 {len(batch_alive)} 条"
-                f"（累计 {len(alive)}）"
+                f"（累计 {len(alive)}/{target}）"
             )
 
         with self._lock:
@@ -182,8 +186,45 @@ class ProxyPool:
             self.last_error = "代理候选均未通过连通性测试"
             log.warn(self.last_error)
             return 0
-        log.ok(f"代理池就绪: {len(alive)} 个可用代理")
+        log.debug(f"代理池测通完成: {len(alive)} 个可用代理，"
+                  f"候选 {candidate_limit}/{total_found} 条，"
+                  f"耗时 {time.monotonic() - started:.1f}s")
         return len(alive)
+
+    def _fetch_all_sources(self) -> list[list[str]]:
+        """并发抓取所有代理源，返回每个源各自的条目列表（保持源内顺序）。"""
+        sources = self.sources
+        if not sources:
+            return []
+        results: dict[str, list[str]] = {}
+        workers = max(1, min(len(sources), 8))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="proxysrc") as pool:
+            futures = {pool.submit(self._fetch_source, src): src for src in sources}
+            for future in as_completed(futures):
+                source = futures[future]
+                try:
+                    found = future.result()
+                except Exception as exc:  # noqa: BLE001 - 单个源失败不影响整体
+                    log.debug(f"代理源 {source} 抓取失败: {type(exc).__name__}: {exc}")
+                    continue
+                if found:
+                    results[source] = found
+        # 按配置顺序还原，保证 _round_robin 的优先级稳定可预期
+        return [results[src] for src in sources if src in results]
+
+    def _fetch_source(self, source: str) -> list[str]:
+        from curl_cffi import requests as cffi
+
+        resp = cffi.get(source, timeout=self.cfg.timeout, impersonate="chrome", verify=True)
+        if resp.status_code != 200:
+            log.debug(f"代理源 {source} HTTP {resp.status_code}，跳过")
+            return []
+        found = parse_proxy_lines(resp.text)
+        if not found:
+            log.debug(f"代理源 {source} 未提取到代理，跳过")
+            return []
+        log.debug(f"代理源 {source}: 提取 {len(found)} 条")
+        return found
 
     @staticmethod
     def _round_robin(per_source: list[list[str]], limit: int) -> list[str]:
@@ -207,13 +248,39 @@ class ProxyPool:
             idx += 1
         return out
 
-    def _test_many(self, candidates: list[str]) -> list[str]:
+    def _test_many(self, candidates: list[str], need: Optional[int] = None,
+                   deadline: Optional[float] = None) -> list[str]:
+        """并发测通。凑够 need 条或到达 deadline 就立刻收手，不等剩下的慢连接超时。"""
         if not candidates:
             return []
         workers = max(1, min(self.cfg.max_workers, len(candidates)))
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="probe") as pool:
-            results = list(pool.map(self._test_one, candidates))
-        return [proxy for proxy, ok in zip(candidates, results) if ok]
+        alive: list[str] = []
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="probe")
+        try:
+            futures = {pool.submit(self._test_one, proxy): proxy for proxy in candidates}
+            timeout = None if deadline is None else max(0.1, deadline - time.monotonic())
+            try:
+                for future in as_completed(futures, timeout=timeout):
+                    try:
+                        ok = future.result()
+                    except Exception:  # noqa: BLE001 - 探测失败一律按不通
+                        ok = False
+                    if ok:
+                        alive.append(futures[future])
+                        if need is not None and len(alive) >= need:
+                            break
+            except FuturesTimeout:
+                log.debug(f"代理测通到达时间盒，本批只收到 {len(alive)} 条可用")
+        finally:
+            # 已经够用了就别再等剩余候选各自超时；wait=False 立即返回
+            pool.shutdown(wait=False, cancel_futures=True)
+        return alive
+
+    def available_count(self) -> int:
+        """当前还能分配出去的代理数量（未使用且未拉黑）。"""
+        with self._lock:
+            return sum(1 for p in self._available if p not in self._used and p not in self._bad)
+
     def _test_one(self, proxy: str) -> bool:
         try:
             from curl_cffi import requests as cffi

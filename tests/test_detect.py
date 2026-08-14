@@ -149,3 +149,46 @@ class TestPageChallengeType:
     def test_landing_page_login_link_is_not_enough(self):
         html = '<a href="/sign-in">登录</a><main>首页内容</main>'
         assert detect.page_challenge_type(html, "GoRouter", "https://example.com/") is None
+
+
+def _fake_probe(html: str, title: str = "", url: str = "https://example.com/") -> dict:
+    """在 Python 里模拟浏览器端探针脚本，用同一份标记表算命中结果。"""
+    markers = detect.probe_markers()
+    low = html.lower()
+    return {
+        "url": url,
+        "title": title,
+        "challenge": any(m in low for m in markers["challenge"]),
+        "js": any(m in low for m in markers["js"]),
+        "turnstile": any(m in low for m in markers["turnstile"]),
+        "waf": any(m in low for m in markers["waf"]),
+        "login": any(m in low for m in markers["login"]),
+        "password": 'type="password"' in low or "type='password'" in low,
+    }
+
+
+class TestProbeParity:
+    """轻量探针（浏览器端扫标记）必须和整页判定得出同样的结论。"""
+
+    CASES = [
+        (CHALLENGE_HTML, "Just a moment...", "https://example.com/dashboard"),
+        (TURNSTILE_HTML, "Just a moment...", "https://example.com/dashboard"),
+        (WAF_HTML, "Attention Required! | Cloudflare", "https://example.com/dashboard"),
+        (JS_HTML, "", "https://example.com/dashboard"),
+        ("<html><body>今日额度</body></html>", "控制台 - New API", "https://example.com/dashboard"),
+        ('<form><input type="password"><button>登录</button></form>', "GoRouter",
+         "https://example.com/sign-in"),
+        ('<form><label>用户名或电子邮件</label><input type="password"></form>', "GoRouter",
+         "https://example.com/dashboard"),
+        ('<a href="/sign-in">登录</a><main>首页内容</main>', "GoRouter", "https://example.com/"),
+    ]
+
+    def test_probe_matches_full_html_classification(self):
+        for html, title, url in self.CASES:
+            expected = detect.page_challenge_type(html, title, url)
+            assert detect.classify_probe(_fake_probe(html, title, url)) == expected, html[:40]
+
+    def test_probe_markers_cover_every_axis(self):
+        markers = detect.probe_markers()
+        assert set(markers) == {"challenge", "js", "turnstile", "waf", "login"}
+        assert all(markers.values())

@@ -107,11 +107,16 @@ class AccountSession:
 class SessionStore:
     """整个 sessions.json 的读写。原子落盘，避免 cron 中断写坏文件。"""
 
+    # 并行签到时每个账号结束都落盘会退化成 O(账号数 × 会话数) 的全量重写，
+    # 这里给「顺手落盘」加一个最小间隔；收尾的 flush() 仍然强制写。
+    THROTTLE_SECONDS = 2.0
+
     def __init__(self, path: Path):
         self.path = Path(path)
         self._data: dict = {}
         self._dirty = False
         self._lock = threading.RLock()
+        self._last_flush = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -164,6 +169,19 @@ class SessionStore:
                 record.user_id = user_id
                 self._dirty = True
 
+    def flush_throttled(self) -> bool:
+        """节流落盘：距上次成功写盘不足 THROTTLE_SECONDS 就先攒着。
+
+        返回是否真的写了盘。收尾必须再调一次 flush() 兜底。
+        """
+        with self._lock:
+            if not self._dirty:
+                return False
+            if now() - self._last_flush < self.THROTTLE_SECONDS:
+                return False
+        self.flush()
+        return True
+
     def flush(self) -> None:
         with self._lock:
             if not self._dirty:
@@ -177,6 +195,7 @@ class SessionStore:
                     json.dump(payload, fh, ensure_ascii=False, indent=2)
                 os.replace(tmp, self.path)
                 self._dirty = False
+                self._last_flush = now()
             except OSError:
                 try:
                     os.unlink(tmp)

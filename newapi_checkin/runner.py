@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -21,17 +23,18 @@ STRATEGY_LABEL = {
     "S5": "S5 人工兜底",
 }
 
-# 这些结果重试没有意义
-_TERMINAL = (
-    api.SUCCESS,
-    api.ALREADY_DONE,
-    api.AUTH_FAILED,
-    api.LOGIN_REQUIRED,
-    api.WAF_BLOCKED,
-    "skipped",
-)
+# 只有这些结果重试才有意义：都属于「链路/环境的瞬时问题」。
+# 其余结果（签到成功/已签/认证失败/未登录/WAF 封禁/业务明确失败/缺 token）
+# 再跑一遍完整策略链只会白烧时间——尤其是每轮都要冷启动一次浏览器。
+_RETRYABLE = (api.NETWORK_ERROR, api.CF_BLOCKED, api.UNKNOWN)
 # 这些结果说明请求本身通了，换策略也不会变，直接结束
 _SETTLED = (api.SUCCESS, api.ALREADY_DONE, api.AUTH_FAILED, api.FAILED)
+
+# 单账号总尝试次数上限（defaults.retry 与代理池换 IP 共享这一份预算）。
+# 不设上限时二者相乘：retry=2 且 ip_swap_limit=2 就是 9 次完整策略链。
+_ATTEMPT_BUDGET = 4
+# 单账号最多启动几次浏览器过盾。浏览器冷启动 + 质询等待是整条链路里最贵的一步。
+_BROWSER_ATTEMPTS_PER_ACCOUNT = 2
 
 
 @dataclass
@@ -44,6 +47,8 @@ class RunOptions:
     use_browser: bool = True
     verbose: bool = False
     parallelism: int = 1          # 1 = 未显式指定，run() 里自动提升为默认 5
+    parallelism_explicit: bool = False   # True = 调用方明确要求这个并发数，不再自动提升
+    browser_parallelism: int = 0         # 0 = 按 CPU 自动推导；浏览器实例的并发上限
 
 
 class Runner:
@@ -58,12 +63,17 @@ class Runner:
         self._pool = None
         # 记录「由代理池分配」的代理：手动配置的代理出错时不换，池分配的才换
         self._pooled_proxies: dict[str, str] = {}
+        # 并行签到时这些状态会被多个工作线程同时读写
+        self._state_lock = threading.RLock()
+        self._browser_attempts: dict[str, int] = {}
+        self._browser_gate: Optional[threading.Semaphore] = None
 
     # ------------------------------------------------------------------ #
     # 懒加载资源
     # ------------------------------------------------------------------ #
 
-    def init_proxy_pool(self, desired: Optional[int] = None) -> None:
+    def init_proxy_pool(self, desired: Optional[int] = None,
+                        accounts: Optional[int] = None) -> None:
         """抓取并测通代理池。失败/为空时降级直连，绝不中断签到。"""
         if not self.cfg.proxy_pool.enabled:
             log.debug("代理池未启用（proxy_pool.enabled=false）")
@@ -75,39 +85,56 @@ class Runner:
             count = self._pool.refresh(desired=desired)
             if count:
                 log.ok(f"代理池就绪: {count} 个可用代理")
+                self._warn_proxy_shortage(count, accounts)
             else:
                 log.warn(f"代理池为空，本次签到降级直连: {self._pool.last_error}")
         except Exception as exc:  # noqa: BLE001 - 代理池是可降级项，绝不能中断签到
             log.warn(f"代理池初始化失败，降级直连: {type(exc).__name__}: {exc}")
             self._pool = None
 
+    def _warn_proxy_shortage(self, count: int, accounts: Optional[int]) -> None:
+        """账号数超过可用代理数时提前说清楚，别让「一账号一 IP」悄悄退化成共用直连。"""
+        if not accounts:
+            return
+        if count >= accounts:
+            log.info(f"一账号一 IP：{accounts} 个账号 / {count} 个可用代理，"
+                     f"余量 {count - accounts} 个可用于换 IP")
+            return
+        log.warn(f"可用代理只有 {count} 个，少于 {accounts} 个账号："
+                 f"前 {count} 个账号各分到独立 IP，其余 {accounts - count} 个将降级直连"
+                 f"（共用本机出口 IP）。可调大 proxy_pool.max_proxies / 增加 sources，"
+                 f"或给这些账号在 accounts[].proxy 里配置固定代理")
+
     def _assign_proxy(self, account: Account) -> None:
         """给账号分配代理。手动配置的优先；否则从池随机取（一个账号一个 IP）。"""
         if account.proxy:
+            log.debug(f"账号 {account.name} 使用手动配置的代理")
             return
         if self._pool is None:
             return
         proxy = self._pool.acquire()
         if proxy:
             account.proxy = proxy
-            self._pooled_proxies[account.name] = proxy
-            log.debug(f"账号 {account.name} 已分配代理 {proxy}")
+            with self._state_lock:
+                self._pooled_proxies[account.name] = proxy
+            log.info(f"账号 {account.name} 已分配独立代理 {proxy}")
         else:
-            log.warn(f"账号 {account.name} 未分配到代理，降级直连")
+            log.warn(f"账号 {account.name} 未分配到代理，降级直连（与其他直连账号共用出口 IP）")
 
     def _swap_proxy(self, account: Account) -> Optional[str]:
         """目标站点连不上时换一个新代理；返回 None 表示没得换（降级直连）。"""
         if self._pool is None:
             return None
-        old = self._pooled_proxies.get(account.name)
+        with self._state_lock:
+            old = self._pooled_proxies.pop(account.name, None)
         if old:
             self._pool.mark_bad(old)
-        self._pooled_proxies.pop(account.name, None)
         account.proxy = None
         proxy = self._pool.acquire()
         if proxy:
             account.proxy = proxy
-            self._pooled_proxies[account.name] = proxy
+            with self._state_lock:
+                self._pooled_proxies[account.name] = proxy
             log.warn(f"账号 {account.name} 代理 {old or '<手动>'} 连目标站点失败，换用 {proxy}")
             return proxy
         log.warn(f"账号 {account.name} 代理连目标站点失败且池无剩余，降级直连")
@@ -115,31 +142,36 @@ class Runner:
 
     def exit_ip(self, proxy: Optional[str]) -> Optional[str]:
         key = proxy or ""
-        if key not in self._ip_cache:
-            ip = probe_exit_ip(proxy)
-            self._ip_cache[key] = ip
-            log.debug(f"出口 IP: {ip or '探测失败（跳过 IP 比对）'}")
-        return self._ip_cache[key]
+        with self._state_lock:
+            if key in self._ip_cache:
+                return self._ip_cache[key]
+        ip = probe_exit_ip(proxy)
+        with self._state_lock:
+            self._ip_cache.setdefault(key, ip)
+            ip = self._ip_cache[key]
+        log.debug(f"出口 IP: {ip or '探测失败（跳过 IP 比对）'}")
+        return ip
 
     def ai(self):
-        if self._ai_ready:
-            return self._ai
-        self._ai_ready = True
-        if not self.options.use_ai:
-            log.debug("已通过 --no-ai 禁用 AI 辅助")
-            return None
-        if not self.cfg.ai.ready:
-            log.debug("AI 未配置或不完整，跳过 S3")
-            return None
-        try:
-            from .ai.vision import VisionClient
+        with self._state_lock:
+            if self._ai_ready:
+                return self._ai
+            self._ai_ready = True
+            if not self.options.use_ai:
+                log.debug("已通过 --no-ai 禁用 AI 辅助")
+                return None
+            if not self.cfg.ai.ready:
+                log.debug("AI 未配置或不完整，跳过 S3")
+                return None
+            try:
+                from .ai.vision import VisionClient
 
-            self._ai = VisionClient(self.cfg.ai)
-            log.debug(f"AI 已就绪: {self.cfg.ai.model} @ {self.cfg.ai.chat_url}")
-        except Exception as exc:  # noqa: BLE001 - AI 是可降级项，绝不能中断签到
-            log.warn(f"AI 初始化失败，将跳过 S3: {exc}")
-            self._ai = None
-        return self._ai
+                self._ai = VisionClient(self.cfg.ai)
+                log.debug(f"AI 已就绪: {self.cfg.ai.model} @ {self.cfg.ai.chat_url}")
+            except Exception as exc:  # noqa: BLE001 - AI 是可降级项，绝不能中断签到
+                log.warn(f"AI 初始化失败，将跳过 S3: {exc}")
+                self._ai = None
+            return self._ai
 
     # ------------------------------------------------------------------ #
     # 主循环
@@ -159,6 +191,46 @@ class Runner:
         """把传入的并发数写回选项（供 CLI/调度调用方设置）。"""
         self.options.parallelism = max(1, min(8, int(workers)))
 
+    def _browser_workers(self) -> int:
+        """浏览器实例的并发上限。
+
+        账号级并行度不能直接当作浏览器并行度：每个 Camoufox/Chromium 实例大致要吃
+        掉一个核心和几百 MB 内存，在 2~4 核的 runner 上开 5 个只会互相抢 CPU，
+        单个实例反而被拖慢好几倍。HTTP 快路径可以高并发，浏览器不行。
+        """
+        accounts_workers = self._parallelism()
+        configured = 0
+        try:
+            configured = int(getattr(self.options, "browser_parallelism", 0) or 0)
+        except (TypeError, ValueError):
+            configured = 0
+        if configured > 0:
+            return max(1, min(accounts_workers, configured))
+        auto = max(1, min(3, (os.cpu_count() or 2) // 2))
+        return max(1, min(accounts_workers, auto))
+
+    def _take_browser_attempt(self, account: Account) -> bool:
+        """领取一次浏览器过盾配额；返回 False 表示该账号已用满。"""
+        with self._state_lock:
+            used = self._browser_attempts.get(account.name, 0)
+            if used >= _BROWSER_ATTEMPTS_PER_ACCOUNT:
+                return False
+            self._browser_attempts[account.name] = used + 1
+            return True
+
+    def _should_retry(self, row: log.SummaryRow) -> bool:
+        """只对瞬时失败重试。其余结果重跑整条链路是纯浪费。"""
+        if row.status not in _RETRYABLE:
+            return False
+        if row.status == api.CF_BLOCKED:
+            if not self.options.use_browser:
+                # 没有浏览器可用，再试也只会拿到同一个质询页
+                return False
+            with self._state_lock:
+                if self._browser_attempts.get(row.name, 0) >= _BROWSER_ATTEMPTS_PER_ACCOUNT:
+                    return False
+        return True
+
     def run(self) -> int:
         accounts = self.cfg.select(self.options.account_names)
         if not accounts:
@@ -166,21 +238,25 @@ class Runner:
             return 2
 
         # 默认并行度 5：效率与资源占用折中（人工模式强制串行 1）
-        if not self.options.manual and self.options.parallelism in (None, 1, 0):
-            self._set_parallelism(5)
-        elif self.options.manual:
+        if self.options.manual:
             self._set_parallelism(1)
+        elif (not getattr(self.options, "parallelism_explicit", False)
+                and self.options.parallelism in (None, 1, 0)):
+            self._set_parallelism(5)
 
         # 代理池是可选资源：抓取+测通失败只降级直连，不影响签到
-        self.init_proxy_pool(desired=len(accounts) + 10)
+        # desired 比账号数多 10：留出换 IP 的余量，账号越多目标越大
+        self.init_proxy_pool(desired=len(accounts) + 10, accounts=len(accounts))
 
         mode = "dry-run 连通性检查" if self.options.dry_run else "签到"
         log.step(f"开始{mode}，共 {len(accounts)} 个账号")
         workers = self._parallelism()
+        browser_workers = self._browser_workers()
+        self._browser_gate = threading.Semaphore(browser_workers)
         if workers <= 1:
             exit_code = self._run_serial(accounts)
         else:
-            log.info(f"账号级并行度 {workers}")
+            log.info(f"账号级并行度 {workers}，浏览器并发上限 {browser_workers}")
             exit_code = self._run_parallel(accounts, workers)
 
         # 邮件通知：无论成败都发；失败只 WARN 不影响退出码
@@ -235,25 +311,36 @@ class Runner:
                     log.debug(traceback.format_exc())
                 row = log.SummaryRow(account.name, api.UNKNOWN, "-", f"{type(exc).__name__}: {exc}")
             self.summary.add(row)
-            self.store.flush()
+            self.store.flush_throttled()
             if idx < total:
                 delay = jitter_sleep(self.cfg.defaults.interval_seconds)
                 log.debug(f"账号间隔停顿 {delay:.1f}s")
 
+        self.store.flush()
         self.summary.render()
         return 0 if self.summary.failed == 0 else 1
 
     def _run_parallel(self, accounts: list, workers: int) -> int:
-        from concurrent.futures import ThreadPoolExecutor
+        """并行跑账号，谁先结束谁先出结果。
+
+        以前是按提交顺序逐个 future.result()：第一个账号不结束，后面全部账号的
+        进度都不打印，看起来像卡死，也没法及早把结果落盘。汇总表仍按配置顺序。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         total = len(accounts)
-        rows: list = []
+        rows: dict = {}
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="checkin") as pool:
-            futures = [pool.submit(self._run_account, account) for account in accounts]
-            for idx, (account, future) in enumerate(zip(accounts, futures), start=1):
-                log.step(f"[{idx}/{total}] {account.name}  ->  {account.base_url}")
+            futures = {}
+            for idx, account in enumerate(accounts, start=1):
+                log.step(f"[{idx}/{total}] 提交 {account.name}  ->  {account.base_url}")
+                futures[pool.submit(self._run_account, account)] = account
+            done = 0
+            for future in as_completed(futures):
+                account = futures[future]
+                done += 1
                 try:
-                    rows.append(future.result())
+                    row = future.result()
                 except KeyboardInterrupt:
                     log.warn("收到中断信号，停止等待后续账号")
                     for pending in futures:
@@ -267,14 +354,18 @@ class Runner:
                         import traceback
 
                         log.debug(traceback.format_exc())
-                    rows.append(
-                        log.SummaryRow(account.name, api.UNKNOWN, "-",
-                                       f"{type(exc).__name__}: {exc}")
-                    )
-                self.store.flush()
+                    row = log.SummaryRow(account.name, api.UNKNOWN, "-",
+                                         f"{type(exc).__name__}: {exc}")
+                rows[id(account)] = row
+                log.step(f"[{done}/{total}] {account.name} 结束: "
+                         f"{log.STATUS_LABEL.get(row.status, row.status)}")
+                self.store.flush_throttled()
 
-        for account, row in zip(accounts, rows):
-            self.summary.add(row)
+        self.store.flush()
+        for account in accounts:
+            row = rows.get(id(account))
+            if row is not None:
+                self.summary.add(row)
         self.summary.render()
         return 0 if self.summary.failed == 0 else 1
 
@@ -297,31 +388,43 @@ class Runner:
 
         # 一个账号一个 IP：先从代理池分配（手动配置的代理优先，不改动）
         self._assign_proxy(account)
+        with self._state_lock:
+            self._browser_attempts[account.name] = 0
 
         # 目标站点连不上（网络层失败）时换 IP 重试；业务失败（cookie/已签/风控）不换
         swap_left = self.cfg.proxy_pool.ip_swap_limit if self._pool else 0
+        budget = _ATTEMPT_BUDGET
         while True:
-            row = self._run_account_with_retries(account, record)
-            if (row.status == api.NETWORK_ERROR and swap_left > 0
-                    and account.name in self._pooled_proxies):
+            row, used = self._run_account_with_retries(account, record, budget)
+            budget -= used
+            with self._state_lock:
+                from_pool = account.name in self._pooled_proxies
+            if (row.status == api.NETWORK_ERROR and swap_left > 0 and budget > 0
+                    and from_pool):
                 if self._swap_proxy(account):
                     swap_left -= 1
                     log.warn(f"账号 {account.name} 换 IP 后重试签到")
                     continue
+            if row.status == api.NETWORK_ERROR and budget <= 0:
+                log.warn(f"账号 {account.name} 已用满 {_ATTEMPT_BUDGET} 次尝试预算，停止重试")
             return row
 
-    def _run_account_with_retries(self, account: Account, record) -> log.SummaryRow:
-        attempts = self.cfg.defaults.retry + 1
+    def _run_account_with_retries(self, account: Account, record,
+                                  budget: int = _ATTEMPT_BUDGET) -> tuple:
+        """返回 (结果行, 实际消耗的尝试次数)。budget 与换 IP 共享同一份预算。"""
+        attempts = max(1, min(self.cfg.defaults.retry + 1, max(1, budget)))
         row: Optional[log.SummaryRow] = None
+        used = 0
         for attempt in range(1, attempts + 1):
             if attempt > 1:
-                backoff = min(30, 2 ** (attempt - 1))
+                backoff = min(8, 2 ** (attempt - 1))
                 log.info(f"第 {attempt}/{attempts} 次尝试，退避 {backoff}s")
                 time.sleep(backoff)
             row = self._attempt(account, record)
-            if row.status in _TERMINAL:
-                return row
-        return row or log.SummaryRow(account.name, api.UNKNOWN, "-", "未产生任何结果")
+            used += 1
+            if not self._should_retry(row):
+                return row, used
+        return row or log.SummaryRow(account.name, api.UNKNOWN, "-", "未产生任何结果"), used
 
     def _attempt(self, account: Account, record) -> log.SummaryRow:
         ip = self.exit_ip(account.proxy)
@@ -365,11 +468,39 @@ class Runner:
         if not self.options.use_browser:
             return self._row(account, result, "S1", detail="已禁用浏览器过盾（--no-browser）")
 
+        if not self._take_browser_attempt(account):
+            return self._row(
+                account, result, "S1",
+                detail=f"已连续 {_BROWSER_ATTEMPTS_PER_ACCOUNT} 次浏览器过盾失败，"
+                       f"不再重复启动浏览器（换出口 IP 或检查 cookie 更有效）",
+            )
+
         return self._solve(account, record, ip, result)
 
     # ------------------------------------------------------------------ #
     # 浏览器过盾（S2 / S3 / S4 / S5）
     # ------------------------------------------------------------------ #
+
+    def _solve_guarded(self, solve, account: Account, ip: Optional[str]):
+        """在浏览器并发信号量的保护下调用过盾流程。"""
+        def _call():
+            return solve(
+                cfg=self.cfg,
+                account=account,
+                exit_ip=ip,
+                options=self.options,
+                ai=self.ai(),
+            )
+
+        gate = self._browser_gate
+        if gate is None:
+            return _call()
+        started = time.monotonic()
+        with gate:
+            waited = time.monotonic() - started
+            if waited > 1.0:
+                log.debug(f"等待浏览器并发配额 {waited:.1f}s")
+            return _call()
 
     def _solve(self, account: Account, record, ip: Optional[str],
                blocked: api.ApiResult) -> log.SummaryRow:
@@ -380,13 +511,7 @@ class Runner:
             log.info("安装依赖: pip install -r requirements.txt && python -m camoufox fetch")
             return self._row(account, blocked, "S1", detail=f"过盾模块缺失: {exc}")
 
-        outcome = solve(
-            cfg=self.cfg,
-            account=account,
-            exit_ip=ip,
-            options=self.options,
-            ai=self.ai(),
-        )
+        outcome = self._solve_guarded(solve, account, ip)
 
         if outcome.cf is not None:
             self.store.update_cf(account.slug, outcome.cf)

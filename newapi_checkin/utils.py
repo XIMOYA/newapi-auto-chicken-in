@@ -6,6 +6,7 @@ import json
 import random
 import re
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -48,28 +49,57 @@ def jitter_sleep(bounds: Tuple[float, float]) -> float:
     return delay
 
 
-def probe_exit_ip(proxy: Optional[str] = None, timeout: int = 8) -> Optional[str]:
-    """探测当前出口 IP。cf_clearance 与 IP 绑定，缓存复用前必须比对。
-
-    探测失败返回 None —— 此时不阻断流程，只是放弃 IP 比对这一层校验。
-    """
+def _probe_one(url: str, proxy: Optional[str], timeout: int) -> Optional[str]:
     try:
         from curl_cffi import requests as cffi_requests
     except ImportError:
         return None
-
-    for url in IP_PROBE_URLS:
-        try:
-            resp = cffi_requests.get(
-                url, timeout=timeout, proxies={"http": proxy, "https": proxy} if proxy else None,
-                impersonate="chrome",
-            )
-            text = (resp.text or "").strip()
-            if _IPV4.match(text) or ":" in text:
-                return text
-        except Exception:  # noqa: BLE001 - 探测是可选项，任何失败都直接跳过
-            continue
+    try:
+        resp = cffi_requests.get(
+            url, timeout=timeout, proxies={"http": proxy, "https": proxy} if proxy else None,
+            impersonate="chrome",
+        )
+    except Exception:  # noqa: BLE001 - 探测是可选项，任何失败都直接跳过
+        return None
+    text = (resp.text or "").strip()
+    if _IPV4.match(text) or ":" in text:
+        return text
     return None
+
+
+def probe_exit_ip(proxy: Optional[str] = None, timeout: int = 5) -> Optional[str]:
+    """探测当前出口 IP。cf_clearance 与 IP 绑定，缓存复用前必须比对。
+
+    三个探测端点并发竞速，第一个返回合法 IP 就立刻采用——串行逐个试的话，
+    前两个端点各超时一次就要白等 2 * timeout 秒，而这只是可降级的辅助校验。
+
+    探测失败返回 None —— 此时不阻断流程，只是放弃 IP 比对这一层校验。
+    """
+    try:
+        import curl_cffi  # noqa: F401
+    except ImportError:
+        return None
+
+    pool = ThreadPoolExecutor(max_workers=len(IP_PROBE_URLS), thread_name_prefix="exitip")
+    try:
+        pending = {pool.submit(_probe_one, url, proxy, timeout) for url in IP_PROBE_URLS}
+        deadline = time.monotonic() + timeout + 1
+        while pending:
+            left = max(0.1, deadline - time.monotonic())
+            done, pending = wait(pending, timeout=left, return_when=FIRST_COMPLETED)
+            if not done:
+                break
+            for future in done:
+                try:
+                    ip = future.result()
+                except Exception:  # noqa: BLE001
+                    ip = None
+                if ip:
+                    return ip
+        return None
+    finally:
+        # 不等剩余探测收尾：出口 IP 只是辅助校验，不该拖住签到主流程
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S | re.I)
