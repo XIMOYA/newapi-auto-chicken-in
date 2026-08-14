@@ -57,15 +57,30 @@ web/src/views/ExportView.vue
 
       <n-alert type="warning" :bordered="false" class="import-tip">
         <template #icon><n-icon><warning-outline /></n-icon></template>
-        导入将写入完整配置（含 Cookie 等敏感信息）。请粘贴或上传一份完整的
-        <n-text code>config.json</n-text>（可用下方「导出」功能获得）。
-        <b>覆盖模式</b>会整体替换当前配置；<b>合并模式</b>只增加/更新账号与站点，其余模块保持不变。
+        导入将写入配置（含 Cookie 等敏感信息）。请粘贴或上传一份完整的
+        <n-text code>config.json</n-text>（可用上方「导出」功能获得）。
+        <b>覆盖模式</b>会整体替换当前配置；<b>合并模式</b>可勾选要导入的模块，
+        勾选哪些就更新哪些，未勾选的保持不变。
       </n-alert>
 
       <n-radio-group v-model:value="importMode" class="import-mode">
-        <n-radio-button value="merge">合并（增加）</n-radio-button>
+        <n-radio-button value="merge">合并（选择模块）</n-radio-button>
         <n-radio-button value="overwrite">覆盖（整体替换）</n-radio-button>
       </n-radio-group>
+
+      <!-- 合并模式的模块勾选 -->
+      <div v-if="importMode === 'merge'" class="module-check">
+        <div class="module-check-title">选择要导入的模块：</div>
+        <n-checkbox-group v-model:value="selectedModules" class="module-check-group">
+          <n-checkbox v-for="mod in availableModules" :key="mod.key" :value="mod.key" class="module-check-item">
+            {{ mod.label }}
+          </n-checkbox>
+        </n-checkbox-group>
+        <div class="module-check-actions">
+          <n-button size="tiny" quaternary @click="selectAllModules">全选</n-button>
+          <n-button size="tiny" quaternary @click="selectedModules = []">清空</n-button>
+        </div>
+      </div>
 
       <n-upload
         :show-file-list="false"
@@ -108,7 +123,7 @@ web/src/views/ExportView.vue
 import { computed, onMounted, ref } from 'vue'
 import {
   NCard, NButton, NIcon, NInput, NTag, NAlert, NText, NSpin, NRadioGroup, NRadioButton, NUpload,
-  useDialog, useMessage
+  NCheckbox, NCheckboxGroup, useDialog, useMessage
 } from 'naive-ui'
 import {
   RefreshOutline, CopyOutline, InformationCircleOutline, WarningOutline,
@@ -128,6 +143,28 @@ const importText = ref('')
 const importMode = ref<'merge' | 'overwrite'>('merge')
 const importing = ref(false)
 const parseError = ref('')
+
+/** 全部可导入模块（与后端 configModuleKeys 对齐） */
+const moduleOptions: { key: string; label: string }[] = [
+  { key: 'accounts', label: '账号' },
+  { key: 'sites', label: '站点预设' },
+  { key: 'ai', label: 'AI 配置' },
+  { key: 'browser', label: '浏览器配置' },
+  { key: 'http', label: 'HTTP 配置' },
+  { key: 'defaults', label: '全局默认' },
+  { key: 'proxy_pool', label: '代理池' },
+  { key: 'notify', label: '邮件通知' },
+  { key: 'config_sync', label: '配置同步' },
+  { key: 'security', label: '安全' }
+]
+
+/** 当前导入 JSON 中实际存在的模块（用于勾选展示） */
+const availableModules = ref<{ key: string; label: string }[]>([])
+const selectedModules = ref<string[]>([])
+
+function selectAllModules() {
+  selectedModules.value = availableModules.value.map((m) => m.key)
+}
 
 const sizeLabel = computed(() => {
   const bytes = new Blob([jsonText.value]).size
@@ -193,6 +230,9 @@ function validateImport(): boolean {
       parseError.value = 'accounts 必须是数组'
       return false
     }
+    // 依据 JSON 中实际存在的模块更新勾选列表（默认全选）
+    availableModules.value = moduleOptions.filter((m) => m.key in obj)
+    selectedModules.value = availableModules.value.map((m) => m.key)
     return true
   } catch {
     parseError.value = 'JSON 解析失败，请检查格式'
@@ -203,6 +243,8 @@ function validateImport(): boolean {
 function clearImport() {
   importText.value = ''
   parseError.value = ''
+  availableModules.value = []
+  selectedModules.value = []
 }
 
 function handleImport() {
@@ -210,10 +252,18 @@ function handleImport() {
   const parsed = JSON.parse(importText.value) as Record<string, unknown>
   const mode = importMode.value
   const count = (parsed.accounts as unknown[]).length
-  const summary =
-    mode === 'merge'
-      ? `将按名称合并导入 ${count} 个账号（同名更新、新名追加），其余配置保持不变。`
-      : `将整体替换当前全部配置为导入内容（共 ${count} 个账号）。此操作不可撤销！`
+  let summary: string
+  if (mode === 'merge') {
+    const picked = selectedModules.value
+    if (picked.length === 0) {
+      message.warning('请至少勾选一个要导入的模块')
+      return
+    }
+    const labels = picked.map((k) => moduleOptions.find((m) => m.key === k)?.label ?? k)
+    summary = `将按名称合并导入以下模块：${labels.join('、')}（共 ${count} 个账号）。未勾选的模块保持不变。`
+  } else {
+    summary = `将整体替换当前全部配置为导入内容（共 ${count} 个账号）。此操作不可撤销！`
+  }
   dialog.warning({
     title: `确认导入（${mode === 'merge' ? '合并' : '覆盖'}）`,
     content: summary,
@@ -222,7 +272,11 @@ function handleImport() {
     onPositiveClick: async () => {
       importing.value = true
       try {
-        const params: ImportParams = { config: parsed, mode }
+        const params: ImportParams = {
+          config: parsed,
+          mode,
+          modules: mode === 'merge' ? selectedModules.value : undefined
+        }
         const res = await importConfig(params)
         message.success(`导入成功（${mode === 'merge' ? '合并' : '覆盖'}）`)
         jsonText.value = ''
@@ -281,6 +335,35 @@ onMounted(fetchExport)
 
 .import-mode {
   margin-bottom: 16px;
+}
+
+.module-check {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  background: #f7f8fb;
+  border-radius: 8px;
+}
+
+.module-check-title {
+  font-size: 13px;
+  color: #48566a;
+  margin-bottom: 10px;
+}
+
+.module-check-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+}
+
+.module-check-item {
+  margin-right: 0;
+}
+
+.module-check-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 4px;
 }
 
 .import-upload {

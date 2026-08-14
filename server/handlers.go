@@ -164,20 +164,24 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleImportConfig POST /api/config/import（JWT）—— 导入完整配置。
-// body: {"config": {...}, "mode": "overwrite" | "merge"}
-//   - overwrite：整体覆盖（与 PUT /api/config 一致，明文 cookie 直接落库）
-//   - merge：账号/站点按 name 合并（同名更新、新名追加），其余模块保留现有
+// handleImportConfig POST /api/config/import（JWT）—— 导入配置。
+// body: {"config": {...}, "mode": "overwrite" | "merge", "modules": ["accounts", ...]}
+//   - overwrite：整体覆盖（modules 忽略）
+//   - merge：仅合并 modules 列出的模块（未列出的保留现有）
+//     其中 accounts / sites 按 name 合并（同名更新、新名追加），
+//     其余标量模块（ai/browser/http/defaults/proxy_pool/notify/config_sync/security）
+//     若导入 JSON 中存在该模块则整体覆盖。
 func (s *Server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Config *Config `json:"config"`
-		Mode   string  `json:"mode"`
+		Config  json.RawMessage `json:"config"`
+		Mode    string          `json:"mode"`
+		Modules []string        `json:"modules"`
 	}
 	if err := readJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "请求体不是合法的 JSON")
 		return
 	}
-	if req.Config == nil {
+	if len(req.Config) == 0 {
 		writeError(w, http.StatusBadRequest, "config 不能为空")
 		return
 	}
@@ -185,6 +189,20 @@ func (s *Server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 	if mode != "overwrite" && mode != "merge" {
 		writeError(w, http.StatusBadRequest, "mode 必须是 overwrite 或 merge")
 		return
+	}
+
+	// 解析导入配置，并记录其顶层实际存在的模块键
+	var in Config
+	if err := json.Unmarshal(req.Config, &in); err != nil {
+		writeError(w, http.StatusBadRequest, "config 解析失败")
+		return
+	}
+	present := map[string]bool{}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(req.Config, &keys); err == nil {
+		for k := range keys {
+			present[k] = true
+		}
 	}
 
 	oldCfg, _, err := LoadConfig(s.db)
@@ -195,9 +213,15 @@ func (s *Server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 
 	var target Config
 	if mode == "merge" {
-		target = mergeConfig(req.Config, &oldCfg)
+		for _, m := range req.Modules {
+			if !isValidModule(m) {
+				writeError(w, http.StatusBadRequest, "modules 含未知模块: "+m)
+				return
+			}
+		}
+		target = mergeConfigWithModules(&in, &oldCfg, present, req.Modules)
 	} else {
-		target = *req.Config
+		target = in
 	}
 	if err := ValidateConfig(&target); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -212,50 +236,106 @@ func (s *Server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"mode":       mode,
+		"modules":    req.Modules,
 		"updated_at": updatedAt,
 	})
 }
 
-// mergeConfig 把导入配置合并进现有配置：
-// - accounts：按 name 合并（同名以导入为准覆盖，新 name 追加）
-// - sites：按 name 合并（同上）
-// - 其余模块：保留现有（导入不改动 ai/browser/http/... 等全局配置）
-func mergeConfig(in *Config, old *Config) Config {
+// configModuleKeys 全部可导入的顶层模块。
+var configModuleKeys = []string{
+	"accounts", "sites", "ai", "browser", "http", "defaults",
+	"proxy_pool", "notify", "config_sync", "security",
+}
+
+// isValidModule 判断模块名是否合法。
+func isValidModule(m string) bool {
+	for _, k := range configModuleKeys {
+		if m == k {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeConfigWithModules 按 modules 列表把导入配置合并进现有配置：
+// - modules 为 nil（未传）→ 默认全部模块（向后兼容旧客户端）
+// - modules 为空数组 → 不导入任何模块
+// - accounts / sites：按 name 合并（同名覆盖、新名追加）
+// - 标量模块：仅当导入 JSON 中存在且被勾选时整体覆盖，否则保留现有
+func mergeConfigWithModules(in *Config, old *Config, present map[string]bool, modules []string) Config {
 	out := cloneConfig(old)
-	if out.Accounts == nil {
-		out.Accounts = []Account{}
+	if modules == nil {
+		modules = configModuleKeys
 	}
-	if out.Sites == nil {
-		out.Sites = []Site{}
+	want := make(map[string]bool, len(modules))
+	for _, m := range modules {
+		want[m] = true
 	}
 
-	// 账号合并：保留现有顺序，同名覆盖，新名追加
-	existing := make(map[string]int, len(out.Accounts))
-	for i := range out.Accounts {
-		existing[out.Accounts[i].Name] = i
-	}
-	for _, a := range in.Accounts {
-		if i, ok := existing[a.Name]; ok {
-			out.Accounts[i] = a
-		} else {
-			existing[a.Name] = len(out.Accounts)
-			out.Accounts = append(out.Accounts, a)
+	// accounts：按 name 合并
+	if want["accounts"] && present["accounts"] {
+		if out.Accounts == nil {
+			out.Accounts = []Account{}
+		}
+		existing := make(map[string]int, len(out.Accounts))
+		for i := range out.Accounts {
+			existing[out.Accounts[i].Name] = i
+		}
+		for _, a := range in.Accounts {
+			if i, ok := existing[a.Name]; ok {
+				out.Accounts[i] = a
+			} else {
+				existing[a.Name] = len(out.Accounts)
+				out.Accounts = append(out.Accounts, a)
+			}
 		}
 	}
 
-	// 站点合并：同上
-	existingSites := make(map[string]int, len(out.Sites))
-	for i := range out.Sites {
-		existingSites[out.Sites[i].Name] = i
-	}
-	for _, s := range in.Sites {
-		if i, ok := existingSites[s.Name]; ok {
-			out.Sites[i] = s
-		} else {
-			existingSites[s.Name] = len(out.Sites)
-			out.Sites = append(out.Sites, s)
+	// sites：按 name 合并
+	if want["sites"] && present["sites"] {
+		if out.Sites == nil {
+			out.Sites = []Site{}
+		}
+		existingSites := make(map[string]int, len(out.Sites))
+		for i := range out.Sites {
+			existingSites[out.Sites[i].Name] = i
+		}
+		for _, s := range in.Sites {
+			if i, ok := existingSites[s.Name]; ok {
+				out.Sites[i] = s
+			} else {
+				existingSites[s.Name] = len(out.Sites)
+				out.Sites = append(out.Sites, s)
+			}
 		}
 	}
+
+	// 标量模块：勾选且导入中存在 → 整体覆盖
+	if want["ai"] && present["ai"] {
+		out.AI = in.AI
+	}
+	if want["browser"] && present["browser"] {
+		out.Browser = in.Browser
+	}
+	if want["http"] && present["http"] {
+		out.HTTP = in.HTTP
+	}
+	if want["defaults"] && present["defaults"] {
+		out.Defaults = in.Defaults
+	}
+	if want["proxy_pool"] && present["proxy_pool"] {
+		out.ProxyPool = in.ProxyPool
+	}
+	if want["notify"] && present["notify"] {
+		out.Notify = in.Notify
+	}
+	if want["config_sync"] && present["config_sync"] {
+		out.ConfigSync = in.ConfigSync
+	}
+	if want["security"] && present["security"] {
+		out.Security = in.Security
+	}
+
 	return *out
 }
 

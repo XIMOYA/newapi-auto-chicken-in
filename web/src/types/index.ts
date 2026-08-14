@@ -187,8 +187,10 @@ export interface ExportResult {
 export interface ImportParams {
   /** 导入的完整配置对象 */
   config: Record<string, unknown>
-  /** overwrite 覆盖全部 / merge 合并（账号/站点按 name 合并，其余模块保留） */
+  /** overwrite 覆盖全部 / merge 合并（按 modules 勾选模块） */
   mode: 'overwrite' | 'merge'
+  /** merge 模式下要导入的模块键；缺省/undefined = 默认全部 */
+  modules?: string[]
 }
 
 export interface ImportResult {
