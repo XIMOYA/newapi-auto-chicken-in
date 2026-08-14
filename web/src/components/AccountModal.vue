@@ -36,14 +36,27 @@ web/src/components/AccountModal.vue
         <n-input v-model:value="form.url" placeholder="https://newapi.example.com" />
       </n-form-item>
       <n-form-item label="Cookie" path="cookie">
-        <masked-input
-          v-model="form.cookie"
-          :original-value="originalCookie"
-          type="textarea"
-          :autosize="{ minRows: 2, maxRows: 6 }"
-          placeholder="粘贴完整 Cookie（如 session=...）"
-          custom-tip="该账号 Cookie 已设置（出于安全原因接口不回传明文），留空保持不变，输入新值可修改"
-        />
+        <div class="cookie-field">
+          <masked-input
+            v-model="form.cookie"
+            :original-value="originalCookie"
+            type="textarea"
+            :autosize="{ minRows: 2, maxRows: 6 }"
+            placeholder="粘贴完整 Cookie（如 session=...）"
+            custom-tip="该账号 Cookie 已设置（出于安全原因接口不回传明文），留空保持不变，输入新值可修改"
+          />
+          <n-button
+            v-if="isEdit && isMaskedCookie"
+            size="tiny"
+            secondary
+            type="info"
+            class="reveal-btn"
+            @click="passwordConfirmVisible = true"
+          >
+            <template #icon><n-icon><eye-outline /></n-icon></template>
+            查看明文
+          </n-button>
+        </div>
       </n-form-item>
       <n-form-item label="用户 ID" path="user_id">
         <n-input v-model:value="form.user_id" placeholder="可选，留空自动识别" />
@@ -68,12 +81,25 @@ web/src/components/AccountModal.vue
       </div>
     </template>
   </n-modal>
+
+  <password-confirm-modal
+    v-model:show="passwordConfirmVisible"
+    :loading="revealing"
+    @confirm="handleRevealCookie"
+  />
+  <cookie-reveal-modal v-model:show="revealVisible" :cookie="revealedCookie" :account-name="form.name" />
 </template>
 
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { NForm, NFormItem, NInput, NModal, NSwitch, NButton, NSelect, type FormInst, type FormRules, type SelectOption } from 'naive-ui'
+import { NForm, NFormItem, NInput, NModal, NSwitch, NButton, NSelect, NIcon, useMessage, type FormInst, type FormRules, type SelectOption } from 'naive-ui'
+import { EyeOutline } from '@vicons/ionicons5'
 import MaskedInput from './MaskedInput.vue'
+import PasswordConfirmModal from './PasswordConfirmModal.vue'
+import CookieRevealModal from './CookieRevealModal.vue'
+import { verifyPassword } from '@/api/auth'
+import { exportConfig } from '@/api/export'
+import { extractErrorMessage } from '@/utils/error'
 import type { Account, Site } from '@/types'
 
 const props = defineProps<{
@@ -199,6 +225,39 @@ watch(
   }
 )
 
+// ---- 查看明文 Cookie（二次确认）----
+const message = useMessage()
+const passwordConfirmVisible = ref(false)
+const revealing = ref(false)
+const revealVisible = ref(false)
+const revealedCookie = ref('')
+
+/** 编辑且 Cookie 是打码占位时，才显示「查看明文」按钮 */
+const isMaskedCookie = computed(() => originalCookie.value !== '' && form.cookie === '***')
+
+async function handleRevealCookie(password: string) {
+  revealing.value = true
+  try {
+    await verifyPassword(password)
+    // 密码确认通过 → 拉取完整明文配置，取当前账号的 cookie
+    const res = await exportConfig()
+    const cfg = JSON.parse(res.json) as { accounts?: Account[] }
+    const target = (cfg.accounts ?? []).find((a) => a.name === props.account?.name)
+    if (!target || !target.cookie) {
+      message.error('未找到该账号的 Cookie')
+      passwordConfirmVisible.value = false
+      return
+    }
+    revealedCookie.value = target.cookie
+    passwordConfirmVisible.value = false
+    revealVisible.value = true
+  } catch (e) {
+    message.error(extractErrorMessage(e, '密码验证失败'))
+  } finally {
+    revealing.value = false
+  }
+}
+
 const rules: FormRules = {
   name: { required: true, message: '请输入账号名称', trigger: ['input', 'blur'] },
   url: [
@@ -254,5 +313,13 @@ function handleSubmit() {
   display: flex;
   justify-content: flex-end;
   gap: 12px;
+}
+
+.cookie-field {
+  width: 100%;
+}
+
+.reveal-btn {
+  margin-top: 8px;
 }
 </style>

@@ -56,6 +56,7 @@ func (s *Server) routes() http.Handler {
 
 	mux.HandleFunc("GET /api/export", s.requireJWT(s.handleExport))
 	mux.HandleFunc("PUT /api/password", s.requireJWT(s.handlePassword))
+	mux.HandleFunc("POST /api/auth/verify-password", s.requireJWT(s.handleVerifyPassword))
 
 	mux.Handle("/", s.staticHandler())
 	return mux
@@ -337,6 +338,29 @@ func mergeConfigWithModules(in *Config, old *Config, present map[string]bool, mo
 	}
 
 	return *out
+}
+
+// handleVerifyPassword POST /api/auth/verify-password（JWT）—— 二次确认当前用户密码。
+// 用于查看明文 Cookie / API Key 等高敏操作前的确认，避免误点泄露。
+func (s *Server) handleVerifyPassword(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := readJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法的 JSON")
+		return
+	}
+	username, _ := r.Context().Value(ctxKeyUsername).(string)
+	user, err := GetUserByUsername(s.db, username)
+	if err != nil || user == nil {
+		writeError(w, http.StatusInternalServerError, "服务器内部错误")
+		return
+	}
+	if !CheckPassword(user.PasswordHash, req.Password) {
+		writeError(w, http.StatusBadRequest, "密码错误")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // handleRawConfig GET /api/config/raw（API Key）—— 直接返回完整明文配置对象（非包裹结构）。

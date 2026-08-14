@@ -13,6 +13,11 @@ export function changePassword(data: ChangePasswordParams): Promise<{ ok: boolea
   return http.put<{ ok: boolean }>('/password', data).then((r) => r.data)
 }
 
+/** 二次确认当前用户密码（查看明文 Cookie / API Key 前调用） */
+export function verifyPassword(password: string): Promise<{ ok: boolean }> {
+  return http.post<{ ok: boolean }>('/auth/verify-password', { password }).then((r) => r.data)
+}
+
 export function getHealth(): Promise<HealthResult> {
   return http.get<HealthResult>('/health').then((r) => r.data)
 }

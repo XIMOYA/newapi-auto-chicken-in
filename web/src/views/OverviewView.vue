@@ -119,6 +119,14 @@ web/src/views/OverviewView.vue
 
     <account-modal v-model:show="modalVisible" :account="editingAccount" :submitting="submitting" :sites="sites" @submit="handleAccountSubmit" />
     <site-modal v-model:show="siteModalVisible" :site="editingSite" @submit="handleSiteSubmit" />
+
+    <!-- 查看明文 Cookie：二次确认 -->
+    <password-confirm-modal
+      v-model:show="passwordConfirmVisible"
+      :loading="revealing"
+      @confirm="handleRevealCookie"
+    />
+    <cookie-reveal-modal v-model:show="revealVisible" :cookie="revealedCookie" :account-name="cookieRevealTarget" />
   </div>
 </template>
 
@@ -134,7 +142,11 @@ import {
 } from '@vicons/ionicons5'
 import AccountModal from '@/components/AccountModal.vue'
 import SiteModal from '@/components/SiteModal.vue'
+import PasswordConfirmModal from '@/components/PasswordConfirmModal.vue'
+import CookieRevealModal from '@/components/CookieRevealModal.vue'
 import { useConfigStore } from '@/stores/config'
+import { verifyPassword } from '@/api/auth'
+import { exportConfig } from '@/api/export'
 import { deepClone } from '@/utils/clone'
 import { extractErrorMessage } from '@/utils/error'
 import type { Account, Site } from '@/types'
@@ -200,6 +212,35 @@ const submitting = ref(false)
 const editingAccount = ref<Account | null>(null)
 /** 编辑时对应的账号索引（-1 表示新增） */
 const editingIndex = ref(-1)
+
+// ---- 查看明文 Cookie（二次确认）----
+const passwordConfirmVisible = ref(false)
+const revealing = ref(false)
+const revealVisible = ref(false)
+const revealedCookie = ref('')
+const cookieRevealTarget = ref('')
+
+async function handleRevealCookie(password: string) {
+  revealing.value = true
+  try {
+    await verifyPassword(password)
+    const res = await exportConfig()
+    const cfg = JSON.parse(res.json) as { accounts?: Account[] }
+    const target = (cfg.accounts ?? []).find((a) => a.name === cookieRevealTarget.value)
+    if (!target || !target.cookie) {
+      message.error('未找到该账号的 Cookie')
+      passwordConfirmVisible.value = false
+      return
+    }
+    revealedCookie.value = target.cookie
+    passwordConfirmVisible.value = false
+    revealVisible.value = true
+  } catch (e) {
+    message.error(extractErrorMessage(e, '密码验证失败'))
+  } finally {
+    revealing.value = false
+  }
+}
 
 const pagination: PaginationProps = { pageSize: 10, showSizePicker: true, pageSizes: [10, 20, 50] }
 const sitePagination: PaginationProps = { pageSize: 10, showSizePicker: true, pageSizes: [10, 20, 50] }
@@ -295,8 +336,9 @@ function viewCookie(row: AccountRow) {
     message.info(`账号「${row.name}」未设置 Cookie`)
     return
   }
-  // 契约 §3：非空 Cookie 后端只返回 "***"，明文不回传
-  message.info(`账号「${row.name}」的 Cookie 已设置。出于安全原因，接口不回传明文 Cookie，如需更新请在编辑弹窗中输入新值。`)
+  // 高敏操作：先弹密码确认，通过后再拉明文展示
+  cookieRevealTarget.value = row.name
+  passwordConfirmVisible.value = true
 }
 
 function toggleEnabled(row: AccountRow, value: boolean) {
