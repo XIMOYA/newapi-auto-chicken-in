@@ -14,6 +14,7 @@ server/proxies.go
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -159,16 +160,27 @@ func fetchSource(url string, timeout int) []string {
 }
 
 // testProxyLatency 测一个代理：GET test_url，返回延迟毫秒；失败返回 -1。
-func testProxyLatency(addr, testURL string, timeout int) int {
+// 使用 ctx 控制生命周期：时间盒一到，进行中的请求立即取消，不拖住刷新流程。
+func testProxyLatency(ctx context.Context, addr, testURL string, timeout int) int {
 	proxyURL := "http://" + addr
+	reqCtx := ctx
+	if timeout > 0 {
+		// 单条也有超时上限；与整体时间盒取更早生效的一个
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(reqCtx, "GET", testURL, nil)
+	if err != nil {
+		return -1
+	}
 	client := &http.Client{
-		Timeout: time.Duration(timeout) * time.Second,
 		Transport: &http.Transport{
-			Proxy: http.ProxyURL(mustParseURL("http://" + proxyURL)),
+			Proxy: http.ProxyURL(mustParseURL(proxyURL)),
 		},
 	}
 	start := time.Now()
-	resp, err := client.Get(testURL)
+	resp, err := client.Do(req)
 	if err != nil {
 		return -1
 	}
@@ -203,7 +215,6 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 		m.mu.Unlock()
 	}()
 
-	started := time.Now()
 	sources := cfg.Sources
 	if len(sources) == 0 {
 		sources = defaultProxySources
@@ -246,7 +257,7 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 		return 0, nil
 	}
 
-	// 2) 并发测通（限制并发数；到达时间盒就提前收手）
+	// 2) 并发测通（限制并发数；整体受 ctx 时间盒约束——到点未完成的请求立即取消）
 	type item struct{ addr, source string }
 	all := make([]item, 0, len(seen))
 	for addr, src := range seen {
@@ -256,22 +267,25 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 	if workers <= 0 {
 		workers = 25
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), refreshBudget)
+	defer cancel()
+
 	results := make([]ProxyEntry, 0, len(all))
 	var mu2 sync.Mutex
 	sem := make(chan struct{}, workers)
 	var wg2 sync.WaitGroup
-	var hitBudget bool
 	for _, it := range all {
-		if time.Since(started) > refreshBudget {
-			hitBudget = true
-			break
-		}
 		wg2.Add(1)
 		go func(it item) {
 			defer wg2.Done()
-			sem <- struct{}{}
+			// 时间盒已过：不测了直接算失败（快进，不等信号量）
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-sem }()
-			latency := testProxyLatency(it.addr, testURL, timeout)
+			latency := testProxyLatency(ctx, it.addr, testURL, timeout)
 			alive := latency >= 0
 			mu2.Lock()
 			results = append(results, ProxyEntry{
@@ -286,8 +300,8 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 		}(it)
 	}
 	wg2.Wait()
-	if hitBudget {
-		log.Printf("[proxy] 刷新到达时间盒 %s，测试了 %d/%d 条候选", refreshBudget, len(results), len(all))
+	if ctx.Err() != nil {
+		log.Printf("[proxy] 刷新到达时间盒 %s，实际测试了 %d/%d 条候选", refreshBudget, len(results), len(all))
 	}
 
 	// 3) 排序：alive 在前，按延迟升序；dead 在后
