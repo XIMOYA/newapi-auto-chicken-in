@@ -181,3 +181,18 @@ export interface CreateKeyResult {
 export interface ExportResult {
   json: string
 }
+
+// ===== 导入 =====
+
+export interface ImportParams {
+  /** 导入的完整配置对象 */
+  config: Record<string, unknown>
+  /** overwrite 覆盖全部 / merge 合并（账号/站点按 name 合并，其余模块保留） */
+  mode: 'overwrite' | 'merge'
+}
+
+export interface ImportResult {
+  ok: boolean
+  mode: 'overwrite' | 'merge'
+  updated_at: string
+}

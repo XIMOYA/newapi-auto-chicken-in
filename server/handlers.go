@@ -47,6 +47,7 @@ func (s *Server) routes() http.Handler {
 
 	mux.HandleFunc("GET /api/config", s.requireJWT(s.handleGetConfig))
 	mux.HandleFunc("PUT /api/config", s.requireJWT(s.handlePutConfig))
+	mux.HandleFunc("POST /api/config/import", s.requireJWT(s.handleImportConfig))
 	mux.HandleFunc("GET /api/config/raw", s.requireAPIKey(s.handleRawConfig))
 
 	mux.HandleFunc("GET /api/keys", s.requireJWT(s.handleListKeys))
@@ -161,6 +162,101 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		"ok":         true,
 		"updated_at": updatedAt,
 	})
+}
+
+// handleImportConfig POST /api/config/import（JWT）—— 导入完整配置。
+// body: {"config": {...}, "mode": "overwrite" | "merge"}
+//   - overwrite：整体覆盖（与 PUT /api/config 一致，明文 cookie 直接落库）
+//   - merge：账号/站点按 name 合并（同名更新、新名追加），其余模块保留现有
+func (s *Server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Config *Config `json:"config"`
+		Mode   string  `json:"mode"`
+	}
+	if err := readJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法的 JSON")
+		return
+	}
+	if req.Config == nil {
+		writeError(w, http.StatusBadRequest, "config 不能为空")
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode != "overwrite" && mode != "merge" {
+		writeError(w, http.StatusBadRequest, "mode 必须是 overwrite 或 merge")
+		return
+	}
+
+	oldCfg, _, err := LoadConfig(s.db)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "服务器内部错误")
+		return
+	}
+
+	var target Config
+	if mode == "merge" {
+		target = mergeConfig(req.Config, &oldCfg)
+	} else {
+		target = *req.Config
+	}
+	if err := ValidateConfig(&target); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	updatedAt, err := SaveConfig(s.db, target)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "服务器内部错误")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"mode":       mode,
+		"updated_at": updatedAt,
+	})
+}
+
+// mergeConfig 把导入配置合并进现有配置：
+// - accounts：按 name 合并（同名以导入为准覆盖，新 name 追加）
+// - sites：按 name 合并（同上）
+// - 其余模块：保留现有（导入不改动 ai/browser/http/... 等全局配置）
+func mergeConfig(in *Config, old *Config) Config {
+	out := cloneConfig(old)
+	if out.Accounts == nil {
+		out.Accounts = []Account{}
+	}
+	if out.Sites == nil {
+		out.Sites = []Site{}
+	}
+
+	// 账号合并：保留现有顺序，同名覆盖，新名追加
+	existing := make(map[string]int, len(out.Accounts))
+	for i := range out.Accounts {
+		existing[out.Accounts[i].Name] = i
+	}
+	for _, a := range in.Accounts {
+		if i, ok := existing[a.Name]; ok {
+			out.Accounts[i] = a
+		} else {
+			existing[a.Name] = len(out.Accounts)
+			out.Accounts = append(out.Accounts, a)
+		}
+	}
+
+	// 站点合并：同上
+	existingSites := make(map[string]int, len(out.Sites))
+	for i := range out.Sites {
+		existingSites[out.Sites[i].Name] = i
+	}
+	for _, s := range in.Sites {
+		if i, ok := existingSites[s.Name]; ok {
+			out.Sites[i] = s
+		} else {
+			existingSites[s.Name] = len(out.Sites)
+			out.Sites = append(out.Sites, s)
+		}
+	}
+	return *out
 }
 
 // handleRawConfig GET /api/config/raw（API Key）—— 直接返回完整明文配置对象（非包裹结构）。
