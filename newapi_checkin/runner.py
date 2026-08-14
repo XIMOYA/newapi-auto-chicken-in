@@ -30,10 +30,8 @@ _RETRYABLE = (api.NETWORK_ERROR, api.CF_BLOCKED, api.UNKNOWN)
 # 这些结果说明请求本身通了，换策略也不会变，直接结束
 _SETTLED = (api.SUCCESS, api.ALREADY_DONE, api.AUTH_FAILED, api.FAILED)
 
-# 单账号总尝试次数上限（defaults.retry 与代理池换 IP 共享这一份预算）。
-# 不设上限时二者相乘：retry=2 且 ip_swap_limit=2 就是 9 次完整策略链。
-_ATTEMPT_BUDGET = 4
-# 单账号最多启动几次浏览器过盾。浏览器冷启动 + 质询等待是整条链路里最贵的一步。
+# 单账号最多启动几次浏览器过盾。浏览器冷启动 + 质询等待是整条链路里最贵的一步，
+# 换 IP 不会重置这份配额，所以「换 IP 不计入重试」不会把浏览器开销放大。
 _BROWSER_ATTEMPTS_PER_ACCOUNT = 2
 
 
@@ -108,7 +106,7 @@ class Runner:
     def _assign_proxy(self, account: Account) -> None:
         """给账号分配代理。手动配置的优先；否则从池随机取（一个账号一个 IP）。"""
         if account.proxy:
-            log.debug(f"账号 {account.name} 使用手动配置的代理")
+            log.debug("使用手动配置的代理")
             return
         if self._pool is None:
             return
@@ -117,9 +115,9 @@ class Runner:
             account.proxy = proxy
             with self._state_lock:
                 self._pooled_proxies[account.name] = proxy
-            log.info(f"账号 {account.name} 已分配独立代理 {proxy}")
+            log.info(f"已分配独立代理 {proxy}")
         else:
-            log.warn(f"账号 {account.name} 未分配到代理，降级直连（与其他直连账号共用出口 IP）")
+            log.warn("未分配到代理，降级直连（与其他直连账号共用出口 IP）")
 
     def _swap_proxy(self, account: Account) -> Optional[str]:
         """目标站点连不上时换一个新代理；返回 None 表示没得换（降级直连）。"""
@@ -135,9 +133,9 @@ class Runner:
             account.proxy = proxy
             with self._state_lock:
                 self._pooled_proxies[account.name] = proxy
-            log.warn(f"账号 {account.name} 代理 {old or '<手动>'} 连目标站点失败，换用 {proxy}")
+            log.warn(f"代理 {old or '<手动>'} 连目标站点失败，换用 {proxy}")
             return proxy
-        log.warn(f"账号 {account.name} 代理连目标站点失败且池无剩余，降级直连")
+        log.warn("代理连目标站点失败且池无剩余，降级直连")
         return None
 
     def exit_ip(self, proxy: Optional[str]) -> Optional[str]:
@@ -295,7 +293,8 @@ class Runner:
     def _run_serial(self, accounts: list) -> int:
         total = len(accounts)
         for idx, account in enumerate(accounts, start=1):
-            log.step(f"[{idx}/{total}] {account.name}  ->  {account.base_url}")
+            with log.context(account.name):
+                log.step(f"{idx}/{total} 开始  ->  {account.base_url}")
             try:
                 row = self._run_account(account)
             except KeyboardInterrupt:
@@ -304,11 +303,12 @@ class Runner:
                 self.summary.render()
                 return 130
             except Exception as exc:  # noqa: BLE001 - 单账号异常不能拖垮整轮
-                log.err(f"未预期异常: {type(exc).__name__}: {exc}")
-                if self.options.verbose:
-                    import traceback
+                with log.context(account.name):
+                    log.err(f"未预期异常: {type(exc).__name__}: {exc}")
+                    if self.options.verbose:
+                        import traceback
 
-                    log.debug(traceback.format_exc())
+                        log.debug(traceback.format_exc())
                 row = log.SummaryRow(account.name, api.UNKNOWN, "-", f"{type(exc).__name__}: {exc}")
             self.summary.add(row)
             self.store.flush_throttled()
@@ -333,7 +333,8 @@ class Runner:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="checkin") as pool:
             futures = {}
             for idx, account in enumerate(accounts, start=1):
-                log.step(f"[{idx}/{total}] 提交 {account.name}  ->  {account.base_url}")
+                with log.context(account.name):
+                    log.step(f"{idx}/{total} 已提交  ->  {account.base_url}")
                 futures[pool.submit(self._run_account, account)] = account
             done = 0
             for future in as_completed(futures):
@@ -349,16 +350,18 @@ class Runner:
                     self.summary.render()
                     return 130
                 except Exception as exc:  # noqa: BLE001 - 单账号异常不能拖垮整轮
-                    log.err(f"未预期异常: {type(exc).__name__}: {exc}")
-                    if self.options.verbose:
-                        import traceback
+                    with log.context(account.name):
+                        log.err(f"未预期异常: {type(exc).__name__}: {exc}")
+                        if self.options.verbose:
+                            import traceback
 
-                        log.debug(traceback.format_exc())
+                            log.debug(traceback.format_exc())
                     row = log.SummaryRow(account.name, api.UNKNOWN, "-",
                                          f"{type(exc).__name__}: {exc}")
                 rows[id(account)] = row
-                log.step(f"[{done}/{total}] {account.name} 结束: "
-                         f"{log.STATUS_LABEL.get(row.status, row.status)}")
+                with log.context(account.name):
+                    log.step(f"{done}/{total} 结束: "
+                             f"{log.STATUS_LABEL.get(row.status, row.status)}")
                 self.store.flush_throttled()
 
         self.store.flush()
@@ -374,6 +377,11 @@ class Runner:
     # ------------------------------------------------------------------ #
 
     def _run_account(self, account: Account) -> log.SummaryRow:
+        """账号入口。整段执行都带上账号标签，避免并行时几个账号的日志混在一起。"""
+        with log.context(account.name):
+            return self._checkin_account(account)
+
+    def _checkin_account(self, account: Account) -> log.SummaryRow:
         if not account.cookie:
             log.warn("缺少 cookie，跳过（浏览器里复制完整 Cookie 到配置）")
             return log.SummaryRow(account.name, "skipped", "-", "缺少 cookie")
@@ -391,40 +399,58 @@ class Runner:
         with self._state_lock:
             self._browser_attempts[account.name] = 0
 
-        # 目标站点连不上（网络层失败）时换 IP 重试；业务失败（cookie/已签/风控）不换
-        swap_left = self.cfg.proxy_pool.ip_swap_limit if self._pool else 0
-        budget = _ATTEMPT_BUDGET
-        while True:
-            row, used = self._run_account_with_retries(account, record, budget)
-            budget -= used
-            with self._state_lock:
-                from_pool = account.name in self._pooled_proxies
-            if (row.status == api.NETWORK_ERROR and swap_left > 0 and budget > 0
-                    and from_pool):
-                if self._swap_proxy(account):
-                    swap_left -= 1
-                    log.warn(f"账号 {account.name} 换 IP 后重试签到")
-                    continue
-            if row.status == api.NETWORK_ERROR and budget <= 0:
-                log.warn(f"账号 {account.name} 已用满 {_ATTEMPT_BUDGET} 次尝试预算，停止重试")
-            return row
+        return self._run_account_with_retries(account, record)
 
-    def _run_account_with_retries(self, account: Account, record,
-                                  budget: int = _ATTEMPT_BUDGET) -> tuple:
-        """返回 (结果行, 实际消耗的尝试次数)。budget 与换 IP 共享同一份预算。"""
-        attempts = max(1, min(self.cfg.defaults.retry + 1, max(1, budget)))
+    def _swap_pooled_proxy(self, account: Account) -> bool:
+        """只换「由代理池分配」的代理；手动配置的代理原样保留。"""
+        with self._state_lock:
+            from_pool = account.name in self._pooled_proxies
+        if not from_pool:
+            return False
+        return self._swap_proxy(account) is not None
+
+    def _run_account_with_retries(self, account: Account, record) -> log.SummaryRow:
+        """跑完一个账号，网络层失败自动换 IP。
+
+        defaults.retry 只用于「同一个出口 IP 上的瞬时失败」。网络层失败几乎都是
+        代理本身死了，这时正确的修复动作是换 IP 而不是在死代理上干等重试，所以
+        换 IP **不消耗重试次数**，改由 proxy_pool.ip_swap_limit 单独限次。
+
+        总迭代次数因此被 (defaults.retry + 1) + ip_swap_limit 双重上限夹住；
+        真正昂贵的浏览器过盾另有 _BROWSER_ATTEMPTS_PER_ACCOUNT 限次，
+        换 IP 不会把它放大。
+        """
+        attempts = max(1, self.cfg.defaults.retry + 1)
+        swaps_left = self.cfg.proxy_pool.ip_swap_limit if self._pool else 0
         row: Optional[log.SummaryRow] = None
-        used = 0
-        for attempt in range(1, attempts + 1):
-            if attempt > 1:
-                backoff = min(8, 2 ** (attempt - 1))
-                log.info(f"第 {attempt}/{attempts} 次尝试，退避 {backoff}s")
+        used = 0                 # 已消耗的重试次数（不含换 IP）
+        just_swapped = False
+        while True:
+            if used > 0 and not just_swapped:
+                backoff = min(8, 2 ** used)
+                log.info(f"第 {used + 1}/{attempts} 次尝试，退避 {backoff}s")
                 time.sleep(backoff)
+            just_swapped = False
+
             row = self._attempt(account, record)
-            used += 1
+
+            # 网络层失败：先换 IP，且不计入重试次数
+            if row.status == api.NETWORK_ERROR and swaps_left > 0:
+                if self._swap_pooled_proxy(account):
+                    swaps_left -= 1
+                    just_swapped = True
+                    log.warn(f"网络异常，已换 IP 立即重试（不计入重试次数，"
+                             f"剩余换 IP 次数 {swaps_left}）")
+                    continue
+
             if not self._should_retry(row):
-                return row, used
-        return row or log.SummaryRow(account.name, api.UNKNOWN, "-", "未产生任何结果"), used
+                return row
+            used += 1
+            if used >= attempts:
+                if row.status == api.NETWORK_ERROR:
+                    log.warn(f"已用满 {attempts} 次尝试"
+                             + ("（换 IP 次数也已用尽）" if self._pool else ""))
+                return row
 
     def _attempt(self, account: Account, record) -> log.SummaryRow:
         ip = self.exit_ip(account.proxy)

@@ -105,45 +105,123 @@ class TestBrowserAttemptQuota:
         assert runner._take_browser_attempt(second) is True
 
 
-class TestAttemptBudget:
-    def test_retry_and_ip_swap_share_one_budget(self, tmp_path, monkeypatch):
-        """retry × 换 IP 不能相乘：默认配置下最多 _ATTEMPT_BUDGET 次完整策略链。"""
+class TestNetworkErrorSwapsIP:
+    """网络异常时换 IP 是「修复动作」，不消耗 defaults.retry 的次数。"""
+
+    @staticmethod
+    def _runner(tmp_path, monkeypatch, *, retry=2, ip_swap_limit=2, pool=True):
         cfg = cfgmod.build_config(
             {
-                "proxy_pool": {"enabled": True, "ip_swap_limit": 2},
-                "defaults": {"retry": 2, "interval_seconds": [0, 0]},
+                "proxy_pool": {"enabled": pool, "ip_swap_limit": ip_swap_limit},
+                "defaults": {"retry": retry, "interval_seconds": [0, 0]},
                 "accounts": [{"name": "A", "url": "https://a.example.com", "cookie": "c"}],
             }
         )
         monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
         monkeypatch.setattr(runner_mod, "probe_exit_ip", lambda proxy=None, timeout=5: None)
+        # 退避会真的 sleep，这些用例只关心次数与顺序
+        monkeypatch.setattr(runner_mod.time, "sleep", lambda _s: None)
         runner = runner_mod.Runner(
             cfg, runner_mod.RunOptions(use_ai=False, use_browser=False)
         )
+        if pool:
+            runner._pool = _EndlessPool()
+        return runner, cfg.accounts[0]
 
-        class Pool:
-            def __init__(self):
-                self.n = 0
+    def test_swap_does_not_consume_retry_budget(self, tmp_path, monkeypatch):
+        runner, account = self._runner(tmp_path, monkeypatch, retry=2, ip_swap_limit=2)
+        proxies = []
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: (proxies.append(acct.proxy),
+                                  _row(acct.name, api.NETWORK_ERROR))[1],
+        )
+        runner._assign_proxy(account)
+        row = runner._run_account(account)
+        assert row.status == api.NETWORK_ERROR
+        # 2 次换 IP（不计次）+ retry=2 允许的 3 次尝试 = 5 次
+        assert len(proxies) == 5
+        # 前三次各用一个新 IP，换完之后就在最后一个 IP 上做真正的重试
+        assert proxies[:3] == ["p1:80", "p2:80", "p3:80"]
+        assert proxies[3:] == ["p3:80", "p3:80"]
 
-            def acquire(self):
-                self.n += 1
-                return f"p{self.n}:80"
+    def test_swap_is_immediate_without_backoff(self, tmp_path, monkeypatch):
+        """换 IP 后立刻重试，不走退避——新 IP 没有必要先罚站。"""
+        runner, account = self._runner(tmp_path, monkeypatch, retry=2, ip_swap_limit=2)
+        slept: list = []
+        monkeypatch.setattr(runner_mod.time, "sleep", slept.append)
+        results = [api.NETWORK_ERROR, api.SUCCESS]
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: _row(acct.name, results.pop(0)),
+        )
+        runner._assign_proxy(account)
+        assert runner._run_account(account).status == api.SUCCESS
+        assert slept == []          # 全程没有退避
 
-            def mark_bad(self, _proxy):
-                pass
-
-        runner._pool = Pool()
+    def test_retry_budget_still_applies_after_swaps_run_out(self, tmp_path, monkeypatch):
+        runner, account = self._runner(tmp_path, monkeypatch, retry=1, ip_swap_limit=1)
         calls = []
         monkeypatch.setattr(
             runner, "_attempt",
-            lambda account, record: (calls.append(1), _row(account.name, api.NETWORK_ERROR))[1],
+            lambda acct, record: (calls.append(1),
+                                  _row(acct.name, api.NETWORK_ERROR))[1],
         )
-        # 退避会真的 sleep，这里只关心次数
-        monkeypatch.setattr(runner_mod.time, "sleep", lambda _s: None)
-        account = runner.cfg.accounts[0]
         runner._assign_proxy(account)
         runner._run_account(account)
-        assert len(calls) == runner_mod._ATTEMPT_BUDGET
+        assert len(calls) == 3      # 1 次换 IP + retry=1 允许的 2 次
+
+    def test_manual_proxy_is_never_swapped(self, tmp_path, monkeypatch):
+        runner, account = self._runner(tmp_path, monkeypatch, retry=1, ip_swap_limit=2)
+        account.proxy = "http://fixed.example.com:8080"
+        proxies = []
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: (proxies.append(acct.proxy),
+                                  _row(acct.name, api.NETWORK_ERROR))[1],
+        )
+        runner._assign_proxy(account)          # 手动代理不会被池覆盖
+        runner._run_account(account)
+        assert set(proxies) == {"http://fixed.example.com:8080"}
+        assert len(proxies) == 2               # 退回纯重试：retry=1 -> 2 次
+
+    def test_business_failure_never_swaps(self, tmp_path, monkeypatch):
+        runner, account = self._runner(tmp_path, monkeypatch, retry=2, ip_swap_limit=2)
+        proxies = []
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: (proxies.append(acct.proxy),
+                                  _row(acct.name, api.FAILED))[1],
+        )
+        runner._assign_proxy(account)
+        runner._run_account(account)
+        assert proxies == ["p1:80"]            # 业务失败既不重试也不换 IP
+
+    def test_without_pool_falls_back_to_plain_retry(self, tmp_path, monkeypatch):
+        runner, account = self._runner(tmp_path, monkeypatch, retry=2, pool=False)
+        calls = []
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: (calls.append(1),
+                                  _row(acct.name, api.NETWORK_ERROR))[1],
+        )
+        runner._run_account(account)
+        assert len(calls) == 3
+
+
+class _EndlessPool:
+    """够用就行的假代理池：每次 acquire 给一个新 IP。"""
+
+    def __init__(self):
+        self.n = 0
+        self.bad: list = []
+
+    def acquire(self):
+        self.n += 1
+        return f"p{self.n}:80"
+
+    def mark_bad(self, proxy):
+        self.bad.append(proxy)
 
 
 class TestBrowserConcurrency:

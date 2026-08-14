@@ -1,14 +1,20 @@
-"""统一日志：彩色输出、敏感信息脱敏、末尾汇总表。"""
+"""统一日志：彩色输出、敏感信息脱敏、末尾汇总表。
+
+并行签到时多个账号的输出会交错在一起，所以每条日志都带一个线程局部的账号标签
+（见 context()）：`Runner._run_account` 进入账号时打上，退出时还原。标签插在
+等级标记之后，不影响原有缩进对齐。
+"""
 
 from __future__ import annotations
 
 import os
 import threading
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 from rich.console import Console
 from rich.table import Table
@@ -32,6 +38,33 @@ _LOG_HANDLE = None
 _LOG_LOCK = threading.RLock()
 _RECENT_LOGS = deque(maxlen=1000)
 _LISTENERS: list[Callable[[str], None]] = []
+# 账号标签是线程局部的：并行时每个工作线程各自持有自己那个账号的名字
+_CONTEXT = threading.local()
+
+
+def set_context(label: Optional[str]) -> None:
+    """设置当前线程的日志标签（账号名）。传空即清除。"""
+    _CONTEXT.label = str(label or "")
+
+
+def get_context() -> str:
+    return getattr(_CONTEXT, "label", "") or ""
+
+
+@contextmanager
+def context(label: Optional[str]) -> Iterator[None]:
+    """在代码块内给本线程的所有日志加上账号标签，退出时还原上一层标签。"""
+    previous = get_context()
+    set_context(label)
+    try:
+        yield
+    finally:
+        set_context(previous)
+
+
+def _tag(text: str) -> str:
+    label = get_context()
+    return f"[{label}] {text}" if label else text
 
 
 def setup(verbose: bool = False, log_dir: Optional[Path] = None) -> None:
@@ -128,28 +161,34 @@ def _esc(text: str) -> str:
 
 
 def step(text: str) -> None:
-    _emit(f"[step]==>[/step] {_esc(text)}", f"==> {text}")
+    tagged = _tag(text)
+    _emit(f"[step]==>[/step] {_esc(tagged)}", f"==> {tagged}")
 
 
 def info(text: str) -> None:
-    _emit(f"    {_esc(text)}", f"    {text}")
+    tagged = _tag(text)
+    _emit(f"    {_esc(tagged)}", f"    {tagged}")
 
 
 def ok(text: str) -> None:
-    _emit(f"    [ok]OK[/ok]   {_esc(text)}", f"    OK   {text}")
+    tagged = _tag(text)
+    _emit(f"    [ok]OK[/ok]   {_esc(tagged)}", f"    OK   {tagged}")
 
 
 def warn(text: str) -> None:
-    _emit(f"    [warn]WARN[/warn] {_esc(text)}", f"    WARN {text}")
+    tagged = _tag(text)
+    _emit(f"    [warn]WARN[/warn] {_esc(tagged)}", f"    WARN {tagged}")
 
 
 def err(text: str) -> None:
-    _emit(f"    [err]FAIL[/err] {_esc(text)}", f"    FAIL {text}")
+    tagged = _tag(text)
+    _emit(f"    [err]FAIL[/err] {_esc(tagged)}", f"    FAIL {tagged}")
 
 
 def debug(text: str) -> None:
     if _VERBOSE:
-        _emit(f"    [dim2]dbg  {_esc(text)}[/dim2]", f"    dbg  {text}")
+        tagged = _tag(text)
+        _emit(f"    [dim2]dbg  {_esc(tagged)}[/dim2]", f"    dbg  {tagged}")
 
 
 def is_verbose() -> bool:
