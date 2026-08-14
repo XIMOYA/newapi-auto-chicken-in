@@ -51,7 +51,7 @@ web/src/views/KeysView.vue
 </template>
 
 <script setup lang="ts">
-import { h, onMounted, ref } from 'vue'
+import { h, onMounted, reactive, ref } from 'vue'
 import {
   NCard, NButton, NIcon, NDataTable, NAlert, NText, NEmpty,
   useDialog, useMessage, type DataTableColumns, type PaginationProps
@@ -71,7 +71,16 @@ const creating = ref(false)
 const modalVisible = ref(false)
 const modalRef = ref<InstanceType<typeof KeyCreateModal> | null>(null)
 
-const pagination: PaginationProps = { pageSize: 10, showSizePicker: true, pageSizes: [10, 20, 50] }
+// 分页必须用响应式对象 + 显式 onUpdatePageSize 写回，
+// 否则 Naive UI 的每页条数选择器（10/20/50）切换后状态不会更新
+const pagination = reactive<PaginationProps>({
+  pageSize: 10,
+  showSizePicker: true,
+  pageSizes: [10, 20, 50],
+  onUpdatePageSize: (size: number) => {
+    pagination.pageSize = size
+  }
+})
 
 function formatTime(t: string | null) {
   if (!t) return '—'

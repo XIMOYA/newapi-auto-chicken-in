@@ -131,7 +131,7 @@ web/src/views/OverviewView.vue
 </template>
 
 <script setup lang="ts">
-import { computed, h, ref } from 'vue'
+import { computed, h, reactive, ref } from 'vue'
 import {
   NGrid, NGridItem, NCard, NIcon, NButton, NSpace, NDataTable, NTag, NSwitch, NEmpty,
   useDialog, useMessage, type DataTableColumns, type PaginationProps
@@ -242,8 +242,24 @@ async function handleRevealCookie(password: string) {
   }
 }
 
-const pagination: PaginationProps = { pageSize: 10, showSizePicker: true, pageSizes: [10, 20, 50] }
-const sitePagination: PaginationProps = { pageSize: 10, showSizePicker: true, pageSizes: [10, 20, 50] }
+// 分页必须用响应式对象 + 显式 onUpdatePageSize 写回，
+// 否则 Naive UI 的每页条数选择器（10/20/50）切换后状态不会更新
+const pagination = reactive<PaginationProps>({
+  pageSize: 10,
+  showSizePicker: true,
+  pageSizes: [10, 20, 50],
+  onUpdatePageSize: (size: number) => {
+    pagination.pageSize = size
+  }
+})
+const sitePagination = reactive<PaginationProps>({
+  pageSize: 10,
+  showSizePicker: true,
+  pageSizes: [10, 20, 50],
+  onUpdatePageSize: (size: number) => {
+    sitePagination.pageSize = size
+  }
+})
 
 // ---- 站点预设表格列 ----
 const siteColumns: DataTableColumns<SiteRow> = [
