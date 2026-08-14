@@ -44,6 +44,33 @@ class TestNotBlocked:
                 "src='https://challenges.cloudflare.com/turnstile/v0/api.js'></script></html>")
         assert detect.analyze(200, CF_HEADERS, html).blocked is False
 
+    def test_injected_jsd_script_on_passed_page_is_not_blocked(self):
+        """CF 开 Bot Fight 后会把 JS 检测脚本注入到已过盾的正常页面，不算被拦。"""
+        html = ("<html><head><title>控制台 - New API</title></head><body>今日额度"
+                "<script src='/cdn-cgi/challenge-platform/h/b/scripts/jsd/main.js'>"
+                "</script></body></html>")
+        verdict = detect.analyze(200, CF_HEADERS, html)
+        assert verdict.blocked is False
+        assert detect.page_challenge_type(html, "控制台 - New API",
+                                          "https://x.example.com/dashboard") is None
+
+    def test_business_page_wording_is_not_a_waf_block(self):
+        """站点 i18n 里的 access denied / rate limited 文案不能判成封禁。"""
+        html = ("<html><body><script>const msg={403:'Access denied',"
+                "429:'Rate limited'}</script>控制台</body></html>")
+        assert detect.page_challenge_type(html, "控制台 - New API",
+                                          "https://x.example.com/dashboard") is None
+
+
+class TestWeakSignalWithStatusCode:
+    def test_injected_script_with_challenge_status_is_blocked(self):
+        """同样的脚本配上 403/503 就是真质询：弱信号需要状态码佐证。"""
+        html = ("<html><body><script src='/cdn-cgi/challenge-platform/x'>"
+                "</script></body></html>")
+        verdict = detect.analyze(403, CF_HEADERS, html)
+        assert verdict.blocked is True
+        assert verdict.challenge == detect.MANAGED_CHALLENGE
+
 
 class TestBlocked:
     def test_managed_challenge(self):

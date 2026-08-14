@@ -831,7 +831,8 @@ class TestSolverRun:
         assert "WAF" in outcome.detail
 
     def test_unresolved_challenge_keeps_artifacts(self, wired):
-        page = FakePage([CHALLENGE], fetches=ALL_FETCHES)
+        # 真正过不去时，页内 API 也一定是被拦的；两者一致才是自洽的现场
+        page = FakePage([CHALLENGE], fetches={f"{BASE}/api/user/self": CF_IN_PAGE})
         cfg, account, driver = build(page, timeout=1)
         with driver:
             outcome = solver._run(driver, cfg, account, None, FakeOptions(), None)
@@ -840,6 +841,44 @@ class TestSolverRun:
         assert "现场证据" in outcome.detail
         shots = list((wired / "shots").glob("*/cf-fail.*"))
         assert {p.suffix for p in shots} == {".png", ".html"}
+
+    def test_false_positive_challenge_is_rescued_by_page_api(self, wired):
+        """CF 把 JS 检测脚本注入到已过盾的正常页面时，DOM 会误判成质询页。
+
+        这时页内 API 是通的，必须以实测为准继续签到，而不是死等到超时。
+        """
+        injected = ("控制台 - New API",
+                    "<html><body>今日额度"
+                    "<script src='/cdn-cgi/challenge-platform/h/b/scripts/jsd/main.js'>"
+                    "</script></body></html>")
+        page = FakePage([injected], fetches=ALL_FETCHES)
+        cfg, account, driver = build(page, timeout=1)
+        with driver:
+            # 注入的 JS 检测脚本不该被当成质询页
+            assert driver.state().passed is True
+            outcome = solver._run(driver, cfg, account, None, FakeOptions(), None)
+        assert outcome.ok is True
+        assert outcome.api_result.kind == api.SUCCESS
+
+    def test_ai_and_dom_disagreement_is_settled_by_page_api(self, wired):
+        """AI 说过了、DOM 说没过：用站点 API 裁决，不再无限期相信 DOM。"""
+        page = FakePage([CHALLENGE], fetches=ALL_FETCHES)
+        cfg, account, driver = build(page, timeout=1)
+        ai = ScriptedAI([PageVerdict(prompts.PASSED, 0.99, "正常业务页面")] * 3)
+        with driver:
+            state = solver._ai_assist(driver, cfg, ai, driver.state(), account)
+        assert state.passed is True
+        assert ai.calls == 1          # 一轮就定论，不再空转 3 轮
+
+    def test_disagreement_without_account_still_trusts_dom(self, wired):
+        """拿不到账号上下文时无法实测，仍以 DOM 为准（保持保守行为）。"""
+        page = FakePage([CHALLENGE])
+        cfg, _, driver = build(page, timeout=1)
+        ai = ScriptedAI([PageVerdict(prompts.PASSED, 0.99, "看起来正常")] * 3)
+        with driver:
+            state = solver._ai_assist(driver, cfg, ai, driver.state())
+        assert state.passed is False
+        assert ai.calls == 3
 
     def test_falls_back_to_fast_path_when_page_fetch_unavailable(self, wired):
         page = FakePage([CHALLENGE, NORMAL, NORMAL], fetches={})

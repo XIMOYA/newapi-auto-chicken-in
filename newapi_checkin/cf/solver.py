@@ -127,13 +127,20 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
     if not state.passed and state.challenge != detect.WAF_BLOCK and ai is not None:
         log.info("质询未自动通过，转入 S3 由 AI 判断页面状态")
         strategy = "S3"
-        state = _ai_assist(driver, cfg, ai, state)
+        state = _ai_assist(driver, cfg, ai, state, account)
 
     # ---------------- S5：人工兜底 ----------------
     if not state.passed and options is not None and getattr(options, "manual", False):
         state = _manual(driver)
         if state.passed:
             strategy = "S5"
+
+    # DOM 判定不是最终裁判：Cloudflare 会把 JS 检测脚本注入到已经通过的正常页面，
+    # 站点自己的文案也可能撞上封禁关键词。放弃之前先用页内 API 请求实测一次。
+    if not state.passed and state.challenge != detect.LOGIN_REQUIRED:
+        if _page_session_alive(driver, account):
+            log.warn("DOM 仍被判为质询页，但页内 API 请求成功，按已过盾继续")
+            state = PageState(url=state.url, title=state.title, challenge=None)
 
     if not state.passed:
         artifact = _dump(driver, cfg, account, "cf-fail")
@@ -202,7 +209,35 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
 # --------------------------------------------------------------------------- #
 
 
-def _ai_assist(driver: BrowserDriver, cfg: Config, ai, state: PageState) -> PageState:
+def _page_session_alive(driver: BrowserDriver, account: Optional[Account]) -> bool:
+    """用页内 fetch 实测一次 /api/user/self，作为「到底过没过盾」的最终裁判。
+
+    DOM 关键词判定天生会误报：CF 开了 Bot Fight 后会把 JS 检测脚本注入到已经
+    通过的业务页面里。一旦误报，S3 就会陷入「AI 说过了 / DOM 说没过」的死循环，
+    一直等到超时。真正能定论的只有「站点 API 是否正常返回业务数据」。
+    """
+    if account is None:
+        return False
+    raw = driver.fetch_in_page(
+        account.base_url + SELF_PATH, "GET",
+        {"Accept": "application/json, text/plain, */*"},
+    )
+    if not raw.get("ok"):
+        return False
+    status, body, resp_headers, data = _parse_raw(raw)
+    if detect.analyze(status, resp_headers, body).blocked:
+        return False
+    result = api.classify_self(status, data, body[:160])
+    if not result.ok or not result.user_id:
+        return False
+    if account.user_id is None:
+        account.user_id = result.user_id
+        log.debug(f"页内实测确认已过盾，user_id={result.user_id}")
+    return True
+
+
+def _ai_assist(driver: BrowserDriver, cfg: Config, ai, state: PageState,
+               account: Optional[Account] = None) -> PageState:
     wait = min(SHORT_WAIT, cfg.browser.timeout)
     # S3 每轮都要截图 + 调模型，没有总预算时「3 轮 × 重试 × 60s」可以跑到十分钟，
     # 而且完全绕过 browser.timeout。这里给整段 S3 一个绝对截止时间。
@@ -222,7 +257,11 @@ def _ai_assist(driver: BrowserDriver, cfg: Config, ai, state: PageState) -> Page
             fresh = driver.state()
             if fresh.passed:
                 return fresh
-            log.debug("AI 认为已过盾但 DOM 仍是质询页，以 DOM 为准继续等待")
+            # AI 与 DOM 打架时，让站点 API 来裁决，而不是无限期地相信 DOM
+            if _page_session_alive(driver, account):
+                log.warn("AI 判定已过盾且页内 API 请求成功，以实测结果为准")
+                return PageState(url=fresh.url, title=fresh.title, challenge=None)
+            log.debug("AI 认为已过盾但 DOM 仍是质询页且页内 API 不通，继续等待")
             state = driver.wait_until_passed(timeout=wait)
             if state.passed:
                 return state
