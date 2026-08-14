@@ -168,3 +168,28 @@ def _first_json_object(text: str) -> Optional[str]:
 
 def clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
+
+
+def sanitize_header_value(value: Any) -> str:
+    """清洗 HTTP 头值：只保留 latin-1 可编码字符（RFC 7230 → ISO-8859-1）。
+
+    curl_cffi 在 session.headers.update / Headers.__init__ 时会对每个值做
+    latin-1 编码；一旦 cookie / UA / Referer 等头值里混入 emoji、中文等
+    非 latin-1 字符，会直接抛 UnicodeEncodeError，把整个账号拖成
+    「结果未知」（koqj 事故根因）。这里统一清洗：
+    - 非 latin-1 字符（ord > 255）一律剔除
+    - 控制字符（换行/回车/NUL 等）一并剔除，顺带防 HTTP 头注入
+    """
+    if value is None:
+        return ""
+    text = str(value)
+    # 不做 isascii 快路径：\r \n 等控制字符也是 ASCII，快路径会漏掉它们。
+    # 头值都很短，统一遍历成本可忽略，正确性优先。
+    out = []
+    for ch in text:
+        code = ord(ch)
+        # 可打印 ASCII（0x20-0x7E）+ latin-1 可打印区（0xA0-0xFF）；
+        # 排除 C0/C1 控制字符与换行（0x00-0x1F、0x7F-0x9F）
+        if 0x20 <= code <= 0x7E or 0xA0 <= code <= 0xFF:
+            out.append(ch)
+    return "".join(out)

@@ -15,7 +15,7 @@ from typing import Any, Optional
 from curl_cffi import requests as cffi
 
 from .config import SELF_PATH, Account, HttpConfig
-from .utils import parse_proxy  # noqa: F401  (供上层复用，保持导入路径统一)
+from .utils import parse_proxy, sanitize_header_value  # noqa: F401  (parse_proxy 供上层复用)
 from .cf import detect
 from .cf.session_store import CFSession
 
@@ -81,7 +81,15 @@ def parse_cookie_header(raw: str) -> dict:
 
 
 def build_cookie_header(cookies: dict) -> str:
-    return "; ".join(f"{k}={v}" for k, v in cookies.items() if k)
+    """拼 Cookie 头。每个名/值都过 latin-1 清洗，防止坏 cookie 让 curl_cffi
+    在 headers.update 时抛 UnicodeEncodeError（koqj 事故根因）。"""
+    parts = []
+    for k, v in cookies.items():
+        key = sanitize_header_value(k)
+        if not key:
+            continue
+        parts.append(f"{key}={sanitize_header_value(v)}")
+    return "; ".join(parts)
 
 
 def merge_cookies(account_cookie: str, cf_cookies: Optional[dict]) -> dict:
@@ -203,17 +211,23 @@ class ApiClient:
         base = self.account.base_url
         headers = {
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": (self.cf.accept_language if self.cf and self.cf.accept_language
-                                else DEFAULT_ACCEPT_LANGUAGE),
-            "Referer": base + "/",
-            "Origin": base,
+            "Accept-Language": sanitize_header_value(
+                self.cf.accept_language if self.cf and self.cf.accept_language
+                else DEFAULT_ACCEPT_LANGUAGE
+            ),
+            "Referer": sanitize_header_value(base + "/"),
+            "Origin": sanitize_header_value(base),
         }
-        # cf_clearance 与 UA 绑定：缓存里的 UA 必须原样带回
+        # cf_clearance 与 UA 绑定：缓存里的 UA 必须原样带回（清洗后仍可能为空，忽略即可）
         if self.cf and self.cf.user_agent:
-            headers["User-Agent"] = self.cf.user_agent
+            ua = sanitize_header_value(self.cf.user_agent)
+            if ua:
+                headers["User-Agent"] = ua
         cookies = merge_cookies(self.account.cookie, self.cf.cookies if self.cf else None)
         if cookies:
-            headers["Cookie"] = build_cookie_header(cookies)
+            cookie_header = build_cookie_header(cookies)
+            if cookie_header:
+                headers["Cookie"] = cookie_header
         session.headers.update(headers)
         if self.user_id:
             session.headers["New-Api-User"] = str(self.user_id)

@@ -130,3 +130,45 @@ class TestPickImpersonate:
 
     def test_empty_config_defaults_to_chrome(self):
         assert client.pick_impersonate("", "") == "chrome"
+
+
+class TestSanitizeHeaderValue:
+    """非 latin-1 字符会导致 curl_cffi headers.update 抛 UnicodeEncodeError
+    （koqj 事故根因）。清洗后必须能安全进入 header。"""
+
+    def test_ascii_passthrough(self):
+        assert client.sanitize_header_value("session=abc; x=1") == "session=abc; x=1"
+
+    def test_emoji_removed(self):
+        value = "session=abc🎉def"
+        cleaned = client.sanitize_header_value(value)
+        assert "🎉" not in cleaned
+        assert cleaned == "session=abcdef"
+
+    def test_chinese_removed(self):
+        value = "token=你好world"
+        assert client.sanitize_header_value(value) == "token=world"
+
+    def test_control_chars_removed(self):
+        value = "a=1\r\nSet-Cookie: evil=1\r\nb=2"
+        cleaned = client.sanitize_header_value(value)
+        assert "\r" not in cleaned and "\n" not in cleaned
+        # 清洗只剔除控制字符，不删可打印文本——没有 \r\n 就无法构成新头注入
+        assert all(ord(c) >= 0x20 for c in cleaned)
+
+    def test_latin1_high_bytes_kept(self):
+        # 0xA0-0xFF 属于 latin-1 可打印区，应保留
+        value = "token=café-ñ"
+        assert client.sanitize_header_value(value) == "token=café-ñ"
+
+    def test_none_to_empty(self):
+        assert client.sanitize_header_value(None) == ""
+
+    def test_build_cookie_header_sanitizes(self):
+        header = client.build_cookie_header({"session": "abc🎉", "keep": "ok"})
+        assert "🎉" not in header
+        assert client.parse_cookie_header(header) == {"session": "abc", "keep": "ok"}
+
+    def test_build_cookie_header_skips_emptied_name(self):
+        header = client.build_cookie_header({"🎉": "x", "keep": "ok"})
+        assert client.parse_cookie_header(header) == {"keep": "ok"}

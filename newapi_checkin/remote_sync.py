@@ -17,6 +17,7 @@ from .config import (
 )
 from .config_store import load_document, save_document
 from .secure_config import ConfigEncryptionError, config_key_from_environment, decrypt_json
+from .utils import sanitize_header_value
 
 
 class RemoteSyncError(ValueError):
@@ -92,10 +93,16 @@ def _decode_payload(value: Any, sync: ConfigSyncConfig, key: str) -> tuple[dict,
 
 def _headers(sync: ConfigSyncConfig) -> dict[str, str]:
     headers = {"Accept": "application/json, text/plain, */*"}
-    headers.update(sync.headers)
+    for key, value in sync.headers.items():
+        key = sanitize_header_value(key)
+        if key:
+            headers[key] = sanitize_header_value(value)
     if sync.token:
         prefix = sync.token_prefix.strip()
-        headers[sync.token_header] = f"{prefix} {sync.token}".strip()
+        value = f"{prefix} {sync.token}".strip()
+        token_header = sanitize_header_value(sync.token_header)
+        if token_header:
+            headers[token_header] = sanitize_header_value(value)
     return headers
 
 
