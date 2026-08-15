@@ -159,6 +159,10 @@ class ProxyPool:
                     self._available = list(remote)
                     self._used.clear()
                     self._bad.clear()
+                    # 代理列表整体换了，旧的共用计数必须一起清，否则
+                    # acquire() 的「挑账号数最少的代理复用」会按残留计数判断，
+                    # 把新代理误判成已被多账号占用，破坏均衡。
+                    self._share_count.clear()
                 log.ok(f"代理池就绪（服务器预取）: {len(remote)} 个可用代理")
                 return len(remote)
             log.warn(f"服务器代理池预取失败/为空，降级本地抓取: {self.last_error or 'remote_url 无返回'}")
