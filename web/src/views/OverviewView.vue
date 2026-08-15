@@ -100,7 +100,7 @@ web/src/views/OverviewView.vue
         :data="tableData"
         :loading="configStore.loading || saving"
         :row-key="(row: AccountRow) => row._index"
-        v-model:selected-row-keys="selectedKeys"
+        v-model:checked-row-keys="selectedKeys"
         :pagination="pagination"
         striped
         :bordered="false"

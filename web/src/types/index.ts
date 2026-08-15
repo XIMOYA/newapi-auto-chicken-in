@@ -13,7 +13,7 @@ export interface Account {
   name: string
   url: string
   cookie: string
-  user_id: number | string | null
+  user_id: number | null
   proxy: string | null
   checkin_path: string | null
   browser_path: string | null

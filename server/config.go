@@ -6,7 +6,7 @@ NewAPI 签到配置管理平台 · 配置对象模型
 - 定义与接口契约一致的完整配置结构体（accounts / ai / browser / http / defaults / proxy_pool / notify / config_sync / security）
 - 提供默认配置（契约文档「配置对象默认结构」）
 - 敏感字段打码 / 还原：accounts[].cookie、ai.api_key、notify.email.password、config_sync.token
-- 配置校验：accounts 必填 name/url/cookie，url 需 http(s) 开头
+- 配置校验：accounts 必填 name/url，cookie 可为空，url 需 http(s) 开头
 */
 package main
 
@@ -44,7 +44,7 @@ type Site struct {
 	BrowserPath *string `json:"browser_path"`
 }
 
-// Account 签到账号：name/url/cookie 为必填（契约校验要求），其余为可选。
+// Account 签到账号：name/url 为必填；cookie 可暂不设置，其余字段可选。
 type Account struct {
 	Name        string  `json:"name"`
 	URL         string  `json:"url"`
@@ -364,7 +364,7 @@ func cloneConfig(c *Config) *Config {
 }
 
 // ValidateConfig 校验配置合法性（契约规则）：
-// - accounts 每个账号必须提供 name / url / cookie
+// - accounts 每个账号必须提供 name / url；cookie 可为空
 // - url 必须以 http:// 或 https:// 开头
 // - sites 每个站点必须提供 name / url
 // 返回第一个错误信息（供 400 响应使用）。
@@ -383,9 +383,7 @@ func ValidateConfig(cfg *Config) error {
 		if !strings.HasPrefix(lowerURL, "http://") && !strings.HasPrefix(lowerURL, "https://") {
 			return fmt.Errorf("accounts[%d].url 必须以 http:// 或 https:// 开头", i)
 		}
-		if strings.TrimSpace(a.Cookie) == "" {
-			return fmt.Errorf("accounts[%d].cookie 不能为空", i)
-		}
+
 	}
 	for i, s := range cfg.Sites {
 		if strings.TrimSpace(s.Name) == "" {

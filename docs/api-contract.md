@@ -70,7 +70,7 @@
 
 规则：
 - 后端把 `"***"` 占位符还原为旧值（深合并）
-- 校验：`accounts` 必须有 `name` / `url` / `cookie`；`sites` 必须有 `name` / `url`；URL 需 http(s) 开头
+- 校验：`accounts` 必须有 `name` / `url`，`cookie` 可为空（未设置时该账号无法依赖 Cookie 完成签到）；`sites` 必须有 `name` / `url`；URL 需 http(s) 开头
 - 校验通过才落库
 
 响应（200）：`{ "ok": true, "updated_at": "2026-08-12T10:00:00Z" }`

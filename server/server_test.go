@@ -290,7 +290,7 @@ func TestValidateConfig(t *testing.T) {
 		{"缺 url", func(c *Config) { c.Accounts[0].URL = "" }, "url"},
 		{"url 非 http", func(c *Config) { c.Accounts[0].URL = "ftp://x.com" }, "http"},
 		{"url 大写 http", func(c *Config) { c.Accounts[0].URL = "HTTPS://X.COM" }, ""}, // 大小写宽容
-		{"缺 cookie", func(c *Config) { c.Accounts[0].Cookie = "" }, "cookie"},
+		{"空 cookie 合法", func(c *Config) { c.Accounts[0].Cookie = "" }, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -311,6 +311,31 @@ func TestValidateConfig(t *testing.T) {
 				t.Errorf("错误信息 %q 应包含 %q", err.Error(), tc.want)
 			}
 		})
+	}
+}
+
+func TestPutConfigAllowsEmptyCookie(t *testing.T) {
+	srv := newTestServer(t)
+	token := loginToken(t, srv)
+	cfg := DefaultConfig()
+	cfg.Accounts = []Account{{
+		Name:    "待补 Cookie 的账号",
+		URL:     "https://example.com",
+		Cookie:  "",
+		Enabled: true,
+	}}
+
+	rr := doReq(t, srv, http.MethodPut, "/api/config", token, map[string]any{"config": cfg})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT config with empty cookie status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	saved, _, err := LoadConfig(srv.db)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(saved.Accounts) != 1 || saved.Accounts[0].Cookie != "" {
+		t.Fatalf("空 Cookie 账号未按原样保存: %+v", saved.Accounts)
 	}
 }
 

@@ -4,7 +4,7 @@ web/src/components/AccountModal.vue
 职责：
 - 字段：name/url/cookie/user_id/proxy/checkin_path/browser_path/enabled
 - cookie 打码处理：服务端返回 "***" 时显示「已设置」，留空则提交原值
-- 表单校验：名称必填、URL 必须 http(s) 开头、新增时 cookie 必填
+- 表单校验：名称必填、URL 必须 http(s) 开头、用户 ID 为可选安全整数
 数据来源：父组件传入 account（null 表示新增）
 -->
 <template>
@@ -43,7 +43,7 @@ web/src/components/AccountModal.vue
             type="textarea"
             :autosize="{ minRows: 2, maxRows: 6 }"
             placeholder="粘贴完整 Cookie（如 session=...）"
-            custom-tip="该账号 Cookie 已设置（出于安全原因接口不回传明文），留空保持不变，输入新值可修改"
+            :custom-tip="isEdit ? '该账号 Cookie 已设置（出于安全原因接口不回传明文），留空保持不变，输入新值可修改' : 'Cookie 可稍后补充；未设置时该账号无法依赖 Cookie 完成签到'"
           />
           <n-button
             v-if="isEdit && isMaskedCookie"
@@ -270,18 +270,25 @@ const rules: FormRules = {
       trigger: ['input', 'blur']
     }
   ],
-  cookie: {
+  user_id: {
     validator: (_rule, value: string) => {
-      // 编辑时 cookie 留空表示「保留原值」；新增时必填
-      if (isEdit.value && value === '') return true
-      if (value === '') return new Error('请输入 Cookie（新增账号必填）')
+      const text = value.trim()
+      if (!text) return true
+      if (!/^-?\d+$/.test(text) || !Number.isSafeInteger(Number(text))) {
+        return new Error('用户 ID 必须是安全整数')
+      }
       return true
     },
-    trigger: ['blur', 'change']
+    trigger: ['input', 'blur']
   }
 }
 
-// 提交时补充 path 校验：不强制，但若是 "**" 也视为未设置
+function normalizeUserID(v: string): number | null {
+  const text = v.trim()
+  return text ? Number(text) : null
+}
+
+// 提交时补充 path 校验：不强制，但若是 "***" 也视为未设置
 function normalizePath(v: string) {
   const t = v.trim()
   if (!t || t === '***') return null
@@ -297,7 +304,7 @@ function handleSubmit() {
       name: form.name.trim(),
       url: form.url.trim(),
       cookie: finalCookie,
-      user_id: form.user_id.trim() === '' ? null : form.user_id.trim(),
+      user_id: normalizeUserID(form.user_id),
       proxy: form.proxy.trim() === '' ? null : form.proxy.trim(),
       checkin_path: normalizePath(form.checkin_path),
       browser_path: normalizePath(form.browser_path),
