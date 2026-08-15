@@ -590,9 +590,11 @@ class TestOneProxyPerAccount:
         infos = []
         monkeypatch.setattr(runner_mod.log, "info", infos.append)
         runner._report_proxy_capacity(15, 10)
-        assert infos and "一账号一 IP" in infos[0] and "余量 5" in infos[0]
-        # 换 IP 次数上限要一起报出来，方便在 Actions 日志里确认生效值
-        assert "最多换 2 次" in infos[0]      # _make_runner 里 ip_swap_limit=2
+        assert infos and "一账号一 IP" in infos[0] and "5 个" in infos[0]
+        # 备用池是所有账号共享的，不能让人以为每个账号都有整份配额
+        assert "共享" in infos[0]
+        assert "配额 2 次" in infos[0]      # _make_runner 里 ip_swap_limit=2
+        assert "盾类重试不限次数" in infos[0]
 
     def test_shortage_points_at_the_server_side_limit(self, monkeypatch, tmp_path):
         """代理不够时要指明数量由服务端 save_limit 决定，否则没人知道去哪调。"""

@@ -145,6 +145,39 @@ class TestShieldRetriesUntilDeadline:
         assert runner._run_account(account).status == api.SUCCESS
         assert calls == ["p1:80", "p2:80", "p3:80"]     # 每轮一个新出口 IP
 
+    def test_shield_swaps_are_counted_in_the_log(self, tmp_path, monkeypatch):
+        """盾类换 IP 按设计不扣 ip_swap_limit 配额，但必须计入累计数。
+
+        不计的话日志会睁眼说瞎话：盾类已经换掉好几个 IP、旧 IP 都被拉黑了，
+        后面一次网络异常仍然报「配额还剩 N-1 次」，跟实际消耗完全脱节。
+        """
+        cfg = cfgmod.build_config(
+            {
+                "proxy_pool": {"enabled": True, "ip_swap_limit": 5},
+                "defaults": {"retry": 2, "interval_seconds": [0, 0]},
+                "accounts": [{"name": "A", "url": "https://a.example.com", "cookie": "c"}],
+            }
+        )
+        monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
+        monkeypatch.setattr(runner_mod, "probe_exit_ip", lambda proxy=None, timeout=5: None)
+        runner = runner_mod.Runner(
+            cfg, runner_mod.RunOptions(use_ai=False, use_browser=True)
+        )
+        runner._pool = _EndlessPool()
+        warnings: list = []
+        monkeypatch.setattr(runner_mod.log, "warn", warnings.append)
+        self._wire(runner, monkeypatch,
+                   [api.CF_BLOCKED, api.CF_BLOCKED, api.CF_BLOCKED, api.SUCCESS])
+        account = runner.cfg.accounts[0]
+        runner._assign_proxy(account)
+        assert runner._run_account(account).status == api.SUCCESS
+        swap_logs = [w for w in warnings if "已换出口 IP" in w]
+        assert len(swap_logs) == 3
+        # 累计数逐轮递增，不是一直停在 1
+        assert "累计已换 1 个" in swap_logs[0]
+        assert "累计已换 2 个" in swap_logs[1]
+        assert "累计已换 3 个" in swap_logs[2]
+
     def test_browser_relaunch_is_no_longer_capped(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, accounts=2, use_browser=True)
         first, second = runner.cfg.accounts
@@ -219,6 +252,22 @@ class TestNetworkErrorSwapsIP:
         runner._assign_proxy(account)
         runner._run_account(account)
         assert len(calls) == 3      # 1 次换 IP + retry=1 允许的 2 次
+
+    def test_network_swap_log_reports_quota_and_running_total(self, tmp_path, monkeypatch):
+        """网络异常换 IP 的日志要同时给出剩余配额和累计已换数。"""
+        runner, account = self._runner(tmp_path, monkeypatch, retry=0, ip_swap_limit=2)
+        warnings: list = []
+        monkeypatch.setattr(runner_mod.log, "warn", warnings.append)
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: _row(acct.name, api.NETWORK_ERROR),
+        )
+        runner._assign_proxy(account)
+        runner._run_account(account)
+        swap_logs = [w for w in warnings if "网络异常，已换 IP" in w]
+        assert len(swap_logs) == 2
+        assert "配额还剩 1 次" in swap_logs[0] and "累计已换 1 个" in swap_logs[0]
+        assert "配额还剩 0 次" in swap_logs[1] and "累计已换 2 个" in swap_logs[1]
 
     def test_manual_proxy_is_never_swapped(self, tmp_path, monkeypatch):
         runner, account = self._runner(tmp_path, monkeypatch, retry=1, ip_swap_limit=2)

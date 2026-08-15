@@ -113,15 +113,15 @@ class Runner:
         swaps = self.cfg.proxy_pool.ip_swap_limit
         if count >= accounts:
             log.info(f"一账号一 IP：{accounts} 个账号 / {count} 个可用代理，"
-                     f"余量 {count - accounts} 个可用于换 IP"
-                     f"（单账号最多换 {swaps} 次）")
+                     f"多出的 {count - accounts} 个是**所有账号共享**的换 IP 备用池"
+                     f"（单账号网络异常换 IP 配额 {swaps} 次，盾类重试不限次数）")
             return
         share = accounts - count
         log.warn(f"可用代理只有 {count} 个，少于 {accounts} 个账号："
                  f"前 {count} 个账号各独占一个 IP，其余 {share} 个会与它们共用 IP"
-                 f"（不会降级直连，单账号最多换 {swaps} 次 IP）。代理来自服务器预取时，"
-                 f"数量由服务端 proxy_pool.save_limit 决定（0 = 不限制）；本地抓取时"
-                 f"可调大 proxy_pool.max_workers 或增加 sources")
+                 f"（不会降级直连，单账号网络异常换 IP 配额 {swaps} 次）。代理来自服务器"
+                 f"预取时，数量由服务端 proxy_pool.save_limit 决定（0 = 不限制）；本地"
+                 f"抓取时可调大 proxy_pool.max_workers 或增加 sources")
 
     def _assign_proxy(self, account: Account) -> None:
         """给账号分配代理。手动配置的优先；否则从池里取（用尽时共用，绝不直连）。"""
@@ -481,7 +481,10 @@ class Runner:
         """
         deadline = time.monotonic() + ACCOUNT_DEADLINE_SECONDS
         attempts = max(1, self.cfg.defaults.retry + 1)
+        # swaps_left 只是「网络异常」这一类的配额；盾类按设计不限次数，不扣它。
+        # 但两类都真的从池里换走了 IP，所以另记一个总数，日志才对得上实际消耗。
         swaps_left = self.cfg.proxy_pool.ip_swap_limit if self._pool else 0
+        swapped_total = 0        # 本账号实际换掉的 IP 数（盾类 + 网络异常都算）
         row: Optional[log.SummaryRow] = None
         used = 0                 # 已消耗的计次重试（不含换 IP、不含盾类重试）
         shield_rounds = 0
@@ -499,9 +502,11 @@ class Runner:
             if row.status == api.NETWORK_ERROR and swaps_left > 0:
                 if self._swap_pooled_proxy(account):
                     swaps_left -= 1
+                    swapped_total += 1
                     skip_backoff = True
                     log.warn(f"网络异常，已换 IP 立即重试（不计入重试次数，"
-                             f"剩余换 IP 次数 {swaps_left}）")
+                             f"网络异常配额还剩 {swaps_left} 次，"
+                             f"本账号累计已换 {swapped_total} 个 IP）")
                     continue
 
             # 2) 盾类失败：换 IP + 重开浏览器，一直试到成功或时间盒用尽
@@ -513,11 +518,14 @@ class Runner:
                     return row
                 shield_rounds += 1
                 swapped = self._swap_pooled_proxy(account)
+                if swapped:
+                    swapped_total += 1
                 backoff = min(SHIELD_RETRY_BACKOFF_MAX, 5 * shield_rounds)
                 backoff = min(backoff, max(0.0, left - 1))
                 label = log.STATUS_LABEL.get(row.status, row.status)
                 log.warn(f"{label}：第 {shield_rounds} 轮重试"
-                         + ("（已换出口 IP）" if swapped else "（无新 IP 可换，沿用当前 IP）")
+                         + (f"（已换出口 IP，本账号累计已换 {swapped_total} 个）" if swapped
+                            else "（无新 IP 可换，沿用当前 IP）")
                          + f"，退避 {backoff:.0f}s，剩余时间盒 {left:.0f}s")
                 if backoff > 0:
                     time.sleep(backoff)
