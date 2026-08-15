@@ -289,7 +289,37 @@ class TestNetworkErrorSwapsIP:
         assert row.status == "skipped"
         assert proxies == ["http://fixed.example.com:8080"]
 
-    def test_business_failure_never_swaps(self, tmp_path, monkeypatch):
+    def test_business_failure_allows_three_ip_swaps_then_skips(self, tmp_path, monkeypatch):
+        """源站业务失败允许额外换 3 个 IP，仍失败后才跳过。"""
+        runner = _make_runner(tmp_path, monkeypatch)
+        runner._pool = _EndlessPool()
+        account = runner.cfg.accounts[0]
+        calls = []
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: (calls.append(acct.proxy), _row(acct.name, api.FAILED))[1],
+        )
+        runner._assign_proxy(account)
+        row = runner._run_account(account)
+        assert row.status == "skipped"
+        assert calls == ["p1:80", "p2:80", "p3:80", "p4:80"]
+
+    def test_waf_block_allows_three_ip_swaps_then_skips(self, tmp_path, monkeypatch):
+        """WAF 硬封禁允许额外换 3 个 IP，仍封禁后才跳过。"""
+        runner = _make_runner(tmp_path, monkeypatch)
+        runner._pool = _EndlessPool()
+        account = runner.cfg.accounts[0]
+        calls = []
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: (calls.append(acct.proxy), _row(acct.name, api.WAF_BLOCKED))[1],
+        )
+        runner._assign_proxy(account)
+        row = runner._run_account(account)
+        assert row.status == "skipped"
+        assert calls == ["p1:80", "p2:80", "p3:80", "p4:80"]
+
+    def test_business_failure_never_uses_regular_retry_budget(self, tmp_path, monkeypatch):
         runner, account = self._runner(tmp_path, monkeypatch, retry=2, ip_swap_limit=2)
         proxies = []
         monkeypatch.setattr(
@@ -300,7 +330,7 @@ class TestNetworkErrorSwapsIP:
         runner._assign_proxy(account)
         row = runner._run_account(account)
         assert row.status == "skipped"
-        assert proxies == ["p1:80"]            # 源站业务失败直接跳过
+        assert proxies == ["p1:80", "p2:80", "p3:80", "p4:80"]
 
     def test_without_pool_network_error_is_skipped(self, tmp_path, monkeypatch):
         runner, account = self._runner(tmp_path, monkeypatch, retry=2, pool=False)
