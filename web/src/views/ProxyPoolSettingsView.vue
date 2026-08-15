@@ -71,6 +71,14 @@ web/src/views/ProxyPoolSettingsView.vue
         <n-form-item label="Actions 预取地址">
           <n-input v-model:value="form.remote_url" placeholder="https://你的域名/api/proxies/available（Actions 预取用）" />
         </n-form-item>
+        <n-form-item label="Actions 预取 Token">
+          <n-input
+            v-model:value="form.remote_token"
+            type="password"
+            show-password-on="click"
+            placeholder="与 config_sync 同一个 API Key"
+          />
+        </n-form-item>
       </n-form>
     </config-card>
   </div>
@@ -113,7 +121,10 @@ const form = reactive<ProxyPoolConfig>({
   refresh_minutes: 30,
   save_limit: 100,
   auto_test: true,
-  remote_url: ''
+  remote_url: '',
+  remote_token: '',
+  remote_token_header: 'Authorization',
+  remote_token_prefix: 'Bearer'
 })
 
 function initForm(cfg: AppConfig) {
@@ -129,6 +140,9 @@ function initForm(cfg: AppConfig) {
   form.save_limit = p.save_limit ?? 100
   form.auto_test = p.auto_test ?? true
   form.remote_url = p.remote_url ?? ''
+  form.remote_token = p.remote_token ?? ''
+  form.remote_token_header = p.remote_token_header ?? 'Authorization'
+  form.remote_token_prefix = p.remote_token_prefix ?? 'Bearer'
   savedSnapshot.value = JSON.stringify(form)
 }
 

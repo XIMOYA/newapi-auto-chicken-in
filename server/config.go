@@ -101,9 +101,12 @@ type ProxyPool struct {
 	RefreshMinutes int  `json:"refresh_minutes"`
 	SaveLimit      int  `json:"save_limit"` // 最多保留多少条可用代理（默认 100）
 	AutoTest       bool `json:"auto_test"`  // 后台刷新时是否测通+测延迟（默认 true）
-	// 给 Actions 用的预取地址（remote_url 是给 Python 端 config 用的展示字段，
-	// 实际 Actions 通过 /api/proxies/available 取）。
-	RemoteURL string `json:"remote_url"`
+	// Actions 预取：Python 端配置的 remote_url / remote_token 等字段，这里透传保存。
+	// 实际 Actions 通过 /api/proxies/available 取，鉴权用同一个 API Key（remote_token）。
+	RemoteURL           string `json:"remote_url"`
+	RemoteToken         string `json:"remote_token"`
+	RemoteTokenHeader   string `json:"remote_token_header"`
+	RemoteTokenPrefix   string `json:"remote_token_prefix"`
 }
 
 // Notify 通知配置。
@@ -180,17 +183,20 @@ func DefaultConfig() Config {
 			IntervalSeconds: []int{3, 8},
 		},
 		ProxyPool: ProxyPool{
-			Enabled:        false,
-			TestURL:        "https://api.ipify.org",
-			Timeout:        8,
-			MaxWorkers:     25,
-			MaxProxies:     250,
-			IPSwapLimit:    2,
-			Sources:        []string{},
-			RefreshMinutes: 30,
-			SaveLimit:      100,
-			AutoTest:       true,
-			RemoteURL:      "",
+			Enabled:          false,
+			TestURL:          "https://api.ipify.org",
+			Timeout:          8,
+			MaxWorkers:       25,
+			MaxProxies:       250,
+			IPSwapLimit:      2,
+			Sources:          []string{},
+			RefreshMinutes:   30,
+			SaveLimit:        100,
+			AutoTest:         true,
+			RemoteURL:        "",
+			RemoteToken:      "",
+			RemoteTokenHeader: "Authorization",
+			RemoteTokenPrefix: "Bearer",
 		},
 		Notify: Notify{
 			Email: EmailConfig{

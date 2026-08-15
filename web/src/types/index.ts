@@ -72,8 +72,12 @@ export interface ProxyPoolConfig {
   save_limit: number
   /** 后台刷新时是否测通 */
   auto_test: boolean
-  /** Actions 预取地址提示（供展示） */
+  /** Actions 预取地址（供展示） */
   remote_url: string
+  /** Actions 预取鉴权 token（与 config_sync 同一个 API Key） */
+  remote_token: string
+  remote_token_header: string
+  remote_token_prefix: string
 }
 
 export interface NotifyEmailConfig {
