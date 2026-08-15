@@ -269,7 +269,7 @@ def test_logger_rolls_over_across_midnight(tmp_path, monkeypatch):
     assert "after midnight" in second.read_text(encoding="utf-8")
 
 
-def test_daemon_uses_scheduler_parallelism_and_serializes_manual(monkeypatch):
+def test_daemon_uses_fixed_parallelism_and_serializes_manual(monkeypatch):
     cfg = build_config({"accounts": [{"name": "A", "url": "https://a.example.com", "cookie": "c"}]})
     captured = []
 
@@ -289,7 +289,7 @@ def test_daemon_uses_scheduler_parallelism_and_serializes_manual(monkeypatch):
 
     assert server._run_checkin(None, manual=False)["ok"] is True
     assert server._run_checkin(None, manual=True)["ok"] is True
-    assert captured == [3, 1]
+    assert captured == [4, 1]
 
 
 def test_daemon_runs_auto_sync_before_runner(monkeypatch):

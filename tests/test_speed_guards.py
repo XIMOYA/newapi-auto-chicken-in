@@ -87,6 +87,9 @@ class TestRetrySemantics:
 class TestShieldRetriesUntilDeadline:
     """被盾拦住 / 拿不到 Turnstile token：换 IP + 重开浏览器，一直试到成功。"""
 
+    def test_account_deadline_is_1200_seconds(self):
+        assert runner_mod.ACCOUNT_DEADLINE_SECONDS == 1200
+
     @staticmethod
     def _wire(runner, monkeypatch, statuses, *, deadline=0.6):
         """把时间盒缩到亚秒级，并让退避不真的睡。"""
@@ -386,20 +389,19 @@ class TestBrowserConcurrency:
         runner = _make_runner(tmp_path, monkeypatch, parallelism=2, browser_parallelism=8)
         assert runner._browser_workers() == 2
 
-    def test_explicit_browser_parallel_is_honoured(self, tmp_path, monkeypatch):
+    def test_explicit_browser_parallel_is_ignored(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, parallelism=8, browser_parallelism=1)
-        assert runner._browser_workers() == 1
+        assert runner._browser_workers() == 2
 
-    def test_auto_browser_workers_stay_small(self, tmp_path, monkeypatch):
+    def test_fixed_browser_workers_stay_at_two(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, parallelism=8)
-        assert 1 <= runner._browser_workers() <= runner_mod.MAX_BROWSER_PARALLELISM
+        assert runner._browser_workers() == 2
+        assert runner_mod.FIXED_BROWSER_PARALLELISM == 2
 
-    def test_auto_browser_workers_leave_one_core_free(self, tmp_path, monkeypatch):
-        """自动值 = 核心数 - 1，留一个核给 Python 编排和系统。"""
+    def test_browser_workers_do_not_depend_on_cpu_count(self, tmp_path, monkeypatch):
+        """浏览器并发固定为 2，不随 CPU 核数变化。"""
         runner = _make_runner(tmp_path, monkeypatch, parallelism=16)
-        for cores, expected in ((1, 1), (2, 1), (4, 3), (8, 4), (32, 4)):
-            monkeypatch.setattr(runner_mod.os, "cpu_count", lambda c=cores: c)
-            assert runner._browser_workers() == expected
+        assert runner._browser_workers() == 2
 
     def test_gate_limits_concurrent_solves(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
@@ -428,22 +430,22 @@ class TestBrowserConcurrency:
         assert state["maximum"] == 2
 
 
-class TestExplicitParallelism:
-    def test_explicit_one_stays_serial(self, tmp_path, monkeypatch):
+class TestFixedParallelism:
+    def test_explicit_one_is_overridden_for_automated_runs(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, accounts=3,
                               parallelism=1, parallelism_explicit=True)
         monkeypatch.setattr(runner, "_run_account",
                             lambda account: _row(account.name, api.SUCCESS))
         assert runner.run() == 0
-        assert runner.options.parallelism == 1
+        assert runner.options.parallelism == 4
 
-    def test_unspecified_is_promoted_to_default(self, tmp_path, monkeypatch):
+    def test_unspecified_is_promoted_to_fixed_default(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, accounts=3, parallelism=1)
         monkeypatch.setattr(runner, "_run_account",
                             lambda account: _row(account.name, api.SUCCESS))
         assert runner.run() == 0
         assert runner.options.parallelism == runner_mod.DEFAULT_ACCOUNT_PARALLELISM
-        assert runner_mod.DEFAULT_ACCOUNT_PARALLELISM == 3
+        assert runner_mod.DEFAULT_ACCOUNT_PARALLELISM == 4
 
 
 class TestExitIpProbe:

@@ -23,7 +23,7 @@ from . import daemon_control
 from .config import DATA_DIR, LOGS_DIR, ConfigError, load_config
 from .config_store import load_document, save_document
 from .remote_sync import sync_remote_config
-from .runner import RunOptions, Runner
+from .runner import DEFAULT_ACCOUNT_PARALLELISM, RunOptions, Runner
 from .secure_config import ConfigEncryptionError
 from .scheduler import ScheduleError, SchedulerService
 
@@ -394,11 +394,7 @@ class DaemonServer:
                 # 定时/立即签到不能弹浏览器窗口；"virtual"(Xvfb) 与 true 本来就是
                 # 无头模式，只有用户显式配置了真 headful(false) 才需要改写成无头。
                 cfg.browser.headless = True
-            # 手动验证只有一台浏览器，强制串行；定时/立即签到用调度配置的并行度
-            scheduler = self._scheduler
-            scheduled_parallelism = 1
-            if scheduler is not None:
-                scheduled_parallelism = getattr(scheduler.config, "parallelism", 1)
+            # 手动验证只有一台浏览器，强制串行；定时/立即签到固定 4 个账号并发。
             options = RunOptions(
                 account_names=account_names,
                 headful=manual,
@@ -406,8 +402,8 @@ class DaemonServer:
                 use_ai=True,
                 use_browser=True,
                 verbose=False,
-                parallelism=1 if manual else scheduled_parallelism,
-                # 调度里配的并发数是用户的明确意愿，包括「就要串行 1」
+                parallelism=1 if manual else DEFAULT_ACCOUNT_PARALLELISM,
+                # 调度配置的旧并发字段保留兼容；自动签到实际固定为 4。
                 parallelism_explicit=not manual,
             )
             runner = Runner(cfg, options)

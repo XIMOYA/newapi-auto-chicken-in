@@ -105,15 +105,12 @@ jobs:
           print("config.json 已写入（校验通过）")
           PY
 
-      - name: 开始签到（headless 真无头 + 账号并行 8 + 浏览器并发按 CPU 自适应）
+      - name: 开始签到（headless 真无头 + 固定 4 账号并发 + 2 浏览器并发）
         # 两级并发管的不是一回事：
-        #   --parallel 8   账号级并发。HTTP 快路径几乎不吃 CPU、纯等网络，开大很划算；
-        #                  大多数账号能在 S1 直连成功，这一档决定整轮的吞吐
-        #   浏览器并发     不写死，让程序按「核心数 - 1」自适应（上限 4）。
-        #                  公共仓库标准 runner 是 4 vCPU / 16 GB -> 3 个浏览器实例，
-        #                  正好留一个核给 Python 编排和系统；私有仓库 2 核 -> 1。
-        #                  写死成固定值会在两种 runner 上一边超配、一边浪费
-        run: python main.py --headless --parallel 8 -v ${{ inputs.dry_run && '--dry-run' || '' }}
+        #   账号级并发固定为 4，HTTP 快路径主要等待网络，保证整轮吞吐稳定；
+        #   浏览器实例固定为 2，不再按 runner 的 CPU 核数动态计算，避免排队时
+        #   在不同运行环境之间出现并发抖动。
+        run: python main.py --headless --parallel 4 --browser-parallel 2 -v ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: 上传排障截图与页面快照（仅失败时）
         if: failure()

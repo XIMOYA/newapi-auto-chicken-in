@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from dataclasses import dataclass
@@ -42,15 +41,17 @@ _SKIP_ON_FAILURE = (
 # 这些结果说明请求本身通了，换策略也不会变，直接结束
 _SETTLED = (api.SUCCESS, api.ALREADY_DONE, api.AUTH_FAILED, api.FAILED)
 
-# 未显式指定 --parallel 时的账号级并发数
-DEFAULT_ACCOUNT_PARALLELISM = 3
-# 账号级并发的硬上限。账号阶段主要在等网络，开大代价很小
+# 自动签到固定账号级并发：HTTP 快路径主要等待网络，统一保持 4 个账号并发。
+# --parallel / 调度配置仍保留兼容字段，但实际运行不再按调用方或 CPU 动态调整。
+DEFAULT_ACCOUNT_PARALLELISM = 4
+# 账号级并发的历史硬上限（保留兼容，实际运行固定使用 DEFAULT_ACCOUNT_PARALLELISM）。
 MAX_ACCOUNT_PARALLELISM = 16
-# 浏览器实例并发的自动推导上限（每个实例约占一个核心）
-MAX_BROWSER_PARALLELISM = 4
+# 浏览器实例固定并发：最多同时开 2 个 Camoufox，不再按 CPU 核数推导。
+FIXED_BROWSER_PARALLELISM = 2
+MAX_BROWSER_PARALLELISM = FIXED_BROWSER_PARALLELISM
 # 单账号的总时长上限（秒）。盾类失败是「不限次数重试到成功」，必须有一个
 # 时间盒兜底，否则一个卡住的账号会占死一个并发位，把整轮拖到 Actions 超时。
-ACCOUNT_DEADLINE_SECONDS = 900
+ACCOUNT_DEADLINE_SECONDS = 1200
 # 盾类重试的退避上限（秒）。连续硬刚 Cloudflare 只会让质询更难过
 SHIELD_RETRY_BACKOFF_MAX = 30
 # 出口 IP 探测结果缓存的上限。代理池在换 IP 时地址是有限的，但 daemon 长跑
@@ -67,9 +68,9 @@ class RunOptions:
     use_ai: bool = True
     use_browser: bool = True
     verbose: bool = False
-    parallelism: int = 1          # 1 = 未显式指定，run() 里自动提升为默认并发数
-    parallelism_explicit: bool = False   # True = 调用方明确要求这个并发数，不再自动提升
-    browser_parallelism: int = 0         # 0 = 按 CPU 自动推导；浏览器实例的并发上限
+    parallelism: int = 1          # 兼容调用方字段；自动签到实际固定为 6，人工模式为 1
+    parallelism_explicit: bool = False   # 兼容字段；固定并发模式下不改变实际账号并发
+    browser_parallelism: int = 0         # 兼容调用方字段；浏览器实际固定为 2（人工模式为 1）
 
 
 class Runner:
@@ -261,39 +262,20 @@ class Runner:
     # ------------------------------------------------------------------ #
 
     def _parallelism(self) -> int:
-        """账号级并发数，钳制在 [1, MAX_ACCOUNT_PARALLELISM]；人工模式强制串行。"""
+        """自动签到固定 4 个账号并发；人工模式仍强制串行。"""
         if self.options.manual:
             return 1
-        try:
-            workers = int(self.options.parallelism)
-        except (TypeError, ValueError):
-            workers = 1
-        return max(1, min(MAX_ACCOUNT_PARALLELISM, workers))
+        return DEFAULT_ACCOUNT_PARALLELISM
 
     def _set_parallelism(self, workers: int) -> None:
-        """把传入的并发数写回选项（供 CLI/调度调用方设置）。"""
+        """把固定并发写回选项；保留参数仅为兼容 CLI/调度调用方。"""
         self.options.parallelism = max(1, min(MAX_ACCOUNT_PARALLELISM, int(workers)))
 
     def _browser_workers(self) -> int:
-        """浏览器实例的并发上限。
-
-        账号级并发可以开很大——HTTP 快路径几乎不吃 CPU，纯等网络。但浏览器不行：
-        每个 Camoufox/Chromium 实例大致要吃掉一个核心和几百 MB 内存，超配之后
-        单个实例会被拖慢好几倍，总耗时反而更长。
-
-        所以自动值取「核心数 - 1」（留一个核给 Python 编排和系统），上限 4：
-          2 核 -> 1、4 核 -> 3、8 核及以上 -> 4
-        """
-        accounts_workers = self._parallelism()
-        configured = 0
-        try:
-            configured = int(getattr(self.options, "browser_parallelism", 0) or 0)
-        except (TypeError, ValueError):
-            configured = 0
-        if configured > 0:
-            return max(1, min(accounts_workers, configured))
-        auto = max(1, min(MAX_BROWSER_PARALLELISM, (os.cpu_count() or 2) - 1))
-        return max(1, min(accounts_workers, auto))
+        """返回固定的浏览器实例并发上限，不再按 CPU 核数计算。"""
+        if self.options.manual:
+            return 1
+        return min(self._parallelism(), FIXED_BROWSER_PARALLELISM)
 
     def _take_browser_attempt(self, account: Account) -> bool:
         """记录一次浏览器过盾（只用于日志/统计，不再限次）。
@@ -323,12 +305,8 @@ class Runner:
             log.warn("没有启用的账号（检查 accounts[].enabled）")
             return 2
 
-        # 未显式指定时用 DEFAULT_ACCOUNT_PARALLELISM（人工模式强制串行 1）
-        if self.options.manual:
-            self._set_parallelism(1)
-        elif (not getattr(self.options, "parallelism_explicit", False)
-                and self.options.parallelism in (None, 1, 0)):
-            self._set_parallelism(DEFAULT_ACCOUNT_PARALLELISM)
+        # 自动签到固定 4 个账号并发；人工模式强制串行 1。
+        self._set_parallelism(1 if self.options.manual else DEFAULT_ACCOUNT_PARALLELISM)
 
         # 代理池：启用后就必须走代理，拿不到代理的账号会被跳过而不是直连
         # desired 比账号数多 10：留出换 IP 的余量，账号越多目标越大

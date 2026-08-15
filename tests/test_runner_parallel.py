@@ -38,19 +38,19 @@ def test_runner_parallelizes_accounts_and_keeps_result_order(tmp_path, monkeypat
     monkeypatch.setattr(runner, "_run_account", fake_run)
 
     assert runner.run() == 0
-    assert state["maximum"] == 2
+    assert state["maximum"] == 4
     assert [row.name for row in runner.summary.rows] == ["A", "B", "C", "D"]
 
 
-def test_runner_parallelism_is_clamped_to_safe_range(tmp_path, monkeypatch):
+def test_runner_parallelism_is_fixed_for_automated_runs(tmp_path, monkeypatch):
     cfg = cfgmod.build_config(
         {"accounts": [{"name": "A", "url": "https://a.example.com", "cookie": "c"}]}
     )
     monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
     runner = runner_mod.Runner(cfg, runner_mod.RunOptions(parallelism=99, use_ai=False, use_browser=False))
 
-    assert runner._parallelism() == runner_mod.MAX_ACCOUNT_PARALLELISM
-    assert runner_mod.MAX_ACCOUNT_PARALLELISM == 16
+    assert runner._parallelism() == 4
+    assert runner_mod.DEFAULT_ACCOUNT_PARALLELISM == 4
 
 
 def test_source_ip_backoff_only_blocks_that_account(tmp_path, monkeypatch):
