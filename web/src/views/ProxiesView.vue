@@ -69,6 +69,27 @@ web/src/views/ProxiesView.vue
 
     <!-- 工具栏 -->
     <n-card :bordered="false" class="toolbar-card">
+      <!-- 实时进度条（刷新/测速进行中显示） -->
+      <div v-if="progress?.running" class="progress-bar">
+        <div class="progress-info">
+          <n-tag :type="progressStage === 'speedtest' ? 'primary' : 'warning'" size="small" :bordered="false">
+            {{ progressStageLabel }}
+          </n-tag>
+          <span class="progress-text">
+            已抓取 {{ progress.fetched }} 条候选 · 已测 {{ progress.tested }} / {{ progress.candidates }} 条 ·
+            可用 {{ progress.alive }}{{ progress.target ? ` / 目标 ${progress.target}` : '' }}
+          </span>
+          <span class="progress-dur">已耗时 {{ progress.duration_sec }}s</span>
+        </div>
+        <n-progress
+          :percentage="progressPercent"
+          :show-indicator="false"
+          :height="8"
+          :color="progressStage === 'speedtest' ? '#1e5eff' : '#f0a020'"
+          class="progress-line"
+        />
+      </div>
+
       <n-space :size="8" align="center" class="toolbar">
         <n-radio-group v-model:value="aliveFilter" size="small">
           <n-radio-button value="all">全部</n-radio-button>
@@ -89,7 +110,6 @@ web/src/views/ProxiesView.vue
           size="small"
           class="sort-select"
         />
-        <n-tag v-if="stats?.running" type="warning" :bordered="false">刷新中…</n-tag>
         <n-alert v-if="stats?.last_error" type="error" :bordered="false" class="toolbar-err">
           {{ stats.last_error }}
         </n-alert>
@@ -98,7 +118,7 @@ web/src/views/ProxiesView.vue
             <template #icon><n-icon><refresh-outline /></n-icon></template>
             立即刷新
           </n-button>
-          <n-button size="small" type="primary" :loading="speedTesting" :disabled="!speedCandidates.length" @click="handleSpeedTest">
+          <n-button size="small" type="primary" :disabled="!speedCandidates.length" @click="openSpeedTestModal">
             <template #icon><n-icon><flash-outline /></n-icon></template>
             测速{{ selectedKeys.length ? `（勾选 ${selectedKeys.length}）` : '（全部可用）' }}
           </n-button>
@@ -125,14 +145,39 @@ web/src/views/ProxiesView.vue
         </template>
       </n-data-table>
     </n-card>
+
+    <!-- 测速进度弹窗：可关闭，后台继续测，随时可再打开查看 -->
+    <n-modal
+      v-model:show="speedModalVisible"
+      preset="card"
+      title="代理测速进度"
+      style="width: 460px"
+      :mask-closable="true"
+      transition-preset="fade-in-scale-up"
+    >
+      <div v-if="progress?.running && progressStage === 'speedtest'" class="speed-modal-body">
+        <n-progress
+          type="circle"
+          :percentage="speedPercent"
+          :indicator-placement="'inside'"
+          :color="'#1e5eff'"
+        />
+        <div class="speed-modal-text">
+          <p>正在测速 <b>{{ progress.tested }}</b> / <b>{{ progress.candidates }}</b> 个代理</p>
+          <p>已完成测速成功 <b>{{ progress.alive }}</b> 个</p>
+          <p class="muted">已耗时 {{ progress.duration_sec }}s · 关闭本弹窗不影响后台继续测速</p>
+        </div>
+      </div>
+      <n-empty v-else description="当前没有测速任务进行中" />
+    </n-modal>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, h, onMounted, reactive, ref } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
   NCard, NButton, NIcon, NTag, NDataTable, NRadioGroup, NRadioButton,
-  NSelect, NSpace, NEmpty, NGrid, NGridItem, NAlert, useMessage,
+  NSelect, NSpace, NEmpty, NGrid, NGridItem, NAlert, NModal, NProgress, useMessage,
   type DataTableColumns, type PaginationProps, type SelectOption
 } from 'naive-ui'
 import {
@@ -141,12 +186,13 @@ import {
 } from '@vicons/ionicons5'
 import { listProxies, getProxyStats, refreshProxies, speedTestProxies } from '@/api/proxies'
 import { extractErrorMessage } from '@/utils/error'
-import type { ProxyEntry, ProxyStatsResult } from '@/types'
+import type { ProxyEntry, ProxyProgress, ProxyStatsResult } from '@/types'
 
 const message = useMessage()
 
 // ---- 状态 ----
 const stats = ref<ProxyStatsResult | null>(null)
+const progress = ref<ProxyProgress | null>(null)
 const proxies = ref<ProxyEntry[]>([])
 const listLoading = ref(false)
 const refreshing = ref(false)
@@ -155,6 +201,29 @@ const aliveFilter = ref<'all' | 'alive'>('all')
 const sourceFilter = ref<string | null>(null)
 const sortBy = ref<'latency' | 'speed'>('latency')
 const selectedKeys = ref<number[]>([])
+const speedModalVisible = ref(false)
+let pollTimer: number | undefined
+
+// ---- 进度轮询 ----
+const progressStage = computed(() => progress.value?.stage ?? '')
+const progressStageLabel = computed(() => {
+  const s = progressStage.value
+  if (s === 'fetching') return '正在抓取代理源'
+  if (s === 'testing') return '正在测通'
+  if (s === 'speedtest') return '正在测速'
+  if (s === 'done') return '完成'
+  return '空闲'
+})
+const progressPercent = computed(() => {
+  const p = progress.value
+  if (!p || !p.candidates) return 0
+  return Math.min(100, Math.round((p.tested / p.candidates) * 100))
+})
+const speedPercent = computed(() => {
+  const p = progress.value
+  if (!p || !p.candidates) return 0
+  return Math.min(100, Math.round((p.tested / p.candidates) * 100))
+})
 
 // ---- 统计 ----
 const avgLatency = computed(() => {
@@ -272,6 +341,7 @@ async function loadProxyData() {
     const [listRes, statsRes] = await Promise.all([listProxies({ limit: 500 }), getProxyStats()])
     proxies.value = listRes.proxies
     stats.value = statsRes
+    progress.value = statsRes.progress ?? null
   } catch (e) {
     message.error(extractErrorMessage(e, '获取代理列表失败'))
   } finally {
@@ -279,12 +349,39 @@ async function loadProxyData() {
   }
 }
 
+// 轮询进度（2s 一次），弹窗关闭/页面停留都能看到最新进度
+function startPolling() {
+  stopPolling()
+  pollTimer = window.setInterval(async () => {
+    try {
+      const statsRes = await getProxyStats()
+      stats.value = statsRes
+      progress.value = statsRes.progress ?? null
+      // 后台任务结束则刷新一次列表
+      const prevRunning = progress.value?.running
+      if (prevRunning === false && statsRes.running === false && statsRes.progress?.running === false) {
+        if (prevRunning) loadProxyData()
+      }
+    } catch {
+      // 轮询失败静默，不打扰用户
+    }
+  }, 2000)
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    window.clearInterval(pollTimer)
+    pollTimer = undefined
+  }
+}
+
 async function handleManualRefresh() {
   refreshing.value = true
   try {
     await refreshProxies()
-    message.success('代理池刷新已开始，稍候查看')
-    setTimeout(() => loadProxyData(), 3000)
+    message.success('代理池刷新已开始，进度实时显示')
+    startPolling()
+    setTimeout(() => loadProxyData(), 2000)
   } catch (e) {
     message.error(extractErrorMessage(e, '触发刷新失败'))
   } finally {
@@ -292,17 +389,23 @@ async function handleManualRefresh() {
   }
 }
 
-async function handleSpeedTest() {
+function openSpeedTestModal() {
   const targets = speedCandidates.value
   if (!targets.length) {
     message.warning('没有可测速的可用代理')
     return
   }
+  speedModalVisible.value = true
+  handleSpeedTest(targets)
+}
+
+async function handleSpeedTest(targets: ProxyEntry[]) {
   speedTesting.value = true
   try {
     await speedTestProxies({ proxies: targets.map((p) => p.addr) })
-    message.success(`已对 ${targets.length} 个代理发起测速，稍候刷新查看结果`)
-    setTimeout(() => loadProxyData(), 3000)
+    message.success(`已对 ${targets.length} 个代理发起测速，弹窗实时显示进度`)
+    startPolling()
+    setTimeout(() => loadProxyData(), 2000)
   } catch (e) {
     message.error(extractErrorMessage(e, '测速请求失败'))
   } finally {
@@ -310,7 +413,12 @@ async function handleSpeedTest() {
   }
 }
 
-onMounted(loadProxyData)
+onMounted(() => {
+  loadProxyData()
+  startPolling()
+})
+
+onBeforeUnmount(stopPolling)
 </script>
 
 <style scoped>
@@ -375,6 +483,56 @@ onMounted(loadProxyData)
   margin-left: auto;
   display: flex;
   gap: 8px;
+}
+
+.progress-bar {
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  background: #f7f8fb;
+  border-radius: 8px;
+}
+
+.progress-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.progress-text {
+  font-size: 13px;
+  color: #48566a;
+}
+
+.progress-dur {
+  margin-left: auto;
+  font-size: 12px;
+  color: #8492a6;
+}
+
+.progress-line {
+  width: 100%;
+}
+
+.speed-modal-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 0;
+}
+
+.speed-modal-text {
+  text-align: center;
+  font-size: 14px;
+  color: #1f2d3d;
+  line-height: 1.8;
+}
+
+.speed-modal-text .muted {
+  color: #8492a6;
+  font-size: 12px;
 }
 
 .source-select {

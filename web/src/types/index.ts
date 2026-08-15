@@ -205,6 +205,19 @@ export interface ProxyStatsResult {
   last_run: string
   last_error: string
   running: boolean
+  progress?: ProxyProgress
+}
+
+export interface ProxyProgress {
+  running: boolean
+  stage: string
+  fetched: number
+  candidates: number
+  tested: number
+  alive: number
+  target: number
+  started_at: string
+  duration_sec: number
 }
 
 // ===== 导出 =====

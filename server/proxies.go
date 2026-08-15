@@ -148,16 +148,50 @@ type ProxyManager struct {
 	lastRun time.Time
 	lastErr string
 	running bool
+	// 实时进度：抓取/测通/测速 阶段计数，供页面轮询展示
+	progress ProxyProgress
+}
+
+// ProxyProgress 刷新/测速的实时进度（前端轮询 /api/proxies/stats 展示）。
+type ProxyProgress struct {
+	Running   bool   `json:"running"`
+	Stage     string `json:"stage"` // fetching | testing | speedtest | done
+	Fetched   int    `json:"fetched"`   // 去重后的候选总数
+	Candidates int   `json:"candidates"` // 本次候选数（=Fetched）
+	Tested    int    `json:"tested"`    // 已测完条数
+	Alive     int    `json:"alive"`     // 当前可用条数
+	Target    int    `json:"target"`    // 目标可用数（达到即提前结束）
+	StartedAt string `json:"started_at"`
+	DurationSec int  `json:"duration_sec"`
 }
 
 func NewProxyManager(db *sql.DB) *ProxyManager {
 	return &ProxyManager{db: db}
 }
 
-// LastRun / LastError 供状态接口展示。
+// LastRun / LastError / IsRunning 供状态接口展示。
 func (m *ProxyManager) LastRun() time.Time { m.mu.RLock(); defer m.mu.RUnlock(); return m.lastRun }
 func (m *ProxyManager) LastError() string  { m.mu.RLock(); defer m.mu.RUnlock(); return m.lastErr }
 func (m *ProxyManager) IsRunning() bool    { m.mu.RLock(); defer m.mu.RUnlock(); return m.running }
+
+// Progress 返回当前进度快照。
+func (m *ProxyManager) Progress() ProxyProgress {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.progress
+}
+
+func (m *ProxyManager) setProgress(p ProxyProgress) {
+	m.mu.Lock()
+	m.progress = p
+	m.mu.Unlock()
+}
+
+func (m *ProxyManager) updateProgress(fn func(*ProxyProgress)) {
+	m.mu.Lock()
+	fn(&m.progress)
+	m.mu.Unlock()
+}
 
 // fetchSource 抓取单个代理源，返回 host:port 列表。
 // - 抓源超时与测通超时解耦：源文件可能几百 KB，8s 太紧会误杀慢源，用独立超时
@@ -240,10 +274,11 @@ func testProxyLatency(ctx context.Context, addr, testURL string, timeout int) in
 
 // RefreshProxies 全量刷新：抓取 → 去重 → 并发测通 → 按延迟排序 → 截断保存。
 // 返回可用代理数；saveLimit<=0 时默认 100。
-// 受 refreshBudget 时间盒约束：到点就停止测通，用已测结果继续（避免几千条
-// 候选把后台线程拖死，与 Python 端 REFRESH_BUDGET_SECONDS 语义一致）。
-const refreshBudget = 90 * time.Second
-
+//
+// 结束策略（目标驱动，不做死时间盒）：
+//   - 测通过程中一旦可用数达到 saveLimit 就提前收手（免费代理够用即可，省时间）
+//   - 达不到 saveLimit 就继续测完全部候选，直到耗尽（不中途放弃）
+//   - 仅保留一个宽泛的绝对上限 REFRESH_ABSOLUTE_MAX，防止极端卡死拖死后台
 func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error) {
 	m.mu.Lock()
 	if m.running {
@@ -251,11 +286,15 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 		return 0, fmt.Errorf("代理池刷新已在进行中")
 	}
 	m.running = true
+	started := time.Now()
 	m.mu.Unlock()
 	defer func() {
 		m.mu.Lock()
 		m.running = false
 		m.lastRun = time.Now()
+		m.progress.Running = false
+		m.progress.Stage = "done"
+		m.progress.DurationSec = int(time.Since(started).Seconds())
 		m.mu.Unlock()
 	}()
 
@@ -275,7 +314,8 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 		timeout = 8
 	}
 
-	// 1) 并发抓取所有源
+	// 1) 并发抓取所有源（阶段：fetching）
+	m.setProgress(ProxyProgress{Running: true, Stage: "fetching", Target: saveLimit, StartedAt: started.UTC().Format(time.RFC3339)})
 	seen := map[string]string{} // addr -> source（首次出现的源保留）
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -301,7 +341,7 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 		return 0, nil
 	}
 
-	// 2) 并发测通（限制并发数；整体受 ctx 时间盒约束——到点未完成的请求立即取消）
+	// 2) 并发测通（目标驱动：达到 saveLimit 即停；否则测完全部候选）
 	type item struct{ addr, source string }
 	all := make([]item, 0, len(seen))
 	for addr, src := range seen {
@@ -311,18 +351,31 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 	if workers <= 0 {
 		workers = 25
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), refreshBudget)
+	// 宽泛绝对上限：只防极端卡死，正常情况由「达标提前停」或「测完」结束
+	ctx, cancel := context.WithTimeout(context.Background(), REFRESH_ABSOLUTE_MAX)
 	defer cancel()
 
+	m.setProgress(ProxyProgress{
+		Running: true, Stage: "testing", Fetched: len(all), Candidates: len(all),
+		Target: saveLimit, StartedAt: started.UTC().Format(time.RFC3339),
+	})
+
 	results := make([]ProxyEntry, 0, len(all))
+	aliveCount := 0
 	var mu2 sync.Mutex
 	sem := make(chan struct{}, workers)
 	var wg2 sync.WaitGroup
+	stop := false
 	for _, it := range all {
+		mu2.Lock()
+		if stop {
+			mu2.Unlock()
+			break
+		}
+		mu2.Unlock()
 		wg2.Add(1)
 		go func(it item) {
 			defer wg2.Done()
-			// 时间盒已过：不测了直接算失败（快进，不等信号量）
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
@@ -340,13 +393,24 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 				LastChecked: time.Now().UTC().Format(time.RFC3339),
 				LastAliveAt: time.Now().UTC().Format(time.RFC3339),
 			})
+			if alive {
+				aliveCount++
+			}
+			m.updateProgress(func(p *ProxyProgress) {
+				p.Tested = len(results)
+				p.Alive = aliveCount
+				p.Stage = "testing"
+			})
+			// 达标提前停：可用数够用了就不测剩下的
+			if aliveCount >= saveLimit {
+				stop = true
+			}
 			mu2.Unlock()
 		}(it)
 	}
 	wg2.Wait()
-	if ctx.Err() != nil {
-		log.Printf("[proxy] 刷新到达时间盒 %s，实际测试了 %d/%d 条候选", refreshBudget, len(results), len(all))
-	}
+	log.Printf("[proxy] 刷新完成: 抓取 %d 候选，测通 %d 条，可用 %d 条（目标 %d，耗时 %.0fs）",
+		len(all), len(results), aliveCount, saveLimit, time.Since(started).Seconds())
 
 	// 3) 排序：alive 在前，按延迟升序；dead 在后
 	sortProxies(results)
@@ -360,7 +424,7 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 	if err := m.replaceAll(results); err != nil {
 		return 0, err
 	}
-	aliveCount := 0
+	aliveCount = 0
 	for _, r := range results {
 		if r.Alive {
 			aliveCount++
@@ -368,9 +432,15 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 	}
 	m.mu.Lock()
 	m.lastErr = ""
+	m.progress.Alive = aliveCount
+	m.progress.Tested = len(results)
 	m.mu.Unlock()
 	return aliveCount, nil
 }
+
+// REFRESH_ABSOLUTE_MAX 刷新的绝对上限：只防极端卡死，正常情况下由
+// 「达到 saveLimit 提前停」或「测完全部候选」结束，不会走到这里。
+const REFRESH_ABSOLUTE_MAX = 20 * time.Minute
 
 // replaceAll 清空 proxies 表并写入新结果（单事务）。
 func (m *ProxyManager) replaceAll(entries []ProxyEntry) error {
@@ -487,6 +557,16 @@ func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout in
 	if timeout <= 0 {
 		timeout = 15
 	}
+	started := time.Now()
+	m.setProgress(ProxyProgress{Running: true, Stage: "speedtest", Target: len(addrs), StartedAt: started.UTC().Format(time.RFC3339)})
+	defer func() {
+		m.updateProgress(func(p *ProxyProgress) {
+			p.Running = false
+			p.Stage = "done"
+			p.DurationSec = int(time.Since(started).Seconds())
+		})
+	}()
+
 	entries, err := m.ListProxies(true, 2000)
 	if err != nil {
 		return 0, err
@@ -508,6 +588,10 @@ func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout in
 	if len(target) == 0 {
 		return 0, nil
 	}
+	m.updateProgress(func(p *ProxyProgress) {
+		p.Target = len(target)
+		p.Candidates = len(target)
+	})
 
 	workers := 8
 	if len(target) < workers {
@@ -515,6 +599,7 @@ func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout in
 	}
 	var mu sync.Mutex
 	var updated int
+	var done int
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, workers)
 	for _, e := range target {
@@ -528,15 +613,23 @@ func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout in
 			}
 			defer func() { <-sem }()
 			speed := testProxySpeed(ctx, e.Addr, SpeedTestURL, timeout)
+			mu.Lock()
+			done++
+			m.updateProgress(func(p *ProxyProgress) {
+				p.Tested = done
+				p.Stage = "speedtest"
+			})
 			if speed < 0 {
+				mu.Unlock()
 				return
 			}
-			mu.Lock()
-			defer mu.Unlock()
 			if _, err := m.db.Exec(`UPDATE proxies SET speed_bps = ? WHERE id = ?`, speed, e.ID); err != nil {
+				mu.Unlock()
 				return
 			}
 			updated++
+			m.updateProgress(func(p *ProxyProgress) { p.Alive = updated })
+			mu.Unlock()
 		}(e)
 	}
 	wg.Wait()

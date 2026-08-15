@@ -569,6 +569,7 @@ func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
 		"last_run":   s.proxies.LastRun().UTC().Format(time.RFC3339),
 		"last_error": s.proxies.LastError(),
 		"running":    s.proxies.IsRunning(),
+		"progress":   s.proxies.Progress(),
 	})
 }
 
