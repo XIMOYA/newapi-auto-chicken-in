@@ -183,11 +183,20 @@ class Runner:
                 from .ai.vision import VisionClient
 
                 self._ai = VisionClient(self.cfg.ai)
+                # AI 请求也走代理：启用代理池时强制走，且换 IP 不限次数
+                self._ai.set_proxy_source(self._acquire_proxy_for_ai,
+                                          require=self._proxy_required())
                 log.debug(f"AI 已就绪: {self.cfg.ai.model} @ {self.cfg.ai.chat_url}")
             except Exception as exc:  # noqa: BLE001 - AI 是可降级项，绝不能中断签到
                 log.warn(f"AI 初始化失败，将跳过 S3: {exc}")
                 self._ai = None
             return self._ai
+
+    def _acquire_proxy_for_ai(self) -> Optional[str]:
+        """给 AI 请求要一个代理。池子用尽时会返回共用的 IP，不会返回 None。"""
+        if self._pool is None:
+            return None
+        return self._pool.acquire()
 
     # ------------------------------------------------------------------ #
     # 主循环

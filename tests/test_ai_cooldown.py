@@ -183,14 +183,101 @@ class TestAIProxy:
         assert session.proxies[0] is not None       # 第一次走代理
         assert session.proxies[1] is None          # 第二次直连
 
-    def test_proxied_attempt_leaves_budget_for_fallback(self, monkeypatch):
-        """代理不通会一直挂到超时，所以只能占用一半预算。"""
-        client, session = _client([RuntimeError("timeout"), FakeResp()], monkeypatch,
+    def test_per_request_timeout_is_cfg_timeout(self, monkeypatch):
+        """cfg.timeout 是单次请求上限；总时长另有墙钟兜底，不再切一半。"""
+        client, session = _client([RuntimeError("boom"), FakeResp()], monkeypatch,
                                  timeout=20)
         with client.use_proxy("slow:1"):
             client.classify_page(b"png")
-        assert session.calls[0] <= 10.0 + 0.01
-        assert session.calls[1] > 10.0
+        assert session.calls[0] == 20.0
+
+
+class TestAIRequiresProxy:
+    """AI 强制走代理：代理不通就换下一个 IP，不限次数，绝不退回直连。"""
+
+    @staticmethod
+    def _pooled(monkeypatch, script, proxies, *, require=True, timeout=5):
+        client, session = _client(script, monkeypatch, timeout=timeout)
+        supply = list(proxies)
+        handed: list = []
+
+        def provider():
+            if not supply:
+                return None
+            proxy = supply.pop(0)
+            handed.append(proxy)
+            return proxy
+
+        client.set_proxy_source(provider, require=require)
+        return client, session, handed
+
+    def test_swaps_ip_instead_of_going_direct(self, monkeypatch):
+        client, session, handed = self._pooled(
+            monkeypatch,
+            [RuntimeError("proxy down"), RuntimeError("proxy down"), FakeResp()],
+            ["p2:80", "p3:80"],
+        )
+        with client.use_proxy("p1:80"):
+            assert client.classify_page(b"png").state == "passed"
+        # 三次请求分别走 p1 / p2 / p3，没有任何一次是直连
+        assert [c["http"] for c in session.proxies] == ["p1:80", "p2:80", "p3:80"]
+        assert handed == ["p2:80", "p3:80"]
+
+    def test_swaps_are_not_counted_as_retries(self, monkeypatch):
+        """max_retries=0 也要能换 IP——换 IP 不占重试次数。"""
+        client, session, _handed = self._pooled(
+            monkeypatch,
+            [RuntimeError("x"), RuntimeError("x"), RuntimeError("x"), FakeResp()],
+            ["p2:80", "p3:80", "p4:80"],
+            timeout=5,
+        )
+        client.cfg.max_retries = 0
+        with client.use_proxy("p1:80"):
+            assert client.classify_page(b"png").state == "passed"
+        assert len(session.calls) == 4
+
+    def test_never_falls_back_to_direct_when_pool_is_dry(self, monkeypatch):
+        """换不到新 IP 时沿用当前代理计次重试，仍然不直连。"""
+        client, session, _handed = self._pooled(
+            monkeypatch, [RuntimeError("x")] * 5, [], timeout=2,
+        )
+        with client.use_proxy("p1:80"):
+            assert client.classify_page(b"png").state == "unknown"
+        assert all(item is not None for item in session.proxies)
+        assert {c["http"] for c in session.proxies} == {"p1:80"}
+
+    def test_skips_call_when_no_proxy_available_at_all(self, monkeypatch):
+        client, session, _handed = self._pooled(monkeypatch, [FakeResp()], [])
+        assert client.classify_page(b"png").state == "unknown"
+        assert session.calls == []          # 一次请求都没发
+
+    def test_optional_proxy_still_falls_back_to_direct(self, monkeypatch):
+        """require=False（没启用代理池）时保持原来的降级直连行为。"""
+        client, session, _handed = self._pooled(
+            monkeypatch, [RuntimeError("x"), FakeResp()], [], require=False,
+        )
+        with client.use_proxy("p1:80"):
+            assert client.classify_page(b"png").state == "passed"
+        assert session.proxies[0] is not None
+        assert session.proxies[1] is None
+
+    def test_wall_clock_deadline_stops_endless_swapping(self, monkeypatch):
+        """池子一直吐死代理时，靠墙钟上限收口，不会无限打转。"""
+        monkeypatch.setattr(vision_mod, "MIN_TASK_DEADLINE", 0.5)
+        monkeypatch.setattr(vision_mod, "TASK_DEADLINE_FACTOR", 0.1)
+        client, session = _client([RuntimeError("x")] * 500, monkeypatch, timeout=1)
+        counter = {"n": 0}
+
+        def provider():
+            counter["n"] += 1
+            return f"p{counter['n']}:80"
+
+        client.set_proxy_source(provider, require=True)
+        started = time.monotonic()
+        with client.use_proxy("p0:80"):
+            assert client.classify_page(b"png").state == "unknown"
+        assert time.monotonic() - started < 3.0
+        assert len(session.calls) < 500
 
     def test_proxy_failure_does_not_trigger_ai_cooldown(self, monkeypatch):
         """经代理超时说明代理有问题，不能据此判定 AI 端点过载。"""

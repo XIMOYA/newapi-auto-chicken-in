@@ -31,6 +31,12 @@ from . import prompts
 # AI 端点，一个线程超时说明端点已经吃不消，其他线程也该一起让一让。
 TIMEOUT_COOLDOWN = 10.0
 
+# cfg.timeout 是「单次请求」上限。换代理 IP 不限次数，所以整个任务另有一个
+# 墙钟上限兜底 = max(MIN_TASK_DEADLINE, cfg.timeout × TASK_DEADLINE_FACTOR)。
+# 没有它的话，池子一直吐死代理就会在这里无限打转。
+TASK_DEADLINE_FACTOR = 2.0
+MIN_TASK_DEADLINE = 60.0
+
 try:  # curl_cffi 的超时异常层级在不同版本里略有差异，缺失时退回错误码/文案判断
     from curl_cffi.requests.exceptions import Timeout as _CurlTimeout
 except (ImportError, AttributeError):  # pragma: no cover - 取决于依赖版本
@@ -82,6 +88,9 @@ class VisionClient:
         self._sessions: dict[int, object] = {}
         self._sessions_lock = threading.Lock()
         self._session_override = None
+        # 强制走代理时用来「再要一个 IP」的回调（由 Runner 注册）
+        self._proxy_provider = None
+        self._require_proxy = False
 
     def _new_session(self):
         return cffi.Session(
@@ -126,6 +135,27 @@ class VisionClient:
             yield
         finally:
             self._local.proxy = previous
+
+    def set_proxy_source(self, provider, require: bool = True) -> None:
+        """注册「再要一个代理」的回调。
+
+        provider() 每次返回一个可用代理地址（拿不到返回 None）。
+        require=True 表示 AI 请求**必须**走代理：代理连不上就换下一个，
+        不限次数，绝不退回直连暴露真实出口 IP。
+        """
+        self._proxy_provider = provider
+        self._require_proxy = bool(require)
+
+    def _next_proxy(self) -> Optional[str]:
+        provider = self._proxy_provider
+        if provider is None:
+            return None
+        try:
+            proxy = provider()
+        except Exception as exc:  # noqa: BLE001 - 取代理失败不该炸掉视觉调用
+            log.debug(f"获取新代理失败: {type(exc).__name__}: {exc}")
+            return None
+        return str(proxy).strip() or None if proxy else None
 
     @staticmethod
     def _proxies(proxy: Optional[str]) -> dict:
@@ -199,66 +229,89 @@ class VisionClient:
             return None
 
         attempts = max(1, self.cfg.max_retries + 1)
-        # 整个任务共享 cfg.timeout 这一份预算：重试不再线性放大等待时间
-        budget = max(1.0, float(self.cfg.timeout))
-        started = time.monotonic()
-        # 避让休眠是主动让路，不该算进请求预算里
-        paused = 0.0
+        # cfg.timeout 是单次请求上限；换 IP 不限次数，整个任务另有墙钟上限兜底
+        per_request = max(1.0, float(self.cfg.timeout))
+        deadline = time.monotonic() + max(MIN_TASK_DEADLINE,
+                                         per_request * TASK_DEADLINE_FACTOR)
+
         proxy = self.current_proxy()
-        proxy_dead = False
-        for attempt in range(1, attempts + 1):
+        if self._require_proxy and not proxy:
+            proxy = self._next_proxy()
+            if not proxy:
+                log.err("AI 强制走代理，但当前拿不到任何代理，跳过本次视觉调用")
+                return None
+
+        used = 0        # 计次重试（不含换 IP）
+        swaps = 0       # 换 IP 次数，不限
+        while used < attempts:
             # 每次发请求前都尊重全局避让：别人刚超时，本线程也一起等
-            paused += self._wait_cooldown()
-            remaining = budget - (time.monotonic() - started - paused)
-            if remaining <= 0.5:
-                log.debug(f"AI 调用预算 {budget:.0f}s 已用尽（第 {attempt}/{attempts} 次前）")
+            self._wait_cooldown()
+            left = deadline - time.monotonic()
+            if left <= 0.5:
+                log.warn(f"AI 调用已用满 {max(MIN_TASK_DEADLINE, per_request * TASK_DEADLINE_FACTOR):.0f}s "
+                         f"墙钟上限（第 {used + 1} 次尝试前，已换 {swaps} 次 IP）")
                 break
-            use_proxy = None if proxy_dead else proxy
-            # 代理不通时会一直挂到超时，所以只给它一半预算，留出直连兜底的时间
-            limit = min(remaining, max(5.0, budget * 0.5)) if use_proxy else remaining
+            limit = min(per_request, left)
             payload = self._payload(prompt, images, detail, max_tokens)
             try:
                 resp = self._session.post(self.cfg.chat_url, json=payload,
-                                          timeout=limit, **self._proxies(use_proxy))
+                                          timeout=limit, **self._proxies(proxy))
             except Exception as exc:  # noqa: BLE001
-                if use_proxy:
-                    # 经代理失败说明代理有问题，不能据此判定 AI 端点过载，
-                    # 所以不进避让，直接改走直连
-                    proxy_dead = True
-                    log.warn(f"AI 请求经代理失败({attempt}/{attempts})，改为直连重试: "
+                if proxy:
+                    # 经代理失败是代理的问题，不能据此判定 AI 端点过载，所以不进避让。
+                    # 换下一个 IP 继续，不计入 attempts（换 IP 不限次数）。
+                    nxt = self._next_proxy()
+                    if nxt and nxt != proxy:
+                        swaps += 1
+                        proxy = nxt
+                        log.warn(f"AI 请求经代理失败，换第 {swaps} 个 IP 重试: "
+                                 f"{type(exc).__name__}: {exc}"[:160])
+                        continue
+                    if self._require_proxy:
+                        # 换不到新 IP：按配置绝不直连，只能沿用当前代理计次重试
+                        used += 1
+                        log.warn(f"AI 请求经代理失败且暂无其他可用 IP，"
+                                 f"沿用当前代理重试({used}/{attempts})")
+                        continue
+                    proxy = None
+                    log.warn(f"AI 请求经代理失败，改为直连重试: "
                              f"{type(exc).__name__}: {exc}"[:160])
-                elif is_timeout(exc):
+                    continue
+                used += 1
+                if is_timeout(exc):
                     # 直连也超时基本等于模型侧过载/限流，立刻重发只会加重拥塞
                     self._enter_cooldown()
-                    log.warn(f"AI 请求超时({attempt}/{attempts})，"
+                    log.warn(f"AI 请求超时({used}/{attempts})，"
                              f"避让 {TIMEOUT_COOLDOWN:.0f}s 后再继续")
-                    paused += self._wait_cooldown()
+                    self._wait_cooldown()
                 else:
-                    log.debug(f"AI 请求异常({attempt}/{attempts}): {type(exc).__name__}: {exc}")
+                    log.debug(f"AI 请求异常({used}/{attempts}): {type(exc).__name__}: {exc}")
                 continue
 
+            used += 1
             if resp.status_code in (400, 415, 422) and self._json_mode:
-                # 模型/中转不支持 response_format，摘掉后重试
+                # 模型/中转不支持 response_format，摘掉后重试（不算一次失败）
                 log.debug(f"模型不支持 response_format（HTTP {resp.status_code}），改用 prompt 约束")
                 self._json_mode = False
+                used -= 1
                 continue
             if resp.status_code >= 400:
                 body = (resp.text or "")[:200]
-                log.debug(f"AI HTTP {resp.status_code}({attempt}/{attempts}): {body}")
+                log.debug(f"AI HTTP {resp.status_code}({used}/{attempts}): {body}")
                 continue
 
             text = self._content_of(resp)
             if not text:
-                log.debug(f"AI 返回空内容({attempt}/{attempts})")
+                log.debug(f"AI 返回空内容({used}/{attempts})")
                 continue
             parsed = loose_json(text)
             if parsed is None:
-                log.debug(f"AI 输出无法解析为 JSON({attempt}/{attempts}): {text[:160]}")
+                log.debug(f"AI 输出无法解析为 JSON({used}/{attempts}): {text[:160]}")
                 continue
             log.debug(f"AI 输出: {parsed}")
             return parsed
 
-        log.debug("AI 调用全部失败，交由上层降级")
+        log.debug(f"AI 调用全部失败（尝试 {used} 次、换 IP {swaps} 次），交由上层降级")
         return None
 
     @staticmethod
