@@ -38,9 +38,9 @@ web/src/views/ProxyPoolSettingsView.vue
           <n-input-number v-model:value="form.max_proxies" :min="1" :max="5000" class="num-input" />
           <span class="switch-tip">已不再生效：测通不设数量上限，保留仅为兼容旧配置</span>
         </n-form-item>
-        <n-form-item label="单账号换 IP 次数上限">
-          <n-input-number v-model:value="form.ip_swap_limit" :min="0" :max="50" class="num-input" />
-          <span class="switch-tip">代理连不上目标站点时，单个账号最多换几次 IP（不占用重试次数）</span>
+        <n-form-item label="单账号换 IP 次数上限（已废弃）">
+          <n-input-number v-model:value="form.ip_swap_limit" :min="0" :max="50" class="num-input" disabled />
+          <span class="switch-tip">网络异常时不限次数换 IP；换不到新 IP 或遇到源站/不可恢复问题才跳过。此字段仅兼容旧配置</span>
         </n-form-item>
         <n-form-item label="代理来源 Sources">
           <dynamic-string-list

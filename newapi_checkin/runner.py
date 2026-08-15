@@ -29,6 +29,14 @@ STRATEGY_LABEL = {
 _SHIELD_RETRYABLE = (api.CF_BLOCKED, api.TURNSTILE_REQUIRED)
 # 计次重试的结果：网络层瞬时故障、以及响应看不懂（可能是临时的网关页）
 _RETRYABLE = (api.NETWORK_ERROR, api.UNKNOWN) + _SHIELD_RETRYABLE
+# 源站/凭据/环境已经给出不可恢复结论：不再浪费重试，直接把账号标记为跳过。
+_SKIP_ON_FAILURE = (
+    api.FAILED,
+    api.AUTH_FAILED,
+    api.LOGIN_REQUIRED,
+    api.WAF_BLOCKED,
+    api.UNKNOWN,
+)
 # 这些结果说明请求本身通了，换策略也不会变，直接结束
 _SETTLED = (api.SUCCESS, api.ALREADY_DONE, api.AUTH_FAILED, api.FAILED)
 
@@ -96,10 +104,12 @@ class Runner:
                 self._report_proxy_capacity(count, accounts)
             else:
                 log.err(f"代理池为空: {self._pool.last_error}；"
-                        f"已要求必须走代理，本轮所有账号都会被跳过（不降级直连）")
+                        f"已要求必须走代理，没有自带代理的账号都会被跳过"
+                        f"（配了 accounts[].proxy 的账号照常执行，也不降级直连）")
         except Exception as exc:  # noqa: BLE001 - 初始化异常不能让进程崩掉
             log.err(f"代理池初始化失败: {type(exc).__name__}: {exc}；"
-                    f"已要求必须走代理，本轮所有账号都会被跳过（不降级直连）")
+                    f"已要求必须走代理，没有自带代理的账号都会被跳过"
+                    f"（配了 accounts[].proxy 的账号照常执行，也不降级直连）")
             self._pool = None
 
     def _proxy_required(self) -> bool:
@@ -110,16 +120,15 @@ class Runner:
         """提前说清楚有多少账号能独占 IP、多少要共用。"""
         if not accounts:
             return
-        swaps = self.cfg.proxy_pool.ip_swap_limit
         if count >= accounts:
             log.info(f"一账号一 IP：{accounts} 个账号 / {count} 个可用代理，"
-                     f"多出的 {count - accounts} 个是**所有账号共享**的换 IP 备用池"
-                     f"（单账号网络异常换 IP 配额 {swaps} 次，盾类重试不限次数）")
+                     f"多出的 {count - accounts} 个是所有账号共享的换 IP 备用池"
+                     f"（网络异常时持续换 IP，直到池里没有新的可用 IP）")
             return
         share = accounts - count
         log.warn(f"可用代理只有 {count} 个，少于 {accounts} 个账号："
                  f"前 {count} 个账号各独占一个 IP，其余 {share} 个会与它们共用 IP"
-                 f"（不会降级直连，单账号网络异常换 IP 配额 {swaps} 次）。代理来自服务器"
+                 f"（不会降级直连；网络异常时持续换 IP，直到没有新的可用 IP）。代理来自服务器"
                  f"预取时，数量由服务端 proxy_pool.save_limit 决定（0 = 不限制）；本地"
                  f"抓取时可调大 proxy_pool.max_workers 或增加 sources")
 
@@ -469,45 +478,40 @@ class Runner:
             return False
         return self._swap_proxy(account) is not None
 
-    def _run_account_with_retries(self, account: Account, record) -> log.SummaryRow:
-        """跑完一个账号。三类失败三种策略：
+    def _skip_after_failure(self, account: Account, row: log.SummaryRow,
+                            reason: str) -> log.SummaryRow:
+        """把源站/不可恢复问题统一记为 skipped，避免无意义重试。"""
+        detail = f"{reason}：{row.detail}" if row.detail else reason
+        log.warn(f"跳过账号：{detail}")
+        return log.SummaryRow(account.name, "skipped", row.strategy, detail, row.quota)
 
-        1. 盾类（被质询拦住 / 拿不到 Turnstile token）——换出口 IP + 重开浏览器，
-           **不限次数**试到成功，只受 ACCOUNT_DEADLINE_SECONDS 时间盒约束。
-           AI 请求失败最终也表现为盾没过，所以自动落进这一类。
-        2. 网络层失败（代理连不上目标站点）——换 IP 立即重试，
-           次数由 proxy_pool.ip_swap_limit 单独限（默认 10），不占重试次数。
-        3. 其余可重试结果（响应看不懂）——按 defaults.retry 计次 + 指数退避。
+    def _run_account_with_retries(self, account: Account, record) -> log.SummaryRow:
+        """跑完一个账号。失败按可恢复性分流：
+
+        1. 网络层失败：只要代理池还能给出新 IP，就无限换 IP 立即重试，不计入
+           defaults.retry，也不受 ip_swap_limit 影响；换不到新 IP 就跳过。
+        2. 盾类失败（Cloudflare/Turnstile）：换 IP + 重开浏览器，按账号总时间盒
+           重试；这是独立于网络异常的恢复路径。
+        3. 源站业务、认证、WAF 或其他不可恢复结果：直接跳过，不浪费重试次数。
         """
         deadline = time.monotonic() + ACCOUNT_DEADLINE_SECONDS
-        attempts = max(1, self.cfg.defaults.retry + 1)
-        # swaps_left 只是「网络异常」这一类的配额；盾类按设计不限次数，不扣它。
-        # 但两类都真的从池里换走了 IP，所以另记一个总数，日志才对得上实际消耗。
-        swaps_left = self.cfg.proxy_pool.ip_swap_limit if self._pool else 0
-        swapped_total = 0        # 本账号实际换掉的 IP 数（盾类 + 网络异常都算）
+        # 网络换 IP 不限次数；swapped_total 只用于说明实际消耗，不再显示“剩余配额”。
+        swapped_total = 0
         row: Optional[log.SummaryRow] = None
-        used = 0                 # 已消耗的计次重试（不含换 IP、不含盾类重试）
         shield_rounds = 0
-        skip_backoff = False
         while True:
-            if used > 0 and not skip_backoff:
-                backoff = min(8, 2 ** used)
-                log.info(f"第 {used + 1}/{attempts} 次尝试，退避 {backoff}s")
-                time.sleep(backoff)
-            skip_backoff = False
-
             row = self._attempt(account, record)
 
-            # 1) 网络层失败：换 IP 立即重试，不计入重试次数
-            if row.status == api.NETWORK_ERROR and swaps_left > 0:
+            # 1) 网络层失败：只要拿得到新 IP 就无限换，换不到就直接跳过。
+            if row.status == api.NETWORK_ERROR:
                 if self._swap_pooled_proxy(account):
-                    swaps_left -= 1
                     swapped_total += 1
-                    skip_backoff = True
                     log.warn(f"网络异常，已换 IP 立即重试（不计入重试次数，"
-                             f"网络异常配额还剩 {swaps_left} 次，"
                              f"本账号累计已换 {swapped_total} 个 IP）")
                     continue
+                return self._skip_after_failure(
+                    account, row, "网络异常且没有可用的新 IP，无法继续换出口"
+                )
 
             # 2) 盾类失败：换 IP + 重开浏览器，一直试到成功或时间盒用尽
             if row.status in _SHIELD_RETRYABLE and self._should_retry(row):
@@ -518,8 +522,11 @@ class Runner:
                     return row
                 shield_rounds += 1
                 swapped = self._swap_pooled_proxy(account)
-                if swapped:
-                    swapped_total += 1
+                if not swapped:
+                    return self._skip_after_failure(
+                        account, row, "盾类问题且没有可用的新 IP，无法继续恢复"
+                    )
+                swapped_total += 1
                 backoff = min(SHIELD_RETRY_BACKOFF_MAX, 5 * shield_rounds)
                 backoff = min(backoff, max(0.0, left - 1))
                 label = log.STATUS_LABEL.get(row.status, row.status)
@@ -529,18 +536,18 @@ class Runner:
                          + f"，退避 {backoff:.0f}s，剩余时间盒 {left:.0f}s")
                 if backoff > 0:
                     time.sleep(backoff)
-                skip_backoff = True
                 continue
 
-            # 3) 其余可重试结果：按 defaults.retry 计次
-            if not self._should_retry(row):
-                return row
-            used += 1
-            if used >= attempts:
-                if row.status == api.NETWORK_ERROR:
-                    log.warn(f"已用满 {attempts} 次尝试"
-                             + ("（换 IP 次数也已用尽）" if self._pool else ""))
-                return row
+            # 源站业务/认证/WAF/未知响应：已经给出不可恢复结论，直接跳过。
+            if row.status in _SKIP_ON_FAILURE:
+                return self._skip_after_failure(account, row, "源站或不可恢复问题")
+
+            # 没有浏览器时，盾类问题无法自行恢复，直接跳过而不是空转。
+            if row.status in _SHIELD_RETRYABLE and not self.options.use_browser:
+                return self._skip_after_failure(account, row, "盾类问题且未启用浏览器")
+
+            # 3) 其他结果不再做无意义重试
+            return row
 
     def _attempt(self, account: Account, record) -> log.SummaryRow:
         ip = self.exit_ip(account.proxy)

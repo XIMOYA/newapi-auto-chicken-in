@@ -47,10 +47,10 @@ class TestRetrySemantics:
 
         monkeypatch.setattr(runner, "_attempt", fake_attempt)
         row = runner._run_account(runner.cfg.accounts[0])
-        assert row.status == api.FAILED
-        assert len(calls) == 1  # retry=2 也只跑一次
+        assert row.status == "skipped"
+        assert len(calls) == 1  # 源站业务结果直接跳过，不进入 retry
 
-    def test_turnstile_without_browser_is_not_retried(self, tmp_path, monkeypatch):
+    def test_turnstile_without_browser_is_skipped(self, tmp_path, monkeypatch):
         """没有浏览器时拿不到 token 是死局，不该空转。"""
         runner = _make_runner(tmp_path, monkeypatch, use_browser=False)
         calls = []
@@ -58,20 +58,22 @@ class TestRetrySemantics:
             runner, "_attempt",
             lambda account, record: (calls.append(1), _row(account.name, api.TURNSTILE_REQUIRED))[1],
         )
-        assert runner._run_account(runner.cfg.accounts[0]).status == api.TURNSTILE_REQUIRED
+        assert runner._run_account(runner.cfg.accounts[0]).status == "skipped"
         assert len(calls) == 1
 
-    def test_network_error_is_retried(self, tmp_path, monkeypatch):
+    def test_network_error_without_new_ip_is_skipped(self, tmp_path, monkeypatch):
+        """网络问题换不到新 IP 时直接跳过，不在原 IP 上浪费 retry。"""
         runner = _make_runner(tmp_path, monkeypatch)
         calls = []
         monkeypatch.setattr(
             runner, "_attempt",
             lambda account, record: (calls.append(1), _row(account.name, api.NETWORK_ERROR))[1],
         )
-        runner._run_account(runner.cfg.accounts[0])
-        assert len(calls) == 3  # retry=2 -> 3 次
+        row = runner._run_account(runner.cfg.accounts[0])
+        assert row.status == "skipped"
+        assert len(calls) == 1
 
-    def test_cf_blocked_without_browser_is_not_retried(self, tmp_path, monkeypatch):
+    def test_cf_blocked_without_browser_is_skipped(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, use_browser=False)
         calls = []
         monkeypatch.setattr(
@@ -79,7 +81,7 @@ class TestRetrySemantics:
             lambda account, record: (calls.append(1), _row(account.name, api.CF_BLOCKED))[1],
         )
         runner._run_account(runner.cfg.accounts[0])
-        assert len(calls) == 1  # 没有浏览器，重试只会拿到同一个质询页
+        assert len(calls) == 1  # 没有浏览器，盾类问题直接跳过
 
 
 class TestShieldRetriesUntilDeadline:
@@ -91,6 +93,9 @@ class TestShieldRetriesUntilDeadline:
         monkeypatch.setattr(runner_mod, "ACCOUNT_DEADLINE_SECONDS", deadline)
         monkeypatch.setattr(runner_mod, "SHIELD_RETRY_BACKOFF_MAX", 0)
         monkeypatch.setattr(runner_mod.time, "sleep", lambda _s: None)
+        # 盾类重试的前提是能换到新出口；没有池的场景由专门测试覆盖为 skipped。
+        if runner.options.use_browser and runner._pool is None:
+            runner._pool = _EndlessPool()
         calls = []
 
         def fake_attempt(account, record):
@@ -146,11 +151,7 @@ class TestShieldRetriesUntilDeadline:
         assert calls == ["p1:80", "p2:80", "p3:80"]     # 每轮一个新出口 IP
 
     def test_shield_swaps_are_counted_in_the_log(self, tmp_path, monkeypatch):
-        """盾类换 IP 按设计不扣 ip_swap_limit 配额，但必须计入累计数。
-
-        不计的话日志会睁眼说瞎话：盾类已经换掉好几个 IP、旧 IP 都被拉黑了，
-        后面一次网络异常仍然报「配额还剩 N-1 次」，跟实际消耗完全脱节。
-        """
+        """盾类换 IP 不限次数，但必须计入累计数。"""
         cfg = cfgmod.build_config(
             {
                 "proxy_pool": {"enabled": True, "ip_swap_limit": 5},
@@ -188,7 +189,7 @@ class TestShieldRetriesUntilDeadline:
 
 
 class TestNetworkErrorSwapsIP:
-    """网络异常时换 IP 是「修复动作」，不消耗 defaults.retry 的次数。"""
+    """网络异常时只要有新 IP 就无限换，换不到新 IP 就跳过。"""
 
     @staticmethod
     def _runner(tmp_path, monkeypatch, *, retry=2, ip_swap_limit=2, pool=True):
@@ -210,22 +211,42 @@ class TestNetworkErrorSwapsIP:
             runner._pool = _EndlessPool()
         return runner, cfg.accounts[0]
 
-    def test_swap_does_not_consume_retry_budget(self, tmp_path, monkeypatch):
-        runner, account = self._runner(tmp_path, monkeypatch, retry=2, ip_swap_limit=2)
-        proxies = []
+    def test_network_swaps_are_unlimited_and_do_not_show_remaining_quota(self, tmp_path, monkeypatch):
+        """网络异常不看 ip_swap_limit：有新 IP 就一直换，日志不再显示剩余次数。"""
+        runner, account = self._runner(tmp_path, monkeypatch, retry=0, ip_swap_limit=0)
+        runner._pool = _EndlessPool()
+        warnings: list = []
+        monkeypatch.setattr(runner_mod.log, "warn", warnings.append)
+        results = [api.NETWORK_ERROR, api.NETWORK_ERROR, api.NETWORK_ERROR, api.SUCCESS]
         monkeypatch.setattr(
             runner, "_attempt",
-            lambda acct, record: (proxies.append(acct.proxy),
-                                  _row(acct.name, api.NETWORK_ERROR))[1],
+            lambda acct, record: _row(acct.name, results.pop(0)),
         )
         runner._assign_proxy(account)
-        row = runner._run_account(account)
-        assert row.status == api.NETWORK_ERROR
-        # 2 次换 IP（不计次）+ retry=2 允许的 3 次尝试 = 5 次
-        assert len(proxies) == 5
-        # 前三次各用一个新 IP，换完之后就在最后一个 IP 上做真正的重试
-        assert proxies[:3] == ["p1:80", "p2:80", "p3:80"]
-        assert proxies[3:] == ["p3:80", "p3:80"]
+        assert runner._run_account(account).status == api.SUCCESS
+        swap_logs = [w for w in warnings if "网络异常，已换 IP" in w]
+        assert len(swap_logs) == 3
+        assert all("剩余" not in w and "配额" not in w for w in swap_logs)
+        assert "累计已换 3 个 IP" in swap_logs[-1]
+
+    def test_network_swap_log_no_longer_reports_quota(self, tmp_path, monkeypatch):
+        """网络异常日志只显示实际累计消耗，不显示已废弃的配额口径。"""
+        runner, account = self._runner(tmp_path, monkeypatch, retry=0, ip_swap_limit=1)
+        runner._pool = _EndlessPool()
+        warnings: list = []
+        monkeypatch.setattr(runner_mod.log, "warn", warnings.append)
+        results = [api.NETWORK_ERROR, api.SUCCESS]
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: _row(acct.name, results.pop(0)),
+        )
+        runner._assign_proxy(account)
+        runner._run_account(account)
+        swap_logs = [w for w in warnings if "网络异常，已换 IP" in w]
+        assert len(swap_logs) == 1
+        assert "剩余" not in swap_logs[0]
+        assert "配额" not in swap_logs[0]
+        assert "累计已换 1 个 IP" in swap_logs[0]
 
     def test_swap_is_immediate_without_backoff(self, tmp_path, monkeypatch):
         """换 IP 后立刻重试，不走退避——新 IP 没有必要先罚站。"""
@@ -241,33 +262,18 @@ class TestNetworkErrorSwapsIP:
         assert runner._run_account(account).status == api.SUCCESS
         assert slept == []          # 全程没有退避
 
-    def test_retry_budget_still_applies_after_swaps_run_out(self, tmp_path, monkeypatch):
-        runner, account = self._runner(tmp_path, monkeypatch, retry=1, ip_swap_limit=1)
+    def test_network_without_new_ip_is_skipped(self, tmp_path, monkeypatch):
+        """网络异常但没有新的代理可换时直接跳过，不在原 IP 上重试。"""
+        runner, account = self._runner(tmp_path, monkeypatch, retry=1, ip_swap_limit=1,
+                                       pool=False)
         calls = []
         monkeypatch.setattr(
             runner, "_attempt",
-            lambda acct, record: (calls.append(1),
-                                  _row(acct.name, api.NETWORK_ERROR))[1],
+            lambda acct, record: (calls.append(1), _row(acct.name, api.NETWORK_ERROR))[1],
         )
-        runner._assign_proxy(account)
-        runner._run_account(account)
-        assert len(calls) == 3      # 1 次换 IP + retry=1 允许的 2 次
-
-    def test_network_swap_log_reports_quota_and_running_total(self, tmp_path, monkeypatch):
-        """网络异常换 IP 的日志要同时给出剩余配额和累计已换数。"""
-        runner, account = self._runner(tmp_path, monkeypatch, retry=0, ip_swap_limit=2)
-        warnings: list = []
-        monkeypatch.setattr(runner_mod.log, "warn", warnings.append)
-        monkeypatch.setattr(
-            runner, "_attempt",
-            lambda acct, record: _row(acct.name, api.NETWORK_ERROR),
-        )
-        runner._assign_proxy(account)
-        runner._run_account(account)
-        swap_logs = [w for w in warnings if "网络异常，已换 IP" in w]
-        assert len(swap_logs) == 2
-        assert "配额还剩 1 次" in swap_logs[0] and "累计已换 1 个" in swap_logs[0]
-        assert "配额还剩 0 次" in swap_logs[1] and "累计已换 2 个" in swap_logs[1]
+        row = runner._run_account(account)
+        assert row.status == "skipped"
+        assert len(calls) == 1
 
     def test_manual_proxy_is_never_swapped(self, tmp_path, monkeypatch):
         runner, account = self._runner(tmp_path, monkeypatch, retry=1, ip_swap_limit=2)
@@ -279,9 +285,9 @@ class TestNetworkErrorSwapsIP:
                                   _row(acct.name, api.NETWORK_ERROR))[1],
         )
         runner._assign_proxy(account)          # 手动代理不会被池覆盖
-        runner._run_account(account)
-        assert set(proxies) == {"http://fixed.example.com:8080"}
-        assert len(proxies) == 2               # 退回纯重试：retry=1 -> 2 次
+        row = runner._run_account(account)
+        assert row.status == "skipped"
+        assert proxies == ["http://fixed.example.com:8080"]
 
     def test_business_failure_never_swaps(self, tmp_path, monkeypatch):
         runner, account = self._runner(tmp_path, monkeypatch, retry=2, ip_swap_limit=2)
@@ -292,10 +298,11 @@ class TestNetworkErrorSwapsIP:
                                   _row(acct.name, api.FAILED))[1],
         )
         runner._assign_proxy(account)
-        runner._run_account(account)
-        assert proxies == ["p1:80"]            # 业务失败既不重试也不换 IP
+        row = runner._run_account(account)
+        assert row.status == "skipped"
+        assert proxies == ["p1:80"]            # 源站业务失败直接跳过
 
-    def test_without_pool_falls_back_to_plain_retry(self, tmp_path, monkeypatch):
+    def test_without_pool_network_error_is_skipped(self, tmp_path, monkeypatch):
         runner, account = self._runner(tmp_path, monkeypatch, retry=2, pool=False)
         calls = []
         monkeypatch.setattr(
@@ -303,8 +310,9 @@ class TestNetworkErrorSwapsIP:
             lambda acct, record: (calls.append(1),
                                   _row(acct.name, api.NETWORK_ERROR))[1],
         )
-        runner._run_account(account)
-        assert len(calls) == 3
+        row = runner._run_account(account)
+        assert row.status == "skipped"
+        assert len(calls) == 1
 
 
 class _EndlessPool:

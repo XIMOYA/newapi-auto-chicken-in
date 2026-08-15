@@ -174,13 +174,22 @@ def build_report_html(rows: list, *, date_str: str, run_context: str = "GitHub A
     failed_count = len(failed)
     skipped_count = sum(1 for r in rows if r.status == "skipped")
 
-    if failed_count == 0:
+    if failed_count == 0 and skipped_count == 0:
         banner_bg = "linear-gradient(135deg,#059669,#10b981)"
         banner_fallback = "#059669"
         banner_label = "全部成功"
         banner_label_color = "#065f46"
         banner_label_bg = "#d1fae5"
         headline = f"今日全部签到成功！ {ok_count}/{total}"
+    elif failed_count == 0:
+        # 没有失败但有跳过（缺 cookie、拿不到代理等）：不能报「全部成功」，
+        # 分母也要去掉跳过的，否则会出现「全部签到成功！ 3/5」这种自相矛盾的话
+        banner_bg = "linear-gradient(135deg,#d97706,#f59e0b)"
+        banner_fallback = "#d97706"
+        banner_label = f"{skipped_count} 个跳过"
+        banner_label_color = "#92400e"
+        banner_label_bg = "#fef3c7"
+        headline = f"已签到 {ok_count}/{total - skipped_count}，另有 {skipped_count} 个账号被跳过"
     else:
         banner_bg = "linear-gradient(135deg,#dc2626,#ef4444)"
         banner_fallback = "#dc2626"
@@ -206,11 +215,14 @@ def build_report_html(rows: list, *, date_str: str, run_context: str = "GitHub A
         f'</div></div>'
     )
 
-    # ---- KPI 统计卡：总账号 / 成功 / 失败 ----
+    # ---- KPI 统计卡：总账号 / 成功 / 失败（有跳过时补第四张，否则会漏掉这批账号）----
+    kpi_cells = 4 if skipped_count else 3
+    kpi_width = f"{100 / kpi_cells:.1f}%"
+
     def _kpi(value, label, color, dot_color=None):
         dot = dot_color or color
         return (
-            "<td style='width:33.3%;text-align:center;padding:18px 8px 16px;'>"
+            f"<td style='width:{kpi_width};text-align:center;padding:18px 8px 16px;'>"
             f"<div style='font-size:27px;font-weight:800;color:{color};"
             f"font-variant-numeric:tabular-nums;line-height:1.2;'>{value}</div>"
             f"<div style='font-size:11px;color:#94a3b8;margin-top:6px;"
@@ -226,6 +238,7 @@ def build_report_html(rows: list, *, date_str: str, run_context: str = "GitHub A
         + _kpi(ok_count, "成功", "#059669")
         + _kpi(failed_count, "失败", "#dc2626" if failed_count else "#cbd5e1",
                dot_color="#dc2626" if failed_count else "#cbd5e1")
+        + (_kpi(skipped_count, "跳过", "#d97706") if skipped_count else "")
         + "</tr></table>"
     )
 

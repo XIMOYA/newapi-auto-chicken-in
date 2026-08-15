@@ -80,6 +80,42 @@ class TestReportHtml:
         assert "2</div>" in html  # 成功
         assert "1</div>" in html  # 失败
 
+    def test_skipped_accounts_are_not_reported_as_all_success(self):
+        """有账号被跳过时不能报「全部成功」，分母也不能把跳过的算进去。
+
+        原来 failed_count 排除了 skipped，5 个账号里 3 成功 2 跳过会打出
+        「今日全部签到成功！ 3/5」，横幅还是绿色「全部成功」，跳过的两个
+        账号在 KPI 里根本看不见。
+        """
+        rows = [
+            make_row("A", "success"),
+            make_row("B", "already_done"),
+            make_row("C", "success"),
+            make_row("D", "skipped"),
+            make_row("E", "skipped"),
+        ]
+        html = nt.build_report_html(rows, date_str="2026-08-12")
+        assert "今日全部签到成功" not in html
+        assert "3/3" in html                    # 分母去掉了 2 个跳过的
+        assert "另有 2 个账号被跳过" in html
+        assert "2 个跳过" in html               # 横幅胶囊
+        assert "跳过</div>" in html             # KPI 第四张卡
+        assert "linear-gradient(135deg,#d97706" in html   # 橙色而非绿色
+
+    def test_all_success_without_skips_keeps_green_banner(self):
+        rows = [make_row("A", "success"), make_row("B", "already_done")]
+        html = nt.build_report_html(rows, date_str="2026-08-12")
+        assert "今日全部签到成功" in html
+        assert "linear-gradient(135deg,#059669" in html
+        assert "跳过</div>" not in html         # 没有跳过就不加第四张卡
+
+    def test_failure_takes_precedence_over_skips(self):
+        rows = [make_row("A", "network_error"), make_row("B", "skipped")]
+        html = nt.build_report_html(rows, date_str="2026-08-12")
+        assert "有 1 个账号签到失败" in html
+        assert "linear-gradient(135deg,#dc2626" in html
+        assert "跳过</div>" in html             # 失败态也要能看到跳过数
+
     def test_quota_shown(self):
         rows = [make_row("A", "success", quota=500000)]
         html = nt.build_report_html(rows, date_str="2026-08-12")

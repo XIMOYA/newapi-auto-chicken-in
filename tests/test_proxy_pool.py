@@ -270,7 +270,7 @@ def test_manual_proxy_not_overwritten(monkeypatch, tmp_path):
     assert account.name not in runner._pooled_proxies  # 不会被池记录，也不会被换
 
 
-def test_swap_limit_respected(monkeypatch, tmp_path):
+def test_network_swaps_until_pool_is_empty_then_skips(monkeypatch, tmp_path):
     runner = _make_runner(monkeypatch, tmp_path, pool_proxies=["p1:80", "p2:80", "p3:80"])
     calls = []
 
@@ -282,9 +282,9 @@ def test_swap_limit_respected(monkeypatch, tmp_path):
     account = runner.cfg.accounts[0]
     runner._assign_proxy(account)
     row = runner._run_account(account)
-    assert row.status == "network_error"
-    # ip_swap_limit=2：p1 失败换 p2，p2 失败换 p3，p3 失败没得换，共 3 次尝试
-    assert len(calls) == 3
+    assert row.status == "skipped"
+    # 不看 ip_swap_limit：p1 -> p2 -> p3，池空后直接跳过，不在 p3 上继续 retry
+    assert calls == ["p1:80", "p2:80", "p3:80"]
 
 
 class TestAIProxyBlacklisting:
@@ -591,10 +591,10 @@ class TestOneProxyPerAccount:
         monkeypatch.setattr(runner_mod.log, "info", infos.append)
         runner._report_proxy_capacity(15, 10)
         assert infos and "一账号一 IP" in infos[0] and "5 个" in infos[0]
-        # 备用池是所有账号共享的，不能让人以为每个账号都有整份配额
+        # 备用池是所有账号共享的，且网络异常时会持续换到池耗尽
         assert "共享" in infos[0]
-        assert "配额 2 次" in infos[0]      # _make_runner 里 ip_swap_limit=2
-        assert "盾类重试不限次数" in infos[0]
+        assert "持续换 IP" in infos[0]
+        assert "配额" not in infos[0]
 
     def test_shortage_points_at_the_server_side_limit(self, monkeypatch, tmp_path):
         """代理不够时要指明数量由服务端 save_limit 决定，否则没人知道去哪调。"""

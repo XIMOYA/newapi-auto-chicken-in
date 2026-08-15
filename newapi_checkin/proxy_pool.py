@@ -69,7 +69,7 @@ class ProxyPoolConfig:
     timeout: int = 8
     max_workers: int = 25       # 并发测通数。候选上千时把它调大才跑得快
     max_proxies: int = 250      # 已废弃：测通不再设数量上限，保留只为配置兼容
-    ip_swap_limit: int = 10     # 目标站点连不上时最多换几次 IP
+    ip_swap_limit: int = 10     # 已废弃：网络异常换 IP 不限次数，保留只为兼容旧配置
     sources: list = field(default_factory=list)   # 空 = 用内置默认源
     # 服务器端代理池预取：配置管理平台已提前抓取+测通，签到前直接拉现成列表，
     # 省去本地抓源+测通（remote_url 非空且请求成功时优先使用，失败降级本地抓取）
@@ -134,6 +134,9 @@ class ProxyPool:
         self._bad: set[str] = set()
         # 代理 -> 正在用它的账号数。池子用尽时按这个值把账号摊到各 IP 上
         self._share_count: dict[str, int] = {}
+        # 上一次 _test_many 真正测完的候选数（时间盒截断时小于候选总数），
+        # 只用于日志口径：分母必须是「测完的」而不是「提交的」
+        self._last_tested = 0
         self._lock = threading.RLock()
         self.last_error = ""
 
@@ -207,7 +210,8 @@ class ProxyPool:
         if not addrs:
             self.last_error = "远程代理预取列表为空"
             return None
-        log.debug(f"远程代理预取: {len(addrs)} 条（来源 {data.get('checked_at', '?')}）")
+        log.debug(f"远程代理预取: {len(addrs)} 条（服务端测通时间 "
+                  f"{data.get('checked_at', '?')}）")
         return addrs
 
     def _refresh_local(self, desired: Optional[int] = None) -> int:
@@ -248,12 +252,22 @@ class ProxyPool:
             self._bad.clear()
             self._share_count.clear()
         elapsed = time.monotonic() - started
+        # 分母必须是「真正测完的候选数」。时间盒截断时若拿总候选数当分母，
+        # 会打出「12/3000 条可用」，让人误以为 3000 条全测过、可用率极低。
+        tested = self._last_tested or len(candidates)
+        truncated = tested < len(candidates)
         if not alive:
-            self.last_error = "代理候选均未通过连通性测试"
+            self.last_error = (f"已测的 {tested} 条代理候选均未通过连通性测试"
+                               if truncated else "代理候选均未通过连通性测试")
             log.warn(self.last_error)
             return 0
-        log.info(f"代理池测通完成: {len(alive)}/{len(candidates)} 条可用，"
-                 f"耗时 {elapsed:.1f}s")
+        if truncated:
+            log.info(f"代理池测通完成: {len(alive)}/{tested} 条可用"
+                     f"（{budget:.0f}s 时间盒内只测完 {tested}/{len(candidates)} 条候选），"
+                     f"耗时 {elapsed:.1f}s")
+        else:
+            log.info(f"代理池测通完成: {len(alive)}/{tested} 条可用，"
+                     f"耗时 {elapsed:.1f}s")
         return len(alive)
 
     def _fetch_all_sources(self) -> list[list[str]]:
@@ -320,12 +334,14 @@ class ProxyPool:
             return []
         workers = max(1, min(self.cfg.max_workers, len(candidates)))
         alive: list[str] = []
+        tested = 0
         pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="probe")
         try:
             futures = {pool.submit(self._test_one, proxy): proxy for proxy in candidates}
             timeout = None if deadline is None else max(0.1, deadline - time.monotonic())
             try:
                 for future in as_completed(futures, timeout=timeout):
+                    tested += 1
                     try:
                         ok = future.result()
                     except Exception:  # noqa: BLE001 - 探测失败一律按不通
@@ -335,8 +351,10 @@ class ProxyPool:
                         if need is not None and len(alive) >= need:
                             break
             except FuturesTimeout:
-                log.debug(f"代理测通到达时间盒，本批只收到 {len(alive)} 条可用")
+                log.debug(f"代理测通到达时间盒，本批只收到 {len(alive)} 条可用"
+                          f"（已测 {tested}/{len(candidates)} 条）")
         finally:
+            self._last_tested = tested
             # 已经够用了就别再等剩余候选各自超时；wait=False 立即返回
             pool.shutdown(wait=False, cancel_futures=True)
         return alive
@@ -390,7 +408,7 @@ class ProxyPool:
             proxy = min(healthy, key=lambda p: self._share_count.get(p, 1))
             self._share_count[proxy] = self._share_count.get(proxy, 1) + 1
             shared = self._share_count[proxy]
-        log.warn(f"代理池已无空闲 IP，改为共用 {proxy}（该 IP 上已有 {shared} 个账号）")
+        log.warn(f"代理池已无空闲 IP，改为共用 {proxy}（含本账号，该 IP 上共 {shared} 个账号在用）")
         return proxy
 
     def mark_bad(self, proxy: Optional[str]) -> None:

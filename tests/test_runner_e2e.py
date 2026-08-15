@@ -140,25 +140,25 @@ class TestFailures:
     def test_auth_failure_does_not_retry(self, server, wire):
         STATE["mode"] = "auth"
         runner = make_runner(server)
-        assert runner.run() == 1
-        assert runner.summary.rows[0].status == "auth_failed"
+        assert runner.run() == 0
+        assert runner.summary.rows[0].status == "skipped"
         # cookie 过期重试无意义，只能请求一次
         assert STATE["hits"].count(("GET", "/api/user/self")) == 1
 
     def test_cf_blocked_without_browser(self, server, wire):
         STATE["mode"] = "cf"
         runner = make_runner(server)
-        assert runner.run() == 1
+        assert runner.run() == 0
         row = runner.summary.rows[0]
-        assert row.status == "cf_blocked"
+        assert row.status == "skipped"
         assert "no-browser" in row.detail or "禁用" in row.detail
 
     def test_waf_block_is_terminal_and_not_retried(self, server, wire):
         """WAF 硬封禁不是质询，重试只会加重风控，必须一次就停。"""
         STATE["mode"] = "waf"
         runner = make_runner(server)
-        assert runner.run() == 1
-        assert runner.summary.rows[0].status == "waf_block"
+        assert runner.run() == 0
+        assert runner.summary.rows[0].status == "skipped"
         assert STATE["hits"].count(("GET", "/api/user/self")) == 1
 
     def test_missing_cookie_is_skipped(self, server, wire):
@@ -202,8 +202,8 @@ class TestSessionCache:
 
         STATE["mode"] = "cf"
         runner = make_runner(server)
-        assert runner.run() == 1
-        assert runner.summary.rows[0].status == "cf_blocked"
+        assert runner.run() == 0
+        assert runner.summary.rows[0].status == "skipped"
 
         reloaded = SessionStore(wire / "sessions.json")
         assert reloaded.get(cfgmod.slugify("本地站")).cf is None
