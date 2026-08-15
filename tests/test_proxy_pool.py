@@ -60,7 +60,7 @@ class TestProxyPoolConfig:
         assert cfg.timeout == 8
         assert cfg.max_workers == 25
         assert cfg.max_proxies == 250
-        assert cfg.ip_swap_limit == 2
+        assert cfg.ip_swap_limit == 5
         assert cfg.sources == []  # 空 = 用内置默认源
 
     def test_from_raw_overrides(self):

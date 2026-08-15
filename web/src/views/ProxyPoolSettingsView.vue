@@ -116,7 +116,7 @@ const form = reactive<ProxyPoolConfig>({
   timeout: 8,
   max_workers: 25,
   max_proxies: 250,
-  ip_swap_limit: 2,
+  ip_swap_limit: 5,
   sources: [],
   refresh_minutes: 30,
   save_limit: 100,

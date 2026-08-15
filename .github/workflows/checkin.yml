@@ -47,7 +47,10 @@ concurrency:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 不设 timeout-minutes：走 GitHub 的默认值 360 分钟（6 小时，也是平台硬上限）。
+    # 真正控制总时长的是程序里的「单账号时间盒」ACCOUNT_DEADLINE_SECONDS：
+    # 盾类失败会不限次数地换 IP + 重开浏览器重试，直到该账号的时间盒用尽，
+    # 所以整轮上限约为 ceil(账号数 / --parallel) × 单账号时间盒。
     steps:
       - name: 检出代码
         uses: actions/checkout@v4

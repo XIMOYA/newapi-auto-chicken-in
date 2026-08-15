@@ -188,7 +188,7 @@ func DefaultConfig() Config {
 			Timeout:          8,
 			MaxWorkers:       25,
 			MaxProxies:       250,
-			IPSwapLimit:      2,
+			IPSwapLimit:      5,
 			Sources:          []string{},
 			RefreshMinutes:   30,
 			SaveLimit:        100,

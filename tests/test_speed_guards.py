@@ -50,8 +50,9 @@ class TestRetrySemantics:
         assert row.status == api.FAILED
         assert len(calls) == 1  # retry=2 也只跑一次
 
-    def test_turnstile_required_is_not_retried(self, tmp_path, monkeypatch):
-        runner = _make_runner(tmp_path, monkeypatch)
+    def test_turnstile_without_browser_is_not_retried(self, tmp_path, monkeypatch):
+        """没有浏览器时拿不到 token 是死局，不该空转。"""
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=False)
         calls = []
         monkeypatch.setattr(
             runner, "_attempt",
@@ -80,28 +81,76 @@ class TestRetrySemantics:
         runner._run_account(runner.cfg.accounts[0])
         assert len(calls) == 1  # 没有浏览器，重试只会拿到同一个质询页
 
-    def test_cf_blocked_stops_after_browser_quota(self, tmp_path, monkeypatch):
-        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+
+class TestShieldRetriesUntilDeadline:
+    """被盾拦住 / 拿不到 Turnstile token：换 IP + 重开浏览器，一直试到成功。"""
+
+    @staticmethod
+    def _wire(runner, monkeypatch, statuses, *, deadline=0.6):
+        """把时间盒缩到亚秒级，并让退避不真的睡。"""
+        monkeypatch.setattr(runner_mod, "ACCOUNT_DEADLINE_SECONDS", deadline)
+        monkeypatch.setattr(runner_mod, "SHIELD_RETRY_BACKOFF_MAX", 0)
+        monkeypatch.setattr(runner_mod.time, "sleep", lambda _s: None)
         calls = []
 
         def fake_attempt(account, record):
-            calls.append(1)
-            runner._take_browser_attempt(account)   # 模拟真实路径里的配额消耗
-            return _row(account.name, api.CF_BLOCKED)
+            calls.append(account.proxy)
+            index = min(len(calls) - 1, len(statuses) - 1)
+            return _row(account.name, statuses[index])
 
         monkeypatch.setattr(runner, "_attempt", fake_attempt)
-        runner._run_account(runner.cfg.accounts[0])
-        assert len(calls) == runner_mod._BROWSER_ATTEMPTS_PER_ACCOUNT
+        return calls
 
+    def test_cf_blocked_retries_many_times_then_gives_up_on_deadline(self, tmp_path, monkeypatch):
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        calls = self._wire(runner, monkeypatch, [api.CF_BLOCKED])
+        row = runner._run_account(runner.cfg.accounts[0])
+        assert row.status == api.CF_BLOCKED
+        # 不再是「2 次就收手」，而是被时间盒收口，轮数远多于 defaults.retry+1
+        assert len(calls) > 5
 
-class TestBrowserAttemptQuota:
-    def test_quota_is_per_account_and_finite(self, tmp_path, monkeypatch):
+    def test_turnstile_is_treated_like_cf_blocked(self, tmp_path, monkeypatch):
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        calls = self._wire(runner, monkeypatch, [api.TURNSTILE_REQUIRED])
+        assert runner._run_account(runner.cfg.accounts[0]).status == api.TURNSTILE_REQUIRED
+        assert len(calls) > 5
+
+    def test_stops_immediately_once_it_succeeds(self, tmp_path, monkeypatch):
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        calls = self._wire(
+            runner, monkeypatch,
+            [api.CF_BLOCKED, api.TURNSTILE_REQUIRED, api.CF_BLOCKED, api.SUCCESS],
+        )
+        assert runner._run_account(runner.cfg.accounts[0]).status == api.SUCCESS
+        assert len(calls) == 4
+
+    def test_each_shield_round_swaps_the_exit_ip(self, tmp_path, monkeypatch):
+        """「更换浏览器和 IP」——每一轮都要换出口 IP，而不是死磕同一个。"""
+        cfg = cfgmod.build_config(
+            {
+                "proxy_pool": {"enabled": True, "ip_swap_limit": 5},
+                "defaults": {"retry": 2, "interval_seconds": [0, 0]},
+                "accounts": [{"name": "A", "url": "https://a.example.com", "cookie": "c"}],
+            }
+        )
+        monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
+        monkeypatch.setattr(runner_mod, "probe_exit_ip", lambda proxy=None, timeout=5: None)
+        runner = runner_mod.Runner(
+            cfg, runner_mod.RunOptions(use_ai=False, use_browser=True)
+        )
+        runner._pool = _EndlessPool()
+        calls = self._wire(runner, monkeypatch, [api.CF_BLOCKED, api.CF_BLOCKED, api.SUCCESS])
+        account = runner.cfg.accounts[0]
+        runner._assign_proxy(account)
+        assert runner._run_account(account).status == api.SUCCESS
+        assert calls == ["p1:80", "p2:80", "p3:80"]     # 每轮一个新出口 IP
+
+    def test_browser_relaunch_is_no_longer_capped(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, accounts=2, use_browser=True)
         first, second = runner.cfg.accounts
-        taken = [runner._take_browser_attempt(first) for _ in range(4)]
-        assert taken == [True] * runner_mod._BROWSER_ATTEMPTS_PER_ACCOUNT + \
-            [False] * (4 - runner_mod._BROWSER_ATTEMPTS_PER_ACCOUNT)
-        # 另一个账号有自己的配额
+        assert all(runner._take_browser_attempt(first) for _ in range(10))
+        with runner._state_lock:
+            assert runner._browser_attempts[first.name] == 10
         assert runner._take_browser_attempt(second) is True
 
 

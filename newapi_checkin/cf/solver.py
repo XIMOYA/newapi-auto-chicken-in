@@ -191,7 +191,8 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
                     "Turnstile 判定当前环境（数据中心 IP）不可信，进入交互质询且未能自动通过；"
                     "可尝试给该账号配置住宅代理，或联系站点管理员关闭该要求"
                 )
-            return SolveOutcome(False, "S4", cf=cf, api_result=result, detail=detail)
+            return SolveOutcome(False, "S4", cf=cf, api_result=result, detail=detail,
+                                result_kind=api.TURNSTILE_REQUIRED)
 
     if result is not None and result.kind in (api.SUCCESS, api.ALREADY_DONE):
         return SolveOutcome(True, "S4", cf=cf, api_result=result,

@@ -23,10 +23,12 @@ STRATEGY_LABEL = {
     "S5": "S5 人工兜底",
 }
 
-# 只有这些结果重试才有意义：都属于「链路/环境的瞬时问题」。
-# 其余结果（签到成功/已签/认证失败/未登录/WAF 封禁/业务明确失败/缺 token）
-# 再跑一遍完整策略链只会白烧时间——尤其是每轮都要冷启动一次浏览器。
-_RETRYABLE = (api.NETWORK_ERROR, api.CF_BLOCKED, api.UNKNOWN)
+# 「盾类」失败：被质询拦住、或拿不到 Turnstile token。
+# 这两种都靠「换出口 IP + 重开浏览器」翻盘，所以不限次数地重试，
+# 只由 ACCOUNT_DEADLINE_SECONDS 这个时间盒收口。
+_SHIELD_RETRYABLE = (api.CF_BLOCKED, api.TURNSTILE_REQUIRED)
+# 计次重试的结果：网络层瞬时故障、以及响应看不懂（可能是临时的网关页）
+_RETRYABLE = (api.NETWORK_ERROR, api.UNKNOWN) + _SHIELD_RETRYABLE
 # 这些结果说明请求本身通了，换策略也不会变，直接结束
 _SETTLED = (api.SUCCESS, api.ALREADY_DONE, api.AUTH_FAILED, api.FAILED)
 
@@ -36,9 +38,11 @@ DEFAULT_ACCOUNT_PARALLELISM = 3
 MAX_ACCOUNT_PARALLELISM = 16
 # 浏览器实例并发的自动推导上限（每个实例约占一个核心）
 MAX_BROWSER_PARALLELISM = 4
-# 单账号最多启动几次浏览器过盾。浏览器冷启动 + 质询等待是整条链路里最贵的一步，
-# 换 IP 不会重置这份配额，所以「换 IP 不计入重试」不会把浏览器开销放大。
-_BROWSER_ATTEMPTS_PER_ACCOUNT = 2
+# 单账号的总时长上限（秒）。盾类失败是「不限次数重试到成功」，必须有一个
+# 时间盒兜底，否则一个卡住的账号会占死一个并发位，把整轮拖到 Actions 超时。
+ACCOUNT_DEADLINE_SECONDS = 900
+# 盾类重试的退避上限（秒）。连续硬刚 Cloudflare 只会让质询更难过
+SHIELD_RETRY_BACKOFF_MAX = 30
 
 
 @dataclass
@@ -225,25 +229,25 @@ class Runner:
         return max(1, min(accounts_workers, auto))
 
     def _take_browser_attempt(self, account: Account) -> bool:
-        """领取一次浏览器过盾配额；返回 False 表示该账号已用满。"""
+        """记录一次浏览器过盾（只用于日志/统计，不再限次）。
+
+        盾类失败的策略是「换 IP + 重开浏览器，一直试到成功」，所以这里不再拦；
+        真正的收口是 _run_account_with_retries 里的时间盒。
+        """
         with self._state_lock:
-            used = self._browser_attempts.get(account.name, 0)
-            if used >= _BROWSER_ATTEMPTS_PER_ACCOUNT:
-                return False
-            self._browser_attempts[account.name] = used + 1
-            return True
+            used = self._browser_attempts.get(account.name, 0) + 1
+            self._browser_attempts[account.name] = used
+        if used > 1:
+            log.debug(f"第 {used} 次启动浏览器过盾")
+        return True
 
     def _should_retry(self, row: log.SummaryRow) -> bool:
-        """只对瞬时失败重试。其余结果重跑整条链路是纯浪费。"""
+        """判断这个结果值不值得再来一轮。"""
         if row.status not in _RETRYABLE:
             return False
-        if row.status == api.CF_BLOCKED:
-            if not self.options.use_browser:
-                # 没有浏览器可用，再试也只会拿到同一个质询页
-                return False
-            with self._state_lock:
-                if self._browser_attempts.get(row.name, 0) >= _BROWSER_ATTEMPTS_PER_ACCOUNT:
-                    return False
+        if row.status in _SHIELD_RETRYABLE and not self.options.use_browser:
+            # 没有浏览器可用，再试也只会拿到同一个质询页
+            return False
         return True
 
     def run(self) -> int:
@@ -432,39 +436,61 @@ class Runner:
         return self._swap_proxy(account) is not None
 
     def _run_account_with_retries(self, account: Account, record) -> log.SummaryRow:
-        """跑完一个账号，网络层失败自动换 IP。
+        """跑完一个账号。三类失败三种策略：
 
-        defaults.retry 只用于「同一个出口 IP 上的瞬时失败」。网络层失败几乎都是
-        代理本身死了，这时正确的修复动作是换 IP 而不是在死代理上干等重试，所以
-        换 IP **不消耗重试次数**，改由 proxy_pool.ip_swap_limit 单独限次。
-
-        总迭代次数因此被 (defaults.retry + 1) + ip_swap_limit 双重上限夹住；
-        真正昂贵的浏览器过盾另有 _BROWSER_ATTEMPTS_PER_ACCOUNT 限次，
-        换 IP 不会把它放大。
+        1. 盾类（被质询拦住 / 拿不到 Turnstile token）——换出口 IP + 重开浏览器，
+           **不限次数**试到成功，只受 ACCOUNT_DEADLINE_SECONDS 时间盒约束。
+           AI 请求失败最终也表现为盾没过，所以自动落进这一类。
+        2. 网络层失败（代理连不上目标站点）——换 IP 立即重试，
+           次数由 proxy_pool.ip_swap_limit 单独限（默认 5），不占重试次数。
+        3. 其余可重试结果（响应看不懂）——按 defaults.retry 计次 + 指数退避。
         """
+        deadline = time.monotonic() + ACCOUNT_DEADLINE_SECONDS
         attempts = max(1, self.cfg.defaults.retry + 1)
         swaps_left = self.cfg.proxy_pool.ip_swap_limit if self._pool else 0
         row: Optional[log.SummaryRow] = None
-        used = 0                 # 已消耗的重试次数（不含换 IP）
-        just_swapped = False
+        used = 0                 # 已消耗的计次重试（不含换 IP、不含盾类重试）
+        shield_rounds = 0
+        skip_backoff = False
         while True:
-            if used > 0 and not just_swapped:
+            if used > 0 and not skip_backoff:
                 backoff = min(8, 2 ** used)
                 log.info(f"第 {used + 1}/{attempts} 次尝试，退避 {backoff}s")
                 time.sleep(backoff)
-            just_swapped = False
+            skip_backoff = False
 
             row = self._attempt(account, record)
 
-            # 网络层失败：先换 IP，且不计入重试次数
+            # 1) 网络层失败：换 IP 立即重试，不计入重试次数
             if row.status == api.NETWORK_ERROR and swaps_left > 0:
                 if self._swap_pooled_proxy(account):
                     swaps_left -= 1
-                    just_swapped = True
+                    skip_backoff = True
                     log.warn(f"网络异常，已换 IP 立即重试（不计入重试次数，"
                              f"剩余换 IP 次数 {swaps_left}）")
                     continue
 
+            # 2) 盾类失败：换 IP + 重开浏览器，一直试到成功或时间盒用尽
+            if row.status in _SHIELD_RETRYABLE and self._should_retry(row):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    log.err(f"盾类重试已用满 {ACCOUNT_DEADLINE_SECONDS}s 时间盒，"
+                            f"共尝试 {shield_rounds + 1} 轮，放弃该账号")
+                    return row
+                shield_rounds += 1
+                swapped = self._swap_pooled_proxy(account)
+                backoff = min(SHIELD_RETRY_BACKOFF_MAX, 5 * shield_rounds)
+                backoff = min(backoff, max(0.0, left - 1))
+                label = log.STATUS_LABEL.get(row.status, row.status)
+                log.warn(f"{label}：第 {shield_rounds} 轮重试"
+                         + ("（已换出口 IP）" if swapped else "（无新 IP 可换，沿用当前 IP）")
+                         + f"，退避 {backoff:.0f}s，剩余时间盒 {left:.0f}s")
+                if backoff > 0:
+                    time.sleep(backoff)
+                skip_backoff = True
+                continue
+
+            # 3) 其余可重试结果：按 defaults.retry 计次
             if not self._should_retry(row):
                 return row
             used += 1
@@ -516,13 +542,7 @@ class Runner:
         if not self.options.use_browser:
             return self._row(account, result, "S1", detail="已禁用浏览器过盾（--no-browser）")
 
-        if not self._take_browser_attempt(account):
-            return self._row(
-                account, result, "S1",
-                detail=f"已连续 {_BROWSER_ATTEMPTS_PER_ACCOUNT} 次浏览器过盾失败，"
-                       f"不再重复启动浏览器（换出口 IP 或检查 cookie 更有效）",
-            )
-
+        self._take_browser_attempt(account)
         return self._solve(account, record, ip, result)
 
     # ------------------------------------------------------------------ #
