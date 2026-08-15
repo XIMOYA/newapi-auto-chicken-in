@@ -20,8 +20,10 @@ web/src/views/ExportView.vue
 
       <n-alert type="info" :bordered="false" class="export-tip">
         <template #icon><n-icon><information-circle-outline /></n-icon></template>
-        导出完整明文 config.json（含 Cookie 等敏感信息）。请将内容保存到 GitHub Secret
-        <n-text code>CONFIG_JSON</n-text> 作为兜底，供 GitHub Actions 在无法从远程拉取时直接使用。
+        导出完整明文 config.json（含 Cookie 等敏感信息）。GitHub Actions 推荐将其转换为
+        base64 后保存到 Secret <n-text code>CONFIG_JSON_B64</n-text>，避免 GitHub 对结构化 JSON
+        自动脱敏时误把账号名、IP、user_id 或普通数字替换为星号；<n-text code>CONFIG_JSON</n-text>
+        仍作为兼容兜底。
       </n-alert>
 
       <n-spin :show="loading">

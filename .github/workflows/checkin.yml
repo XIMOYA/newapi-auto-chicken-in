@@ -8,9 +8,18 @@
 #   2. workflow_dispatch —— 仓库 Actions 页面手动运行，可选 dry-run 只验连通性。
 #
 # 首次使用前必须配置（重要！）：
-#   GitHub 仓库 -> Settings -> Secrets and variables -> Actions -> New secret
-#     Name:  CONFIG_JSON
-#     Value: 完整 config.json 文件内容（含 13 个账号 cookie 与 AI api_key）
+#   GitHub 仓库 -> Settings and variables -> Actions -> New repository secret
+#     Name:  CONFIG_JSON_B64（推荐）
+#     Value: 完整 config.json 的 base64 文本（含账号 cookie 与 AI api_key）
+#
+#   Windows PowerShell 生成方式：
+#     [Convert]::ToBase64String([IO.File]::ReadAllBytes('config.json'))
+#   Linux/macOS 生成方式：
+#     base64 -w 0 config.json
+#
+#   兼容旧配置：仍支持 CONFIG_JSON（直接存完整 JSON），但结构化 Secret 会让
+#   GitHub 自动脱敏误命中 JSON 内的账号名、IP、user_id 和数字；迁移到
+#   CONFIG_JSON_B64 后，日志中的普通业务数字不会再被 Secret 掩码误伤。
 #
 # 【公共仓库安全须知】
 #   - Secret 的值只有仓库所有者/管理员可见，日志中会被 GitHub 自动打码为 ***；
@@ -19,7 +28,7 @@
 #       * 日志会公开显示账号名、站点 URL、AI 的 base_url 和 /api/user/self
 #         返回的用户名（cookie 与 api_key 已在程序内脱敏打印）；
 #       * 注意：账号名现在会出现在**每一行**日志前缀里（并行时用来区分账号），
-#         所以强烈建议把 config.json 里的 name 换成 A1/站点1 这类代号；
+#         所以仍建议把 config.json 里的 name 换成 A1/站点1 这类代号；
 #   - fork 的仓库不会继承你的 secret，别人 fork 后无法读取你的配置。
 # ============================================================================ #
 
@@ -91,18 +100,25 @@ jobs:
 
       - name: 写入配置（来自 GitHub Secrets）
         env:
+          CONFIG_JSON_B64: ${{ secrets.CONFIG_JSON_B64 }}
           CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
         run: |
-          if [ -z "$CONFIG_JSON" ]; then
-            echo "::error::未设置 CONFIG_JSON secret。请到仓库 Settings -> Secrets -> Actions 添加，值为完整 config.json 内容"
+          if [ -n "$CONFIG_JSON_B64" ]; then
+            printf '%s' "$CONFIG_JSON_B64" | base64 --decode > config.json
+            CONFIG_SOURCE="CONFIG_JSON_B64"
+          elif [ -n "$CONFIG_JSON" ]; then
+            printf '%s' "$CONFIG_JSON" > config.json
+            CONFIG_SOURCE="CONFIG_JSON（兼容旧配置，建议迁移到 CONFIG_JSON_B64）"
+          else
+            echo "::error::未设置 CONFIG_JSON_B64 secret。请添加完整 config.json 的 base64 文本；旧 CONFIG_JSON 仍兼容"
             exit 2
           fi
-          python - <<'PY'
-          import json, os, pathlib
-          raw = os.environ["CONFIG_JSON"]
+          python - "$CONFIG_SOURCE" <<'PY'
+          import json, pathlib, sys
+          path = pathlib.Path("config.json")
+          raw = path.read_text(encoding="utf-8")
           json.loads(raw)  # 先校验是合法 JSON，避免写入坏配置
-          pathlib.Path("config.json").write_text(raw, encoding="utf-8")
-          print("config.json 已写入（校验通过）")
+          print(f"config.json 已写入（来源 {sys.argv[1]}，校验通过）")
           PY
 
       - name: 开始签到（headless 真无头 + 固定 4 账号并发 + 2 浏览器并发）
