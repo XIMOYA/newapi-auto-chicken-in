@@ -30,7 +30,8 @@ _SHIELD_RETRYABLE = (api.CF_BLOCKED, api.TURNSTILE_REQUIRED)
 # 计次重试的结果：网络层瞬时故障、以及响应看不懂（可能是临时的网关页）
 _RETRYABLE = (api.NETWORK_ERROR, api.UNKNOWN) + _SHIELD_RETRYABLE
 # 源站业务失败/WAF 硬封禁可能是出口 IP 被源站临时风控，允许有限换 IP 后再判定。
-SOURCE_IP_SWAP_LIMIT = 3
+SOURCE_IP_SWAP_LIMIT = 5
+SOURCE_IP_SWAP_BACKOFF_SECONDS = 5
 _SOURCE_IP_RETRYABLE = (api.FAILED, api.WAF_BLOCKED)
 # 源站/凭据/环境已经给出不可恢复结论：不再浪费重试，直接把账号标记为跳过。
 _SKIP_ON_FAILURE = (
@@ -491,13 +492,14 @@ class Runner:
 
         1. 网络层失败：只要代理池还能给出新 IP，就无限换 IP 立即重试，不计入
            defaults.retry，也不受 ip_swap_limit 影响；换不到新 IP 就跳过。
-        2. 源站业务失败/WAF 硬封禁：额外换最多 3 次 IP；仍是同类问题就跳过。
+        2. 源站业务失败/WAF 硬封禁：额外换最多 5 次 IP，每次等待 5 秒；
+           仍是同类问题就跳过。
         3. 盾类失败（Cloudflare/Turnstile）：换 IP + 重开浏览器，按账号总时间盒
            重试；这是独立于网络异常的恢复路径。
         4. 认证、未知或其他不可恢复结果：直接跳过，不浪费重试次数。
         """
         deadline = time.monotonic() + ACCOUNT_DEADLINE_SECONDS
-        # 网络换 IP 不限次数；源站/WAF 只允许额外换三次；两类都记入真实累计数。
+        # 网络换 IP 不限次数；源站/WAF 只允许额外换五次；两类都记入真实累计数。
         swapped_total = 0
         source_swaps = 0
         row: Optional[log.SummaryRow] = None
@@ -516,14 +518,17 @@ class Runner:
                     account, row, "网络异常且没有可用的新 IP，无法继续换出口"
                 )
 
-            # 2) 源站业务失败/WAF 硬封禁：最多额外换三次 IP，仍是同类问题就跳过。
+            # 2) 源站业务失败/WAF 硬封禁：最多额外换五次 IP，每次等待 5 秒，
+            #    仍是同类问题就跳过。sleep 只阻塞当前账号 worker，不持有全局锁。
             if row.status in _SOURCE_IP_RETRYABLE:
                 if source_swaps < SOURCE_IP_SWAP_LIMIT and self._swap_pooled_proxy(account):
                     source_swaps += 1
                     swapped_total += 1
                     label = "WAF 硬封禁" if row.status == api.WAF_BLOCKED else "源站返回失败"
                     log.warn(f"{label}，换 IP 重试（已换第 {source_swaps}/{SOURCE_IP_SWAP_LIMIT} 个，"
-                             f"本账号累计已换 {swapped_total} 个 IP）")
+                             f"本账号累计已换 {swapped_total} 个 IP，等待 "
+                             f"{SOURCE_IP_SWAP_BACKOFF_SECONDS}s）")
+                    time.sleep(SOURCE_IP_SWAP_BACKOFF_SECONDS)
                     continue
                 return self._skip_after_failure(
                     account, row,
