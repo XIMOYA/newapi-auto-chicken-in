@@ -160,7 +160,29 @@ func (m *ProxyManager) LastError() string  { m.mu.RLock(); defer m.mu.RUnlock();
 func (m *ProxyManager) IsRunning() bool    { m.mu.RLock(); defer m.mu.RUnlock(); return m.running }
 
 // fetchSource 抓取单个代理源，返回 host:port 列表。
+// - 抓源超时与测通超时解耦：源文件可能几百 KB，8s 太紧会误杀慢源，用独立超时
+// - 失败自动重试 1 次：网络抖动可恢复，避免一次失败就废掉整个源
 func fetchSource(url string, timeout int) []string {
+	fetchTimeout := timeout * 3
+	if fetchTimeout < 15 {
+		fetchTimeout = 15
+	}
+	if fetchTimeout > 60 {
+		fetchTimeout = 60
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		items := fetchSourceOnce(url, fetchTimeout)
+		if items != nil {
+			return items
+		}
+		if attempt == 1 {
+			log.Printf("[proxy] 源 %s 第 1 次抓取失败，重试…", url)
+		}
+	}
+	return nil
+}
+
+func fetchSourceOnce(url string, timeout int) []string {
 	client := &http.Client{Timeout: time.Duration(timeout) * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
