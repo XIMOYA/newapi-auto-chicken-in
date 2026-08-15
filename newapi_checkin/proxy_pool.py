@@ -69,7 +69,7 @@ class ProxyPoolConfig:
     timeout: int = 8
     max_workers: int = 25       # 并发测通数。候选上千时把它调大才跑得快
     max_proxies: int = 250      # 已废弃：测通不再设数量上限，保留只为配置兼容
-    ip_swap_limit: int = 5      # 目标站点连不上时最多换几次 IP
+    ip_swap_limit: int = 10     # 目标站点连不上时最多换几次 IP
     sources: list = field(default_factory=list)   # 空 = 用内置默认源
     # 服务器端代理池预取：配置管理平台已提前抓取+测通，签到前直接拉现成列表，
     # 省去本地抓源+测通（remote_url 非空且请求成功时优先使用，失败降级本地抓取）
@@ -93,7 +93,7 @@ class ProxyPoolConfig:
             # 上限放宽到 512：全量测通几千条候选时，25 并发要跑十几分钟
             max_workers=max(1, min(512, _as_int(raw.get("max_workers"), 25))),
             max_proxies=max(1, min(100000, _as_int(raw.get("max_proxies"), 250))),
-            ip_swap_limit=max(0, min(20, _as_int(raw.get("ip_swap_limit"), 5))),
+            ip_swap_limit=max(0, min(50, _as_int(raw.get("ip_swap_limit"), 10))),
             sources=sources,
             remote_url=str(raw.get("remote_url") or "").strip(),
             remote_token=str(raw.get("remote_token") or "").strip(),

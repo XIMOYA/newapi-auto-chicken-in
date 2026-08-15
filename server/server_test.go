@@ -136,6 +136,15 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.ProxyPool.TestURL != "https://api.ipify.org" {
 		t.Errorf("ProxyPool.TestURL 默认值不符合契约: %q", cfg.ProxyPool.TestURL)
 	}
+	if cfg.ProxyPool.SaveLimit != 0 {
+		t.Errorf("ProxyPool.SaveLimit 默认应为 0（不限量），得到 %d", cfg.ProxyPool.SaveLimit)
+	}
+	if cfg.ProxyPool.IPSwapLimit != 10 {
+		t.Errorf("ProxyPool.IPSwapLimit 默认应为 10，得到 %d", cfg.ProxyPool.IPSwapLimit)
+	}
+	if cfg.ConfigVersion != currentConfigVersion {
+		t.Errorf("ConfigVersion 默认应为 %d，得到 %d", currentConfigVersion, cfg.ConfigVersion)
+	}
 	if cfg.Notify.Email.SubjectPrefix != "NewAPI 签到日报" || cfg.Notify.Email.SMTPHost != "smtp.aliyun.com" {
 		t.Errorf("Notify.Email 默认值不符合契约: %+v", cfg.Notify.Email)
 	}

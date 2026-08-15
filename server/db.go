@@ -18,6 +18,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -267,6 +268,42 @@ func EnsureDefaultConfig(db *sql.DB) error {
 	}
 	if _, err := SaveConfig(db, DefaultConfig()); err != nil {
 		return err
+	}
+	return nil
+}
+
+// MigrateConfig 一次性升级旧配置里过时的默认值（幂等，靠 config_version 判定）。
+//
+// v0 -> v1：
+//   - proxy_pool.save_limit  旧默认 100 -> 0（不限制，上游有多少可用就存多少）
+//   - proxy_pool.ip_swap_limit 旧默认 5 -> 10
+//
+// 只在 config_version 缺失/为 0 时跑一次，跑完就写入版本号；之后用户在界面上
+// 改成什么都不会再被覆盖。旧库里这两个值等于旧默认值时才动，用户显式改成别的
+// 值一律保留。
+func MigrateConfig(db *sql.DB) error {
+	cfg, _, err := LoadConfig(db)
+	if err != nil {
+		return err
+	}
+	if cfg.ConfigVersion >= currentConfigVersion {
+		return nil
+	}
+	var changed []string
+	if cfg.ProxyPool.SaveLimit == 100 {
+		cfg.ProxyPool.SaveLimit = 0
+		changed = append(changed, "save_limit 100 -> 0（不限制）")
+	}
+	if cfg.ProxyPool.IPSwapLimit == 5 {
+		cfg.ProxyPool.IPSwapLimit = 10
+		changed = append(changed, "ip_swap_limit 5 -> 10")
+	}
+	cfg.ConfigVersion = currentConfigVersion
+	if _, err := SaveConfig(db, cfg); err != nil {
+		return err
+	}
+	if len(changed) > 0 {
+		log.Printf("[config] 旧配置默认值已升级: %s", strings.Join(changed, "；"))
 	}
 	return nil
 }

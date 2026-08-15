@@ -110,15 +110,18 @@ class Runner:
         """提前说清楚有多少账号能独占 IP、多少要共用。"""
         if not accounts:
             return
+        swaps = self.cfg.proxy_pool.ip_swap_limit
         if count >= accounts:
             log.info(f"一账号一 IP：{accounts} 个账号 / {count} 个可用代理，"
-                     f"余量 {count - accounts} 个可用于换 IP")
+                     f"余量 {count - accounts} 个可用于换 IP"
+                     f"（单账号最多换 {swaps} 次）")
             return
         share = accounts - count
         log.warn(f"可用代理只有 {count} 个，少于 {accounts} 个账号："
                  f"前 {count} 个账号各独占一个 IP，其余 {share} 个会与它们共用 IP"
-                 f"（不会降级直连）。想让每个账号都独占就调大 proxy_pool.max_workers "
-                 f"以测通更多候选、或增加 sources")
+                 f"（不会降级直连，单账号最多换 {swaps} 次 IP）。代理来自服务器预取时，"
+                 f"数量由服务端 proxy_pool.save_limit 决定（0 = 不限制）；本地抓取时"
+                 f"可调大 proxy_pool.max_workers 或增加 sources")
 
     def _assign_proxy(self, account: Account) -> None:
         """给账号分配代理。手动配置的优先；否则从池里取（用尽时共用，绝不直连）。"""
@@ -473,7 +476,7 @@ class Runner:
            **不限次数**试到成功，只受 ACCOUNT_DEADLINE_SECONDS 时间盒约束。
            AI 请求失败最终也表现为盾没过，所以自动落进这一类。
         2. 网络层失败（代理连不上目标站点）——换 IP 立即重试，
-           次数由 proxy_pool.ip_swap_limit 单独限（默认 5），不占重试次数。
+           次数由 proxy_pool.ip_swap_limit 单独限（默认 10），不占重试次数。
         3. 其余可重试结果（响应看不懂）——按 defaults.retry 计次 + 指数退避。
         """
         deadline = time.monotonic() + ACCOUNT_DEADLINE_SECONDS

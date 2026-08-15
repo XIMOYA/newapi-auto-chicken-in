@@ -63,6 +63,10 @@ func main() {
 	if err := EnsureDefaultConfig(db); err != nil {
 		log.Fatalf("初始化默认配置失败: %v", err)
 	}
+	// 已有库可能还带着旧默认值（save_limit=100 / ip_swap_limit=5），升级一次
+	if err := MigrateConfig(db); err != nil {
+		log.Fatalf("升级旧配置失败: %v", err)
+	}
 
 	srv := NewServer(db, jwtSecret)
 	log.Printf("NewAPI 签到配置管理平台已启动，监听 %s（数据库: %s）", addr, dbPath)

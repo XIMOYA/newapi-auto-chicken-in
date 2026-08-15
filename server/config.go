@@ -18,18 +18,22 @@ import (
 // MaskPlaceholder 敏感字段占位符：前端展示打码值，后端识别为「未修改，保留原值」。
 const MaskPlaceholder = "***"
 
+// currentConfigVersion 用于一次性迁移旧默认值。旧配置没有该字段，视为 0。
+const currentConfigVersion = 1
+
 // Config 完整配置对象 = 契约文档中的顶层结构。
 type Config struct {
-	Accounts   []Account     `json:"accounts"`
-	Sites      []Site        `json:"sites"`
-	AI         AIConfig      `json:"ai"`
-	Browser    BrowserConfig `json:"browser"`
-	HTTP       HTTPConfig    `json:"http"`
-	Defaults   Defaults      `json:"defaults"`
-	ProxyPool  ProxyPool     `json:"proxy_pool"`
-	Notify     Notify        `json:"notify"`
-	ConfigSync ConfigSync    `json:"config_sync"`
-	Security   Security      `json:"security"`
+	ConfigVersion int           `json:"config_version"`
+	Accounts      []Account     `json:"accounts"`
+	Sites         []Site        `json:"sites"`
+	AI            AIConfig      `json:"ai"`
+	Browser       BrowserConfig `json:"browser"`
+	HTTP          HTTPConfig    `json:"http"`
+	Defaults      Defaults      `json:"defaults"`
+	ProxyPool     ProxyPool     `json:"proxy_pool"`
+	Notify        Notify        `json:"notify"`
+	ConfigSync    ConfigSync    `json:"config_sync"`
+	Security      Security      `json:"security"`
 }
 
 // Site 站点预设：供新增账号时快速选择，自动带出 URL 与接口路径。
@@ -153,8 +157,9 @@ type Security struct {
 // DefaultConfig 返回契约文档规定的「配置对象默认结构」。
 func DefaultConfig() Config {
 	return Config{
-		Accounts: []Account{},
-		Sites:    []Site{},
+		ConfigVersion: currentConfigVersion,
+		Accounts:      []Account{},
+		Sites:         []Site{},
 		AI: AIConfig{
 			Enabled:    false,
 			BaseURL:    "",
@@ -188,7 +193,7 @@ func DefaultConfig() Config {
 			Timeout:           8,
 			MaxWorkers:        25,
 			MaxProxies:        250,
-			IPSwapLimit:       5,
+			IPSwapLimit:       10,
 			Sources:           []string{},
 			RefreshMinutes:    30,
 			SaveLimit:         0,

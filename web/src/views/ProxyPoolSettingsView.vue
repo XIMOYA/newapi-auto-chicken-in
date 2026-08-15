@@ -34,12 +34,13 @@ web/src/views/ProxyPoolSettingsView.vue
         <n-form-item label="最大并发测试数">
           <n-input-number v-model:value="form.max_workers" :min="1" :max="500" class="num-input" />
         </n-form-item>
-        <n-form-item label="代理池容量上限">
+        <n-form-item label="代理池容量上限（已废弃）">
           <n-input-number v-model:value="form.max_proxies" :min="1" :max="5000" class="num-input" />
+          <span class="switch-tip">已不再生效：测通不设数量上限，保留仅为兼容旧配置</span>
         </n-form-item>
-        <n-form-item label="IP 更换阈值（次）">
-          <n-input-number v-model:value="form.ip_swap_limit" :min="0" :max="100" class="num-input" />
-          <span class="switch-tip">单个隧道使用达到该次数后更换</span>
+        <n-form-item label="单账号换 IP 次数上限">
+          <n-input-number v-model:value="form.ip_swap_limit" :min="0" :max="50" class="num-input" />
+          <span class="switch-tip">代理连不上目标站点时，单个账号最多换几次 IP（不占用重试次数）</span>
         </n-form-item>
         <n-form-item label="代理来源 Sources">
           <dynamic-string-list
@@ -116,7 +117,7 @@ const form = reactive<ProxyPoolConfig>({
   timeout: 8,
   max_workers: 25,
   max_proxies: 250,
-  ip_swap_limit: 5,
+  ip_swap_limit: 10,
   sources: [],
   refresh_minutes: 30,
   save_limit: 0,

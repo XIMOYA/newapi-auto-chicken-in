@@ -60,7 +60,7 @@ class TestProxyPoolConfig:
         assert cfg.timeout == 8
         assert cfg.max_workers == 25
         assert cfg.max_proxies == 250
-        assert cfg.ip_swap_limit == 5
+        assert cfg.ip_swap_limit == 10
         assert cfg.sources == []  # 空 = 用内置默认源
 
     def test_from_raw_overrides(self):
@@ -471,6 +471,40 @@ class TestFullSweep:
         assert pool.last_error
 
 
+class TestRemotePrefetchIsUncapped:
+    """服务器预取：上游返回多少就全部收下，不受 desired / max_proxies 影响。"""
+
+    @staticmethod
+    def _pool(addrs):
+        pool = ProxyPool(ProxyPoolConfig(
+            remote_url="https://cfg.example.com/api/proxies/available",
+            max_proxies=100,          # 已废弃字段，不该再截断任何东西
+        ))
+        pool._fetch_remote = lambda: list(addrs)   # 绕开真实 HTTP
+        return pool
+
+    def test_keeps_every_remote_entry(self):
+        addrs = [f"10.0.{i // 250}.{i % 250}:8080" for i in range(600)]
+        pool = self._pool(addrs)
+        # desired 远小于上游数量，也不能拿它去截断
+        assert pool.refresh(desired=36) == 600
+        assert len(pool._available) == 600
+
+    def test_local_sweep_is_skipped_when_remote_succeeds(self, monkeypatch):
+        called = []
+        pool = self._pool(["1.1.1.1:80", "2.2.2.2:80"])
+        monkeypatch.setattr(pool, "_refresh_local",
+                            lambda desired=None: called.append(desired) or 0)
+        assert pool.refresh(desired=5) == 2
+        assert called == []          # 远程成功就不该再本地抓源测通
+
+    def test_falls_back_to_local_when_remote_empty(self, monkeypatch):
+        pool = self._pool([])
+        pool._fetch_remote = lambda: None
+        monkeypatch.setattr(pool, "_refresh_local", lambda desired=None: 7)
+        assert pool.refresh(desired=5) == 7
+
+
 class TestOneProxyPerAccount:
     def test_every_account_gets_a_distinct_ip(self, monkeypatch, tmp_path):
         """核心不变量：同一次运行内任何两个账号不会拿到同一个代理。"""
@@ -557,6 +591,16 @@ class TestOneProxyPerAccount:
         monkeypatch.setattr(runner_mod.log, "info", infos.append)
         runner._report_proxy_capacity(15, 10)
         assert infos and "一账号一 IP" in infos[0] and "余量 5" in infos[0]
+        # 换 IP 次数上限要一起报出来，方便在 Actions 日志里确认生效值
+        assert "最多换 2 次" in infos[0]      # _make_runner 里 ip_swap_limit=2
+
+    def test_shortage_points_at_the_server_side_limit(self, monkeypatch, tmp_path):
+        """代理不够时要指明数量由服务端 save_limit 决定，否则没人知道去哪调。"""
+        runner = _make_runner(monkeypatch, tmp_path, pool_proxies=[])
+        warnings = []
+        monkeypatch.setattr(runner_mod.log, "warn", warnings.append)
+        runner._report_proxy_capacity(3, 10)
+        assert warnings and "save_limit" in warnings[0]
 
     def test_swapped_proxy_is_never_reassigned(self, monkeypatch, tmp_path):
         runner = _make_runner(monkeypatch, tmp_path, pool_proxies=["p1:80", "p2:80", "p3:80"])
