@@ -196,7 +196,8 @@ class TestAIRequiresProxy:
     """AI 强制走代理：代理不通就换下一个 IP，不限次数，绝不退回直连。"""
 
     @staticmethod
-    def _pooled(monkeypatch, script, proxies, *, require=True, timeout=5):
+    def _pooled(monkeypatch, script, proxies, *, require=True, timeout=5,
+                dropped=None):
         client, session = _client(script, monkeypatch, timeout=timeout)
         supply = list(proxies)
         handed: list = []
@@ -208,7 +209,10 @@ class TestAIRequiresProxy:
             handed.append(proxy)
             return proxy
 
-        client.set_proxy_source(provider, require=require)
+        client.set_proxy_source(
+            provider, require=require,
+            on_failed=(dropped.append if dropped is not None else None),
+        )
         return client, session, handed
 
     def test_swaps_ip_instead_of_going_direct(self, monkeypatch):
@@ -260,6 +264,63 @@ class TestAIRequiresProxy:
             assert client.classify_page(b"png").state == "passed"
         assert session.proxies[0] is not None
         assert session.proxies[1] is None
+
+    def test_swapped_out_ip_is_reported_as_bad(self, monkeypatch):
+        """换掉一个 IP 就要上报它坏了。
+
+        不上报的话它既不在空闲候选里、又不在黑名单里，池子用尽时还会被
+        当成共用候选分给别的账号，等于明知连不通还往外发。
+        """
+        dropped: list = []
+        client, _session, _handed = self._pooled(
+            monkeypatch,
+            [RuntimeError("proxy down"), RuntimeError("proxy down"), FakeResp()],
+            ["p2:80", "p3:80"],
+            dropped=dropped,
+        )
+        with client.use_proxy("p1:80"):
+            assert client.classify_page(b"png").state == "passed"
+        # 被换掉的 p1/p2 都上报，最后跑通的 p3 不上报
+        assert dropped == ["p1:80", "p2:80"]
+
+    def test_reused_ip_is_not_reported_when_pool_is_dry(self, monkeypatch):
+        """池子空了只能沿用当前 IP 重试时不上报——下一轮还得靠它。
+
+        上报会让 Runner 把它拉黑，那就成了「拿一个已拉黑的代理继续用」。
+        """
+        dropped: list = []
+        client, _session, _handed = self._pooled(
+            monkeypatch, [RuntimeError("x")] * 5, [], timeout=2, dropped=dropped,
+        )
+        with client.use_proxy("p1:80"):
+            assert client.classify_page(b"png").state == "unknown"
+        assert dropped == []
+
+    def test_direct_fallback_reports_the_dropped_proxy(self, monkeypatch):
+        """require=False 降级直连前，被丢掉的代理要上报。"""
+        dropped: list = []
+        client, _session, _handed = self._pooled(
+            monkeypatch, [RuntimeError("x"), FakeResp()], [], require=False,
+            dropped=dropped,
+        )
+        with client.use_proxy("p1:80"):
+            assert client.classify_page(b"png").state == "passed"
+        assert dropped == ["p1:80"]
+
+    def test_reporter_error_does_not_break_the_call(self, monkeypatch):
+        """上报回调抛错不能连带炸掉视觉调用。"""
+        def boom(_proxy):
+            raise ValueError("reporter exploded")
+
+        client, _session, _handed = self._pooled(
+            monkeypatch,
+            [RuntimeError("proxy down"), FakeResp()],
+            ["p2:80"],
+        )
+        client.set_proxy_source(client._proxy_provider, require=True,
+                                on_failed=boom)
+        with client.use_proxy("p1:80"):
+            assert client.classify_page(b"png").state == "passed"
 
     def test_wall_clock_deadline_stops_endless_swapping(self, monkeypatch):
         """池子一直吐死代理时，靠墙钟上限收口，不会无限打转。"""

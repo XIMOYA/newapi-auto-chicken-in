@@ -185,7 +185,8 @@ class Runner:
                 self._ai = VisionClient(self.cfg.ai)
                 # AI 请求也走代理：启用代理池时强制走，且换 IP 不限次数
                 self._ai.set_proxy_source(self._acquire_proxy_for_ai,
-                                          require=self._proxy_required())
+                                          require=self._proxy_required(),
+                                          on_failed=self._ai_proxy_failed)
                 log.debug(f"AI 已就绪: {self.cfg.ai.model} @ {self.cfg.ai.chat_url}")
             except Exception as exc:  # noqa: BLE001 - AI 是可降级项，绝不能中断签到
                 log.warn(f"AI 初始化失败，将跳过 S3: {exc}")
@@ -197,6 +198,27 @@ class Runner:
         if self._pool is None:
             return None
         return self._pool.acquire()
+
+    def _ai_proxy_failed(self, proxy: Optional[str]) -> None:
+        """AI 彻底放弃了某个代理，决定要不要把它从池里拉黑。
+
+        AI 端点和签到目标站点是两个不同的域名，连不上前者不代表连不上
+        后者。所以只拉黑「没有账号在用」的 IP：
+        - 该 IP 正绑在某个账号上 -> 它连目标站点是通的，拉黑会把那个账号
+          的代理一起废掉，属于误伤，宁可让 AI 换下一个。
+        - 没人在用（AI 自己 acquire 来的）-> 真拉黑。否则它既不在 _used
+          的空闲候选里、又不在 _bad 里，池子用尽时还会被当共用候选分给
+          别的账号，等于明知连不通还往外发。
+        """
+        if self._pool is None or not proxy:
+            return
+        with self._state_lock:
+            in_use = proxy in self._pooled_proxies.values()
+        if in_use:
+            log.debug(f"AI 经 {proxy} 请求失败，但该 IP 正被账号使用，不拉黑")
+            return
+        self._pool.mark_bad(proxy)
+        log.debug(f"AI 经 {proxy} 请求失败且无账号在用，已从池中拉黑")
 
     # ------------------------------------------------------------------ #
     # 主循环

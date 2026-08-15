@@ -287,6 +287,35 @@ def test_swap_limit_respected(monkeypatch, tmp_path):
     assert len(calls) == 3
 
 
+class TestAIProxyBlacklisting:
+    """AI 放弃某个 IP 时要不要拉黑：只拉黑没有账号在用的那些。"""
+
+    def test_unused_ip_is_blacklisted(self, monkeypatch, tmp_path):
+        """AI 自己取来的 IP 失败后必须拉黑，否则它会被当共用候选发给别的账号。"""
+        runner = _make_runner(monkeypatch, tmp_path, pool_proxies=["p1:80", "p2:80"])
+        proxy = runner._acquire_proxy_for_ai()
+        runner._ai_proxy_failed(proxy)
+        assert proxy in runner._pool._bad
+        assert runner._pool.acquire() != proxy      # 拉黑后不再分出去
+
+    def test_ip_in_use_by_account_is_kept(self, monkeypatch, tmp_path):
+        """账号正拿它签到 = 它连目标站点是通的，拉黑等于误伤签到主流程。"""
+        runner = _make_runner(monkeypatch, tmp_path, pool_proxies=["p1:80", "p2:80"])
+        account = runner.cfg.accounts[0]
+        runner._assign_proxy(account)
+        runner._ai_proxy_failed(account.proxy)
+        assert runner._pool._bad == set()
+        assert account.proxy in runner._pooled_proxies.values()
+
+    def test_missing_pool_or_proxy_is_a_noop(self, monkeypatch, tmp_path):
+        runner = _make_runner(monkeypatch, tmp_path, pool_proxies=["p1:80"])
+        runner._ai_proxy_failed(None)
+        runner._ai_proxy_failed("")
+        assert runner._pool._bad == set()
+        runner._pool = None
+        runner._ai_proxy_failed("p1:80")            # 没有池子也不能抛
+
+
 # --------------------------------------------------------------------------- #
 # 抓源 / 测通的耗时控制
 # --------------------------------------------------------------------------- #

@@ -91,6 +91,8 @@ class VisionClient:
         # 强制走代理时用来「再要一个 IP」的回调（由 Runner 注册）
         self._proxy_provider = None
         self._require_proxy = False
+        # 「已放弃这个代理」的上报回调（由 Runner 注册，见 set_proxy_source）
+        self._proxy_failed_cb = None
 
     def _new_session(self):
         return cffi.Session(
@@ -136,15 +138,22 @@ class VisionClient:
         finally:
             self._local.proxy = previous
 
-    def set_proxy_source(self, provider, require: bool = True) -> None:
+    def set_proxy_source(self, provider, require: bool = True,
+                         on_failed=None) -> None:
         """注册「再要一个代理」的回调。
 
         provider() 每次返回一个可用代理地址（拿不到返回 None）。
         require=True 表示 AI 请求**必须**走代理：代理连不上就换下一个，
         不限次数，绝不退回直连暴露真实出口 IP。
+
+        on_failed(proxy) 在**彻底放弃**某个代理时调用，让上层决定要不要
+        拉黑。本类故意不直接 mark_bad：「连不上 AI 端点」不等于「连不上
+        签到目标站点」，只有掌握全局分配情况的 Runner 才能判断拉黑会不会
+        误伤正在签到的账号。
         """
         self._proxy_provider = provider
         self._require_proxy = bool(require)
+        self._proxy_failed_cb = on_failed
 
     def _next_proxy(self) -> Optional[str]:
         provider = self._proxy_provider
@@ -156,6 +165,16 @@ class VisionClient:
             log.debug(f"获取新代理失败: {type(exc).__name__}: {exc}")
             return None
         return str(proxy).strip() or None if proxy else None
+
+    def _report_bad_proxy(self, proxy: Optional[str]) -> None:
+        """上报「这个代理连不上 AI 端点，已放弃」。回调抛错绝不能影响视觉调用。"""
+        cb = self._proxy_failed_cb
+        if cb is None or not proxy:
+            return
+        try:
+            cb(proxy)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"上报坏代理失败: {type(exc).__name__}: {exc}")
 
     @staticmethod
     def _proxies(proxy: Optional[str]) -> dict:
@@ -260,19 +279,25 @@ class VisionClient:
                 if proxy:
                     # 经代理失败是代理的问题，不能据此判定 AI 端点过载，所以不进避让。
                     # 换下一个 IP 继续，不计入 attempts（换 IP 不限次数）。
+                    # 顺序要紧：先拿到替代品再上报旧 IP 坏掉。万一池子已空、
+                    # 只能沿用它重试，就不能把它拉黑，否则就成了「拿一个已拉黑
+                    # 的代理继续用」。
                     nxt = self._next_proxy()
                     if nxt and nxt != proxy:
+                        self._report_bad_proxy(proxy)
                         swaps += 1
                         proxy = nxt
                         log.warn(f"AI 请求经代理失败，换第 {swaps} 个 IP 重试: "
                                  f"{type(exc).__name__}: {exc}"[:160])
                         continue
                     if self._require_proxy:
-                        # 换不到新 IP：按配置绝不直连，只能沿用当前代理计次重试
+                        # 换不到新 IP：按配置绝不直连，只能沿用当前代理计次重试。
+                        # 这里不上报坏代理——下一轮还要靠它。
                         used += 1
                         log.warn(f"AI 请求经代理失败且暂无其他可用 IP，"
                                  f"沿用当前代理重试({used}/{attempts})")
                         continue
+                    self._report_bad_proxy(proxy)
                     proxy = None
                     log.warn(f"AI 请求经代理失败，改为直连重试: "
                              f"{type(exc).__name__}: {exc}"[:160])
