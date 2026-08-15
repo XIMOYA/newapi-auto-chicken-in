@@ -78,6 +78,18 @@ class TestProxyPoolConfig:
         assert cfg.max_workers == 1
         assert cfg.max_proxies == 1
 
+    def test_enabled_strict_boolean_parsing(self):
+        """enabled 必须严格布尔解析：字符串 "false" 不能因为非空被 bool() 误判成 True。"""
+        assert ProxyPoolConfig.from_raw({"enabled": "false"}).enabled is False
+        assert ProxyPoolConfig.from_raw({"enabled": "true"}).enabled is True
+        assert ProxyPoolConfig.from_raw({"enabled": "0"}).enabled is False
+        assert ProxyPoolConfig.from_raw({"enabled": "1"}).enabled is True
+        assert ProxyPoolConfig.from_raw({"enabled": "no"}).enabled is False
+        assert ProxyPoolConfig.from_raw({"enabled": "yes"}).enabled is True
+        assert ProxyPoolConfig.from_raw({"enabled": "banana"}).enabled is False  # 非法值回退默认
+        assert ProxyPoolConfig.from_raw({"enabled": 0}).enabled is False
+        assert ProxyPoolConfig.from_raw({"enabled": 1}).enabled is True
+
     def test_default_sources_are_configured(self):
         assert len(DEFAULT_SOURCES) >= 5
         assert any("89ip.cn" in s for s in DEFAULT_SOURCES)
@@ -368,7 +380,7 @@ class TestProbeEarlyStop:
 
         def fake_test(proxy):
             tested.append(proxy)
-            return True
+            return 0.05   # 全部秒回，延迟都一样
 
         monkeypatch.setattr(pool, "_test_one", fake_test)
         alive = pool._test_many([f"1.1.1.{i}:80" for i in range(20)], need=3)
@@ -378,9 +390,43 @@ class TestProbeEarlyStop:
 
     def test_without_need_tests_everything(self, monkeypatch):
         pool = ProxyPool(ProxyPoolConfig(max_workers=4))
-        monkeypatch.setattr(pool, "_test_one", lambda proxy: proxy.endswith(":80"))
+        monkeypatch.setattr(pool, "_test_one",
+                            lambda proxy: 0.5 if proxy.endswith(":80") else None)
         alive = pool._test_many(["1.1.1.1:80", "2.2.2.2:8080", "3.3.3.3:80"])
         assert sorted(alive) == ["1.1.1.1:80", "3.3.3.3:80"]
+
+    def test_results_are_sorted_by_latency(self, monkeypatch):
+        """可用代理按延迟升序返回：快的排前面，acquire() 顺序取优拿到最快出口。"""
+        pool = ProxyPool(ProxyPoolConfig(max_workers=4))
+        latency = {"slow:80": 8.0, "fast:80": 0.2, "mid:80": 3.0, "dead:80": None}
+
+        monkeypatch.setattr(pool, "_test_one", lambda proxy: latency[proxy])
+        alive = pool._test_many(["slow:80", "fast:80", "mid:80", "dead:80"])
+        assert alive == ["fast:80", "mid:80", "slow:80"]
+
+    def test_controlled_dispatch_window_is_bounded(self, monkeypatch):
+        """受控派发：不同时把全部候选塞进线程池，在飞窗口不超过并发数。"""
+        import threading
+        import time
+
+        pool = ProxyPool(ProxyPoolConfig(max_workers=3, timeout=2))
+        state = {"active": 0, "max": 0}
+        lock = threading.Lock()
+
+        def fake_test(proxy):
+            with lock:
+                state["active"] += 1
+                state["max"] = max(state["max"], state["active"])
+            time.sleep(0.03)
+            with lock:
+                state["active"] -= 1
+            return 0.1
+
+        monkeypatch.setattr(pool, "_test_one", fake_test)
+        alive = pool._test_many([f"1.1.1.{i}:80" for i in range(50)])
+        assert len(alive) == 50
+        # 在飞窗口被钳在并发数上：50 条候选也不会瞬间同时跑 50 个
+        assert state["max"] == 3
 
     def test_deadline_stops_slow_batch(self, monkeypatch):
         """时间盒到了就带着已有结果返回，不让慢代理拖住签到开始。"""
@@ -390,7 +436,7 @@ class TestProbeEarlyStop:
 
         def slow_test(_proxy):
             time.sleep(5)
-            return True
+            return 0.1
 
         monkeypatch.setattr(pool, "_test_one", slow_test)
         started = time.monotonic()

@@ -14,8 +14,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,20 +29,27 @@ import (
 // serverVersion 健康检查接口返回的版本号。
 const serverVersion = "1.0.0"
 
-// Server 服务依赖：数据库连接、JWT 签名密钥与代理池管理器。
+// Server 服务依赖：数据库连接、JWT 签名密钥、代理池管理器与登录限流器。
 type Server struct {
 	db        *sql.DB
 	jwtSecret []byte
 	proxies   *ProxyManager
+	loginLim  *loginLimiter
 }
 
 // NewServer 构造服务实例；jwtSecret 为 JWT 签名密钥（main 已校验长度）。
 func NewServer(db *sql.DB, jwtSecret string) *Server {
-	return &Server{db: db, jwtSecret: []byte(jwtSecret), proxies: NewProxyManager(db)}
+	return &Server{
+		db:        db,
+		jwtSecret: []byte(jwtSecret),
+		proxies:   NewProxyManager(db),
+		loginLim:  newLoginLimiter(),
+	}
 }
 
 // routes 注册全部 HTTP 路由并返回根 Handler。
 // API 路由优先匹配；"/" 兜底交给静态文件处理器。
+// 整体包一层基础安全响应头中间件。
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
@@ -68,7 +77,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/proxies/speedtest", s.requireJWT(s.handleSpeedTestProxies))
 
 	mux.Handle("/", s.staticHandler())
-	return mux
+	return securityHeaders(mux)
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +94,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLogin POST /api/login —— 无需鉴权，校验账号密码后签发 JWT。
+// 带登录失败限流：按「对端 IP + 用户名」统计，1 分钟 5 次失败后指数退避。
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Username string `json:"username"`
@@ -94,20 +104,30 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "请求体不是合法的 JSON")
 		return
 	}
-	if strings.TrimSpace(req.Username) == "" || req.Password == "" {
+	username := strings.TrimSpace(req.Username)
+	if username == "" || req.Password == "" {
 		writeError(w, http.StatusBadRequest, "用户名和密码不能为空")
 		return
 	}
 
-	user, err := GetUserByUsername(s.db, req.Username)
+	key := loginKey(r, username)
+	if retryAfter, allowed := s.loginLim.check(key); !allowed {
+		w.Header().Set("Retry-After", fmt.Sprintf("%.0f", retryAfter.Seconds()))
+		writeError(w, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
+		return
+	}
+
+	user, err := GetUserByUsername(s.db, username)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 		return
 	}
 	if user == nil || !CheckPassword(user.PasswordHash, req.Password) {
+		s.loginLim.recordFailure(key)
 		writeError(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
+	s.loginLim.recordSuccess(key)
 
 	token, expiresIn, err := SignToken(user.Username, s.jwtSecret)
 	if err != nil {
@@ -119,6 +139,21 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"username":   user.Username,
 		"expires_in": expiresIn,
 	})
+}
+
+// loginKey 构造登录限流键：对端 IP + 用户名。
+// 只信任 RemoteAddr（不解析 X-Forwarded-For，防止伪造来源绕过限流）。
+func loginKey(r *http.Request, username string) string {
+	return clientIP(r) + "|" + username
+}
+
+// clientIP 返回请求对端 IP（RemoteAddr 的 host 部分）；解析失败时原样返回。
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +588,7 @@ func (s *Server) handleAvailableProxies(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"proxies":    addrs,
 		"count":      len(addrs),
-		"checked_at": s.proxies.LastRun().UTC().Format(time.RFC3339),
+		"checked_at": s.proxies.LastRunRFC3339(),
 	})
 }
 
@@ -568,7 +603,7 @@ func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
 		"total":      st.Total,
 		"alive":      st.Alive,
 		"by_source":  st.BySource,
-		"last_run":   s.proxies.LastRun().UTC().Format(time.RFC3339),
+		"last_run":   s.proxies.LastRunRFC3339(),
 		"last_error": s.proxies.LastError(),
 		"running":    s.proxies.IsRunning(),
 		"progress":   s.proxies.Progress(),
@@ -578,7 +613,7 @@ func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
 // handleRefreshProxies POST /api/proxies/refresh（JWT）—— 手动触发一次刷新。
 func (s *Server) handleRefreshProxies(w http.ResponseWriter, r *http.Request) {
 	if s.proxies.IsRunning() {
-		writeError(w, http.StatusConflict, "代理池刷新已在进行中")
+		writeError(w, http.StatusConflict, "代理池刷新或测速已在进行中")
 		return
 	}
 	cfg, _, err := LoadConfig(s.db)
@@ -609,8 +644,10 @@ func (s *Server) handleSpeedTestProxies(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "请求体不是合法的 JSON")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
-	defer cancel()
+	if s.proxies.IsRunning() {
+		writeError(w, http.StatusConflict, "代理池刷新或测速已在进行中")
+		return
+	}
 	cfg, _, err := LoadConfig(s.db)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
@@ -618,6 +655,9 @@ func (s *Server) handleSpeedTestProxies(w http.ResponseWriter, r *http.Request) 
 	}
 	timeout := cfg.ProxyPool.Timeout
 	go func() {
+		// 测速后台使用独立 120 秒 context：不随 HTTP 请求结束/取消而中断
+		ctx, cancel := context.WithTimeout(context.Background(), speedTestBackgroundTimeout)
+		defer cancel()
 		updated, terr := s.proxies.SpeedTest(ctx, req.Proxies, timeout)
 		if terr != nil {
 			log.Printf("[proxy] 测速失败: %v", terr)
@@ -627,6 +667,19 @@ func (s *Server) handleSpeedTestProxies(w http.ResponseWriter, r *http.Request) 
 	}()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "tested": len(req.Proxies), "url": "https://speed.cloudflare.com/__down?bytes=1048576",
+	})
+}
+
+// securityHeaders 为所有响应追加基础安全响应头（防 MIME 嗅探 / 点击劫持 / 来源泄露）。
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		// 现代浏览器已内置 XSS 防护，显式禁用遗留的 XSS Auditor 避免误报
+		h.Set("X-XSS-Protection", "0")
+		next.ServeHTTP(w, r)
 	})
 }
 

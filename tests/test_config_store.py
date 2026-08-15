@@ -122,3 +122,22 @@ def test_change_key_reencrypts_existing_document(tmp_path, raw_config):
                 os.environ["CHECKIN_CONFIG_KEY"] = old
 
     assert load_document(path).raw["accounts"][0]["name"] == "站点A"
+
+
+def test_save_without_security_keeps_existing_encryption(tmp_path, raw_config):
+    """已加密配置继续加密保存：新 raw 里没有 security 时不能降级成明文落盘。
+
+    与 remote_sync 的「同步保留本地 security 加密状态」同一语义：加密状态是
+    本地安全属性，远端/新配置没带也不许把它丢掉。
+    """
+    path = tmp_path / "config.json"
+    save_document(raw_config, path, encryption_enabled=True, key="file-key-123")
+
+    # 新配置不带 security 字段（例如远程同步回来的精简结构）
+    fresh = {"accounts": [{"name": "站点B", "url": "https://b.example.com", "cookie": "c2"}]}
+    save_document(fresh, path)
+
+    bootstrap = json.loads(path.read_text(encoding="utf-8"))
+    assert bootstrap["security"]["encryption_enabled"] is True
+    assert "cookie" not in path.read_text(encoding="utf-8")     # 绝不明文落盘
+    assert load_document(path).raw["accounts"][0]["name"] == "站点B"

@@ -138,7 +138,7 @@
   "browser": { "driver": "camoufox", "headless": "virtual", "humanize": true, "timeout": 60, "keep_artifacts_on_fail": true, "locale": "zh-CN", "window": [1280, 800], "executable_path": null },
   "http": { "impersonate": "chrome", "timeout": 20, "verify": true },
   "defaults": { "retry": 2, "interval_seconds": [3, 8] },
-  "proxy_pool": { "enabled": false, "test_url": "https://api.ipify.org", "timeout": 8, "max_workers": 25, "max_proxies": 250, "ip_swap_limit": 2, "sources": [] },
+  "proxy_pool": { "enabled": false, "test_url": "https://api.ipify.org", "timeout": 8, "max_workers": 25, "max_proxies": 250, "ip_swap_limit": 10, "sources": [], "refresh_minutes": 30, "save_limit": 0, "auto_test": true, "remote_url": "", "remote_token": "", "remote_token_header": "Authorization", "remote_token_prefix": "Bearer" },
   "notify": { "email": { "enabled": false, "smtp_host": "smtp.aliyun.com", "smtp_port": 465, "use_ssl": true, "username": "", "password": "", "from_addr": "", "to_addrs": [], "subject_prefix": "NewAPI 签到日报", "timeout": 20 } },
   "config_sync": { "enabled": false, "url": "", "method": "GET", "token": "", "token_header": "Authorization", "token_prefix": "Bearer", "headers": {}, "body": null, "response_field": "", "timeout": 20, "auto_before_checkin": true },
   "security": { "encryption_enabled": false, "config_key": "", "encrypted_file": "data/config.encrypted.json" }

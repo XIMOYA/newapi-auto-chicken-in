@@ -45,7 +45,7 @@
     }
   },
   "ai": {
-    "enabled": true,
+    "enabled": false,
     "base_url": "https://你的站点.com/v1",
     "api_key": "sk-xxxx",
     "model": "gpt-4o-mini",

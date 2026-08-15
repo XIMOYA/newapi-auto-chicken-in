@@ -262,15 +262,25 @@ func MaskConfig(cfg *Config) *Config {
 
 // UnmaskConfig 把输入配置中的 "***" 占位符还原为库中旧值（深合并）。
 // 规则：仅敏感字段值为 "***" 时保留旧值；其余字段一律以输入为准（含清空、新增、删除账号）。
+// 账号 cookie 按「账号名」匹配旧配置还原，避免前端调整账号顺序时按下标还原导致错位；
+// 旧配置中不存在的账号名（改名/新增场景）占位符保持原样，不做猜测性还原。
 func UnmaskConfig(in, old *Config) *Config {
 	out := cloneConfig(in)
+
+	oldCookieByName := make(map[string]string, len(old.Accounts))
+	for _, a := range old.Accounts {
+		if a.Name != "" {
+			oldCookieByName[a.Name] = a.Cookie
+		}
+	}
 	for i := range out.Accounts {
 		if out.Accounts[i].Cookie == MaskPlaceholder {
-			if i < len(old.Accounts) {
-				out.Accounts[i].Cookie = old.Accounts[i].Cookie
+			if c, ok := oldCookieByName[out.Accounts[i].Name]; ok {
+				out.Accounts[i].Cookie = c
 			}
 		}
 	}
+
 	if out.AI.APIKey == MaskPlaceholder {
 		out.AI.APIKey = old.AI.APIKey
 	}

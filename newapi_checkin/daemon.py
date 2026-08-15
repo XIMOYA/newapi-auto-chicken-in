@@ -30,6 +30,9 @@ from .scheduler import ScheduleError, SchedulerService
 STATE_FILE = DATA_DIR / "daemon.json"
 HOST = "127.0.0.1"
 AUTHKEY_BYTES = 32
+# stop 优雅收尾的最长等待：先阻止新任务，等当前任务/调度线程最多这么久，
+# 刷新日志后再执行强制退出兜底（进程模式由 _handle 直接 os._exit）。
+STOP_GRACE_SECONDS = 10.0
 
 
 @dataclass
@@ -227,14 +230,16 @@ class DaemonServer:
         if self._stopped_event.is_set():
             return
         if not self._stop_lock.acquire(blocking=False):
-            self._stopped_event.wait(timeout=5.0)
+            self._stopped_event.wait(timeout=STOP_GRACE_SECONDS)
             return
         try:
             listener = self._listener
             info = self._info
+            # 先阻止新任务：accept 循环退出，不再接受新的 IPC/签到请求
             self._stop_event.set()
             if self._scheduler:
-                self._scheduler.stop()
+                # 最多等 10 秒让当前签到任务优雅收尾，之后由进程模式兜底强退
+                self._scheduler.stop(timeout=STOP_GRACE_SECONDS)
             # Windows 上 Listener.accept() 可能不会因 close() 立即返回，先建立
             # 一个 loopback 连接唤醒 accept，再关闭 listener，确保 --stop 能退出。
             if listener is not None and info is not None:
@@ -259,7 +264,10 @@ class DaemonServer:
                     pass
             if self._info:
                 _remove_info(self._info, self.state_path)
+            # 刷新日志缓冲，确保 daemon 退出前停止/汇总日志都落盘
+            log.flush()
             log.info("daemon 已停止")
+            log.flush()
         finally:
             self._stopped_event.set()
             self._stop_lock.release()
@@ -286,6 +294,7 @@ class DaemonServer:
             if shutdown_process:
                 # 独立 daemon 进程收到 stop 后直接结束自身，避免 Windows
                 # 后台线程/accept 阻塞让 GUI 看到“已停止”但进程仍残留。
+                log.flush()
                 self._stop_event.set()
                 if self._info:
                     _remove_info(self._info, self.state_path)
@@ -381,8 +390,9 @@ class DaemonServer:
             cfg = load_config()
             if manual:
                 cfg.browser.headless = False
-            else:
-                # 定时/立即签到永远不弹浏览器窗口；手动验证是唯一有头例外。
+            elif cfg.browser.headless is False:
+                # 定时/立即签到不能弹浏览器窗口；"virtual"(Xvfb) 与 true 本来就是
+                # 无头模式，只有用户显式配置了真 headful(false) 才需要改写成无头。
                 cfg.browser.headless = True
             # 手动验证只有一台浏览器，强制串行；定时/立即签到用调度配置的并行度
             scheduler = self._scheduler

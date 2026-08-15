@@ -220,8 +220,8 @@ func TestUnmaskConfig(t *testing.T) {
 
 	in := DefaultConfig()
 	in.Accounts = []Account{
-		{Name: "A改", URL: "https://a.com", Cookie: MaskPlaceholder}, // "***" → 还原旧 cookie
-		{Name: "B", URL: "https://b.com", Cookie: "new-cookie"},     // 新账号，非占位符
+		{Name: "A", URL: "https://a.com", Cookie: MaskPlaceholder}, // "***" → 按账号名还原旧 cookie
+		{Name: "B", URL: "https://b.com", Cookie: "new-cookie"},    // 新账号，非占位符
 	}
 	in.AI.APIKey = MaskPlaceholder        // 还原
 	in.Notify.Email.Password = "new-pass" // 非占位符，保留新值
@@ -232,7 +232,7 @@ func TestUnmaskConfig(t *testing.T) {
 	if out.Accounts[0].Cookie != "old-cookie" {
 		t.Errorf("占位符 cookie 未还原: %q", out.Accounts[0].Cookie)
 	}
-	if out.Accounts[0].Name != "A改" {
+	if out.Accounts[0].Name != "A" {
 		t.Errorf("非敏感字段应以输入为准: %q", out.Accounts[0].Name)
 	}
 	if out.Accounts[1].Cookie != "new-cookie" {

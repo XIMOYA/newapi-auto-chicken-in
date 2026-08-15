@@ -159,6 +159,7 @@ class SchedulerService:
             self.save_config(self._config)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._worker_thread: Optional[threading.Thread] = None
         self._run_lock = threading.Lock()
         self._config_lock = threading.RLock()
         self._pending_requests: dict[str, dict] = {}
@@ -212,6 +213,10 @@ class SchedulerService:
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=timeout)
+        # 当前正在跑的签到任务最多等 timeout 秒收尾；超时后由调用方决定强退兜底。
+        worker = self._worker_thread
+        if worker and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=timeout)
 
     def run_now(self, account_names: Optional[list[str]] = None, manual: bool = False,
                 request_id: Optional[str] = None) -> dict:
@@ -237,6 +242,8 @@ class SchedulerService:
             name="checkin-runner",
             daemon=True,
         )
+        with self._config_lock:
+            self._worker_thread = thread
         thread.start()
         return result
 
@@ -270,6 +277,7 @@ class SchedulerService:
             self._emit(f"签到线程异常: {type(exc).__name__}: {exc}")
         finally:
             with self._config_lock:
+                self._worker_thread = None
                 self._snapshot.running = False
                 if request_id is not None:
                     self._pending_requests.pop(request_id, None)

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -120,6 +121,107 @@ func GenerateAPIKey() (plain, hash, prefix string, err error) {
 func HashAPIKey(plain string) string {
 	sum := sha256.Sum256([]byte(plain))
 	return hex.EncodeToString(sum[:])
+}
+
+// ---------------------------------------------------------------------------
+// 登录失败限流
+// ---------------------------------------------------------------------------
+
+// 登录限流参数：1 分钟窗口内最多 5 次失败；超过后指数退避 1/2/4/8/16 秒。
+const (
+	loginMaxFailures       = 5
+	loginWindow            = 1 * time.Minute
+	loginMaxBackoff        = 16 * time.Second
+	loginDefaultMaxEntries = 10000 // 内存上限：条目过多时清理过期窗口并兜底清空
+)
+
+// loginFailEntry 单个「IP+用户名」的失败记录。
+type loginFailEntry struct {
+	failures     int       // 当前窗口内失败次数
+	firstFail    time.Time // 窗口起点（首次失败时间）
+	blockedUntil time.Time // 指数退避：下次允许尝试的最早时间
+}
+
+// loginLimiter 登录失败限流器（并发安全）。
+// 键 = RemoteAddr(IP) + 用户名；不信任 X-Forwarded-For。
+type loginLimiter struct {
+	mu         sync.Mutex
+	now        func() time.Time
+	entries    map[string]*loginFailEntry
+	maxEntries int
+}
+
+func newLoginLimiter() *loginLimiter {
+	return &loginLimiter{
+		now:        time.Now,
+		entries:    make(map[string]*loginFailEntry),
+		maxEntries: loginDefaultMaxEntries,
+	}
+}
+
+// check 查询当前键是否被退避拦截；allowed=false 时返回还需等待的时长。
+// 窗口过期（首次失败超过 1 分钟）视为放行，由下一次 recordFailure 重新计数。
+func (l *loginLimiter) check(key string) (retryAfter time.Duration, allowed bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	e, ok := l.entries[key]
+	if !ok || now.Sub(e.firstFail) >= loginWindow {
+		return 0, true
+	}
+	if now.Before(e.blockedUntil) {
+		return e.blockedUntil.Sub(now), false
+	}
+	return 0, true
+}
+
+// recordFailure 记录一次失败；达到阈值后按失败次数指数退避
+// （第 5 次起 1s，之后 2/4/8/16s，封顶 16s）。
+func (l *loginLimiter) recordFailure(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	l.trimLocked(now)
+	e, ok := l.entries[key]
+	if !ok || now.Sub(e.firstFail) >= loginWindow {
+		e = &loginFailEntry{firstFail: now}
+		l.entries[key] = e
+	}
+	e.failures++
+	if e.failures >= loginMaxFailures {
+		n := e.failures - loginMaxFailures
+		if n > 5 {
+			n = 5 // 1<<5=32s，比较后封顶 16s
+		}
+		backoff := time.Duration(1<<uint(n)) * time.Second
+		if backoff > loginMaxBackoff {
+			backoff = loginMaxBackoff
+		}
+		e.blockedUntil = now.Add(backoff)
+	}
+}
+
+// recordSuccess 登录成功：清除该键的失败记录，重新计数。
+func (l *loginLimiter) recordSuccess(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.entries, key)
+}
+
+// trimLocked 控制内存增长：条目达到上限时先清理过期窗口的条目，
+// 仍超上限则整体清空（限流是临时防护，宁可重置也不无限占用内存）。
+func (l *loginLimiter) trimLocked(now time.Time) {
+	if len(l.entries) < l.maxEntries {
+		return
+	}
+	for k, e := range l.entries {
+		if now.Sub(e.firstFail) >= loginWindow {
+			delete(l.entries, k)
+		}
+	}
+	if len(l.entries) >= l.maxEntries {
+		l.entries = make(map[string]*loginFailEntry)
+	}
 }
 
 // ---------------------------------------------------------------------------

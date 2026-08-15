@@ -87,7 +87,9 @@ class ProxyPoolConfig:
         else:
             sources = []
         return cls(
-            enabled=bool(raw.get("enabled", False)),
+            # enabled 严格布尔解析：字符串 "false"/"0"/"no" 不能因为非空而被
+            # bool() 误判成 True（旧实现 bool("false") == True，属于配置解析 bug）
+            enabled=_as_bool(raw.get("enabled"), False),
             test_url=str(raw.get("test_url") or DEFAULT_TEST_URL).strip() or DEFAULT_TEST_URL,
             timeout=max(2, min(60, _as_int(raw.get("timeout"), 8))),
             # 上限放宽到 512：全量测通几千条候选时，25 并发要跑十几分钟
@@ -122,6 +124,22 @@ def _as_int(value, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    """严格布尔解析：接受 bool、0/1、'true'/'false'/'yes'/'no'/'on'/'off' 等，
+    其余一律回退到 default。避免 bool("false") == True 这类误判。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "on", "y"):
+            return True
+        if text in ("false", "0", "no", "off", "n"):
+            return False
+    return default
 
 
 class ProxyPool:
@@ -329,45 +347,76 @@ class ProxyPool:
 
     def _test_many(self, candidates: list[str], need: Optional[int] = None,
                    deadline: Optional[float] = None) -> list[str]:
-        """并发测通。凑够 need 条或到达 deadline 就立刻收手，不等剩下的慢连接超时。"""
+        """受控派发并发测通，结果按延迟升序排列。
+
+        不一次性 submit 全部候选：候选常以千计，一次全提交会把几万个 future
+        同时挂在内存和线程池队列里。这里维护一个与并发数等宽的在飞窗口，
+        完成一个补一个，窗口大小有界。
+
+        返回的可用代理按延迟从小到大排序（快的在前），这样 acquire() 顺序
+        取优时拿到的就是响应最快的出口 IP。凑够 need 条或到达 deadline 就
+        立刻收手，不等剩下的慢连接超时。
+        """
         if not candidates:
             return []
         workers = max(1, min(self.cfg.max_workers, len(candidates)))
-        alive: list[str] = []
+        # (延迟, 代理)：测通后按延迟排序，快的排前面
+        alive: list[tuple[float, str]] = []
         tested = 0
         pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="probe")
+        futures: dict = {}
         try:
-            futures = {pool.submit(self._test_one, proxy): proxy for proxy in candidates}
-            timeout = None if deadline is None else max(0.1, deadline - time.monotonic())
-            try:
-                for future in as_completed(futures, timeout=timeout):
-                    tested += 1
-                    try:
-                        ok = future.result()
-                    except Exception:  # noqa: BLE001 - 探测失败一律按不通
-                        ok = False
-                    if ok:
-                        alive.append(futures[future])
-                        if need is not None and len(alive) >= need:
-                            break
-            except FuturesTimeout:
-                log.debug(f"代理测通到达时间盒，本批只收到 {len(alive)} 条可用"
-                          f"（已测 {tested}/{len(candidates)} 条）")
+            # 首波：只提交并发数等宽的一批，其余候选等有坑位再补
+            next_idx = 0
+            while next_idx < workers and next_idx < len(candidates):
+                proxy = candidates[next_idx]
+                futures[pool.submit(self._test_one, proxy)] = proxy
+                next_idx += 1
+            while futures:
+                timeout = None if deadline is None else max(0.1, deadline - time.monotonic())
+                try:
+                    for future in as_completed(futures, timeout=timeout):
+                        proxy = futures.pop(future)
+                        tested += 1
+                        try:
+                            latency = future.result()
+                        except Exception:  # noqa: BLE001 - 探测失败一律按不通
+                            latency = None
+                        if latency is not None:
+                            alive.append((latency, proxy))
+                            if need is not None and len(alive) >= need:
+                                # 已经够用了：取消剩余在飞任务，立即收手
+                                for pending in futures:
+                                    pending.cancel()
+                                futures.clear()
+                                break
+                        # 受控派发：完成一个就补一个，保持窗口宽度 = 并发数
+                        if next_idx < len(candidates):
+                            proxy = candidates[next_idx]
+                            futures[pool.submit(self._test_one, proxy)] = proxy
+                            next_idx += 1
+                except FuturesTimeout:
+                    log.debug(f"代理测通到达时间盒，本批只收到 {len(alive)} 条可用"
+                              f"（已测 {tested}/{len(candidates)} 条）")
+                    break
         finally:
             self._last_tested = tested
             # 已经够用了就别再等剩余候选各自超时；wait=False 立即返回
             pool.shutdown(wait=False, cancel_futures=True)
-        return alive
+        alive.sort(key=lambda item: item[0])
+        return [proxy for _latency, proxy in alive]
 
     def available_count(self) -> int:
         """当前还能独占分配的代理数量（未使用且未拉黑）。"""
         with self._lock:
             return sum(1 for p in self._available if p not in self._used and p not in self._bad)
 
-    def _test_one(self, proxy: str) -> bool:
+    def _test_one(self, proxy: str) -> Optional[float]:
+        """测通单个代理。成功返回探测耗时（秒，用于按延迟排序），失败返回 None。"""
         try:
             from curl_cffi import requests as cffi
 
+            started = time.monotonic()
             resp = cffi.get(
                 self.cfg.test_url,
                 timeout=self.cfg.timeout,
@@ -375,9 +424,11 @@ class ProxyPool:
                 impersonate="chrome",
                 verify=True,
             )
-            return resp.status_code == 200 and bool((resp.text or "").strip())
+            if resp.status_code == 200 and bool((resp.text or "").strip()):
+                return time.monotonic() - started
+            return None
         except Exception:  # noqa: BLE001 - 代理不通原因很多，统一按失败
-            return False
+            return None
 
     # ------------------------------------------------------------------ #
     # 分配

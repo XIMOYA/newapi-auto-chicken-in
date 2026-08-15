@@ -62,10 +62,15 @@ BIN="$ROOT/server/$APP_NAME"
 [[ -f "$BIN" ]] || { echo "❌ 构建产物不存在: $BIN"; exit 1; }
 
 echo
-echo "==> [2/5] 生成随机 JWT 密钥（写入远端环境文件，勿外泄）"
+echo "==> [2/5] 生成随机 JWT 密钥与初始管理员密码（写入远端环境文件，勿外泄）"
 JWT_SECRET="$(openssl rand -hex 32)"
 if [[ -z "$JWT_SECRET" ]]; then
   JWT_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+fi
+# 初始密码也随机生成（hex 无特殊字符，可安全写入 systemd EnvironmentFile）；绝不写死默认密码
+ADMIN_PASS="$(openssl rand -hex 16)"
+if [[ -z "$ADMIN_PASS" ]]; then
+  ADMIN_PASS="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 fi
 
 echo
@@ -76,7 +81,7 @@ scp -P "$VPS_PORT" "$BIN" "${SSH_TARGET}:${APP_DIR}/"
 echo
 echo "==> [4/5] VPS 上安装 systemd 服务 + Nginx + HTTPS"
 ssh "${SSH_ARGS[@]}" "$SSH_TARGET" \
-  "APP_NAME='$APP_NAME' APP_DIR='$APP_DIR' SERVICE_PORT='$SERVICE_PORT' DOMAIN='$DOMAIN' JWT_SECRET='$JWT_SECRET' CERTBOT_EMAIL='$CERTBOT_EMAIL' VPS_USER='$VPS_USER' bash -s" <<'REMOTE'
+  "APP_NAME='$APP_NAME' APP_DIR='$APP_DIR' SERVICE_PORT='$SERVICE_PORT' DOMAIN='$DOMAIN' JWT_SECRET='$JWT_SECRET' ADMIN_PASS='$ADMIN_PASS' CERTBOT_EMAIL='$CERTBOT_EMAIL' VPS_USER='$VPS_USER' bash -s" <<'REMOTE'
 set -euo pipefail
 
 echo "   - 安装依赖（nginx / certbot / python3-certbot-nginx）"
@@ -90,11 +95,12 @@ fi
 
 echo "   - 写入环境文件 /etc/${APP_NAME}.env"
 cat > "/etc/${APP_NAME}.env" <<EOF
+NCF_ENV=production
 NCF_DB_PATH=${APP_DIR}/data/config.db
 NCF_JWT_SECRET=${JWT_SECRET}
 NCF_HTTP_ADDR=127.0.0.1:${SERVICE_PORT}
 NCF_ADMIN_USER=admin
-NCF_ADMIN_PASS=admin123456
+NCF_ADMIN_PASS=${ADMIN_PASS}
 EOF
 chmod 600 "/etc/${APP_NAME}.env"
 
@@ -168,5 +174,6 @@ if [[ -n "$DOMAIN" ]]; then
 else
   echo "  访问: http://${VPS_HOST}:${SERVICE_PORT}  （需先放行安全组/防火墙端口）"
 fi
-echo "  初始账号: admin / admin123456"
-echo "  ⚠️ 登录后请立即修改默认密码！JWT 密钥已写入 /etc/${APP_NAME}.env"
+echo "  初始账号: admin"
+echo "  初始密码: ${ADMIN_PASS}（随机生成，仅此一次显示；已同时写入 /etc/${APP_NAME}.env，权限 600）"
+echo "  ⚠️ 登录后请立即在「修改密码」中更换初始密码！JWT 密钥与密码请妥善保管，勿外泄。"

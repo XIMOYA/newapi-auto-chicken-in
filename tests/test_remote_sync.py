@@ -3,7 +3,7 @@
 import json
 
 from newapi_checkin.config_store import load_document, save_document
-from newapi_checkin.remote_sync import sync_remote_config
+from newapi_checkin.remote_sync import _merge_payload, sync_remote_config
 from newapi_checkin.secure_config import encrypt_json
 
 
@@ -35,7 +35,8 @@ def base_config(*, sync=None):
     }
 
 
-def test_sync_decrypts_envelope_and_saves_plaintext(tmp_path, monkeypatch):
+def test_sync_preserves_local_encryption(tmp_path, monkeypatch):
+    """同步后加密状态必须保留：不能明文落盘，也不能删掉密文文件。"""
     path = tmp_path / "config.json"
     raw = base_config()
     save_document(raw, path, encryption_enabled=True, key="config-key-123")
@@ -54,11 +55,64 @@ def test_sync_decrypts_envelope_and_saves_plaintext(tmp_path, monkeypatch):
     assert result["ok"] is True
     assert result["encrypted_response"] is True
     document = load_document(path)
-    assert document.encrypted is False
+    assert document.encrypted is True
     assert document.raw["accounts"][0]["name"] == "新账号"
     assert document.raw["security"]["config_key"] == "config-key-123"
     assert document.raw["config_sync"]["url"] == "https://config.example.com/api"
-    assert not (tmp_path / "data" / "config.encrypted.json").exists()
+    # config.json 仍只是 security bootstrap，密文文件被更新而不是被删
+    bootstrap = json.loads(path.read_text(encoding="utf-8"))
+    assert "accounts" not in bootstrap
+    assert "cookie" not in path.read_text(encoding="utf-8")
+    encrypted_path = tmp_path / "data" / "config.encrypted.json"
+    assert encrypted_path.exists()
+    assert document.raw["accounts"][0]["cookie"] == "new"
+
+
+def test_sync_keeps_local_modules_missing_from_remote(tmp_path, monkeypatch):
+    """远端没带本地已有的业务模块时，保留本地模块并正常同步账号。"""
+    path = tmp_path / "config.json"
+    raw = base_config()
+    raw["ai"] = {
+        "enabled": True,
+        "base_url": "https://ai.example.com",
+        "api_key": "sk-local-secret",
+        "model": "gpt-4o-mini",
+    }
+    raw["proxy_pool"] = {"enabled": True, "sources": ["http://src.example.com:80"]}
+    save_document(raw, path, encryption_enabled=False)
+    monkeypatch.setenv("CHECKIN_CONFIG", str(path))
+    monkeypatch.setattr(
+        "newapi_checkin.remote_sync.cffi.request",
+        lambda method, url, **kwargs: FakeResponse(
+            {"accounts": [{"name": "新账号", "url": "https://new.example.com", "cookie": "c"}]}
+        ),
+    )
+
+    result = sync_remote_config()
+
+    assert result["ok"] is True
+    document = load_document(path)
+    assert document.raw["ai"]["api_key"] == "sk-local-secret"
+    assert document.raw["proxy_pool"]["enabled"] is True
+    assert document.raw["accounts"][0]["name"] == "新账号"
+
+
+def test_merge_remote_keeps_local_when_missing_and_applies_empty_arrays():
+    """合并语义：远端缺键保留本地；远端显式空数组按远端意图清空。"""
+    local = {
+        "accounts": [{"name": "A", "url": "https://a.example.com"}],
+        "ai": {"enabled": False, "api_key": "local-key"},
+        "proxy_pool": {"enabled": True},
+    }
+    merged = _merge_payload(local, {"accounts": [], "ai": {"enabled": True}})
+    assert merged["accounts"] == []
+    assert merged["ai"] == {"enabled": True}
+    assert merged["proxy_pool"] == {"enabled": True}  # 远端没带 -> 保留本地
+
+    # security / config_sync 永远不能被远端覆盖
+    local["security"] = {"encryption_enabled": True}
+    merged = _merge_payload(local, {"security": {"encryption_enabled": False}})
+    assert merged["security"] == {"encryption_enabled": True}
 
 
 def test_sync_sends_token_and_post_body(tmp_path, monkeypatch):

@@ -195,13 +195,22 @@ class VisionClient:
         with self._cooldown_lock:
             return max(0.0, self._cooldown_until - time.monotonic())
 
-    def _wait_cooldown(self) -> float:
-        """还在避让期内就先等满，返回实际等待秒数（不计入请求预算）。"""
+    def _wait_cooldown(self, max_wait: Optional[float] = None) -> float:
+        """还在避让期内就先等，返回实际等待秒数（不计入请求预算）。
+
+        max_wait 是本任务剩余墙钟预算：避让可以等，但不能等过任务预算，
+        否则会把 AI 任务整体拖到超时。传 None 表示不限时（默认行为不变）。
+        """
         waited = 0.0
         while True:
             left = self._cooldown_left()
             if left <= 0:
                 return waited
+            if max_wait is not None:
+                remaining = max_wait - waited
+                if remaining <= 0:
+                    return waited
+                left = min(left, remaining)
             log.warn(f"AI 处于超时避让期，等待 {left:.1f}s 后再请求")
             time.sleep(left)
             waited += left
@@ -259,16 +268,22 @@ class VisionClient:
             if not proxy:
                 log.err("AI 强制走代理，但当前拿不到任何代理，跳过本次视觉调用")
                 return None
+            self._local.proxy = proxy
 
         used = 0        # 计次重试（不含换 IP）
         swaps = 0       # 换 IP 次数，不限
         while used < attempts:
-            # 每次发请求前都尊重全局避让：别人刚超时，本线程也一起等
-            self._wait_cooldown()
             left = deadline - time.monotonic()
             if left <= 0.5:
                 log.warn(f"AI 调用已用满 {max(MIN_TASK_DEADLINE, per_request * TASK_DEADLINE_FACTOR):.0f}s "
                          f"墙钟上限（第 {used + 1} 次尝试前，已换 {swaps} 次 IP）")
+                break
+            # 每次发请求前都尊重全局避让；等待不能超过任务剩余预算
+            self._wait_cooldown(max_wait=left)
+            left = deadline - time.monotonic()
+            if left <= 0.5:
+                log.warn(f"AI 调用已用满 {max(MIN_TASK_DEADLINE, per_request * TASK_DEADLINE_FACTOR):.0f}s "
+                         f"墙钟上限（避让等待耗尽剩余预算，已换 {swaps} 次 IP）")
                 break
             limit = min(per_request, left)
             payload = self._payload(prompt, images, detail, max_tokens)
@@ -287,6 +302,9 @@ class VisionClient:
                         self._report_bad_proxy(proxy)
                         swaps += 1
                         proxy = nxt
+                        # 换代理成功后同步线程本地代理，避免下一次视觉请求
+                        # 又拿到已失败的旧代理
+                        self._local.proxy = proxy
                         log.warn(f"AI 请求经代理失败，换第 {swaps} 个 IP 重试: "
                                  f"{type(exc).__name__}: {exc}"[:160])
                         continue
@@ -299,6 +317,8 @@ class VisionClient:
                         continue
                     self._report_bad_proxy(proxy)
                     proxy = None
+                    # 降级直连同样同步线程本地代理，保证 current_proxy() 一致
+                    self._local.proxy = None
                     log.warn(f"AI 请求经代理失败，改为直连重试: "
                              f"{type(exc).__name__}: {exc}"[:160])
                     continue
@@ -308,7 +328,8 @@ class VisionClient:
                     self._enter_cooldown()
                     log.warn(f"AI 请求超时({used}/{attempts})，"
                              f"避让 {TIMEOUT_COOLDOWN:.0f}s 后再继续")
-                    self._wait_cooldown()
+                    # 避让等待不得超过任务剩余预算
+                    self._wait_cooldown(max_wait=max(0.0, deadline - time.monotonic()))
                 else:
                     log.debug(f"AI 请求异常({used}/{attempts}): {type(exc).__name__}: {exc}")
                 continue

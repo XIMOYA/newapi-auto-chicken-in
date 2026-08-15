@@ -94,6 +94,33 @@ def _close_handle() -> None:
         _LOG_HANDLE = None
 
 
+def _roll_log_if_needed(now: datetime) -> None:
+    """daemon 跨日运行时自动切换到新日期的日志文件。"""
+    global _LOG_FILE, _LOG_HANDLE
+    if _LOG_FILE is None:
+        return
+    expected = f"{now:%Y-%m-%d}.log"
+    if _LOG_FILE.name == expected:
+        return
+    _close_handle()
+    _LOG_FILE = _LOG_FILE.with_name(expected)
+    try:
+        _LOG_HANDLE = _LOG_FILE.open("a", encoding="utf-8", buffering=1)
+    except OSError:
+        _LOG_HANDLE = None
+
+
+def flush() -> None:
+    """把日志缓冲刷到磁盘，不关闭句柄（daemon stop 前调用）。"""
+    with _LOG_LOCK:
+        handle = _LOG_HANDLE
+        if handle is not None:
+            try:
+                handle.flush()
+            except (OSError, ValueError):
+                _close_handle()
+
+
 def shutdown() -> None:
     """关闭日志文件句柄（进程退出或切换日志目录前调用）。"""
     with _LOG_LOCK:
@@ -132,10 +159,12 @@ def mask(value: object, keep: int = 4) -> str:
 
 def _emit(markup: str, plain: str) -> None:
     console.print(markup)
-    timestamped = f"[{datetime.now():%H:%M:%S}] {plain}"
+    now = datetime.now()
+    timestamped = f"[{now:%H:%M:%S}] {plain}"
     with _LOG_LOCK:
         _RECENT_LOGS.append(timestamped)
         listeners = list(_LISTENERS)
+        _roll_log_if_needed(now)
         handle = _LOG_HANDLE
         if handle is not None:
             try:

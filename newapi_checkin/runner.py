@@ -53,6 +53,9 @@ MAX_BROWSER_PARALLELISM = 4
 ACCOUNT_DEADLINE_SECONDS = 900
 # 盾类重试的退避上限（秒）。连续硬刚 Cloudflare 只会让质询更难过
 SHIELD_RETRY_BACKOFF_MAX = 30
+# 出口 IP 探测结果缓存的上限。代理池在换 IP 时地址是有限的，但 daemon 长跑
+# 或手动配置频繁变更时不该让这个 dict 无界增长，超出后丢弃最早的一条。
+IP_CACHE_MAX = 256
 
 
 @dataclass
@@ -177,10 +180,29 @@ class Runner:
                 return self._ip_cache[key]
         ip = probe_exit_ip(proxy)
         with self._state_lock:
+            # 缓存有界：超出上限时丢弃最早的一条，避免长跑进程里无界增长
+            if len(self._ip_cache) >= IP_CACHE_MAX and key not in self._ip_cache:
+                self._ip_cache.pop(next(iter(self._ip_cache)))
             self._ip_cache.setdefault(key, ip)
             ip = self._ip_cache[key]
         log.debug(f"出口 IP: {ip or '探测失败（跳过 IP 比对）'}")
         return ip
+
+    def _close_ai(self) -> None:
+        """释放懒加载创建的 AI 客户端（关闭各线程的 curl session）。
+
+        AI 是可选降级项，关闭失败不影响退出码；run() 结束后调用，
+        避免 daemon 长跑或频繁轮次里泄漏 session 资源。
+        """
+        with self._state_lock:
+            ai = self._ai
+            self._ai = None
+        if ai is None:
+            return
+        try:
+            ai.close()
+        except Exception as exc:  # noqa: BLE001 - 关闭失败不影响退出码
+            log.debug(f"关闭 AI 客户端失败: {type(exc).__name__}: {exc}")
 
     def ai(self):
         with self._state_lock:
@@ -312,20 +334,25 @@ class Runner:
         # desired 比账号数多 10：留出换 IP 的余量，账号越多目标越大
         self.init_proxy_pool(desired=len(accounts) + 10, accounts=len(accounts))
 
-        mode = "dry-run 连通性检查" if self.options.dry_run else "签到"
-        log.step(f"开始{mode}，共 {len(accounts)} 个账号")
-        workers = self._parallelism()
-        browser_workers = self._browser_workers()
-        self._browser_gate = threading.Semaphore(browser_workers)
-        if workers <= 1:
-            exit_code = self._run_serial(accounts)
-        else:
-            log.info(f"账号级并行度 {workers}，浏览器并发上限 {browser_workers}")
-            exit_code = self._run_parallel(accounts, workers)
+        try:
+            mode = "dry-run 连通性检查" if self.options.dry_run else "签到"
+            log.step(f"开始{mode}，共 {len(accounts)} 个账号")
+            workers = self._parallelism()
+            browser_workers = self._browser_workers()
+            self._browser_gate = threading.Semaphore(browser_workers)
+            if workers <= 1:
+                exit_code = self._run_serial(accounts)
+            else:
+                log.info(f"账号级并行度 {workers}，浏览器并发上限 {browser_workers}")
+                exit_code = self._run_parallel(accounts, workers)
 
-        # 邮件通知：无论成败都发；失败只 WARN 不影响退出码
-        self._send_notification()
-        return exit_code
+            # 邮件通知：无论成败都发；失败只 WARN 不影响退出码
+            self._send_notification()
+            return exit_code
+        finally:
+            # 释放懒加载创建的 AI 客户端（含各线程的 curl session），
+            # 避免 daemon 长跑或多轮执行时泄漏资源。
+            self._close_ai()
 
     def _send_notification(self) -> None:
         """把本轮汇总表以 HTML 邮件发出。未配置/发送失败均降级为 WARN。"""
@@ -396,7 +423,9 @@ class Runner:
 
         total = len(accounts)
         rows: dict = {}
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="checkin") as pool:
+        interrupted = False
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="checkin")
+        try:
             futures = {}
             for idx, account in enumerate(accounts, start=1):
                 with log.context(account.name):
@@ -410,11 +439,8 @@ class Runner:
                     row = future.result()
                 except KeyboardInterrupt:
                     log.warn("收到中断信号，停止等待后续账号")
-                    for pending in futures:
-                        pending.cancel()
-                    self.store.flush()
-                    self.summary.render()
-                    return 130
+                    interrupted = True
+                    break
                 except Exception as exc:  # noqa: BLE001 - 单账号异常不能拖垮整轮
                     with log.context(account.name):
                         log.err(f"未预期异常: {type(exc).__name__}: {exc}")
@@ -429,6 +455,11 @@ class Runner:
                     log.step(f"{done}/{total} 结束: "
                              f"{log.STATUS_LABEL.get(row.status, row.status)}")
                 self.store.flush_throttled()
+        finally:
+            # 中断时不能 shutdown(wait=True)：正在运行的账号可能卡在网络重试或
+            # 退避 sleep 里，等待会让 Ctrl+C 变成「挂起」。cancel_futures 取消
+            # 尚未开始的任务，已运行的工作线程是 daemon，进程可正常退出。
+            pool.shutdown(wait=False, cancel_futures=interrupted)
 
         self.store.flush()
         for account in accounts:
@@ -436,6 +467,8 @@ class Runner:
             if row is not None:
                 self.summary.add(row)
         self.summary.render()
+        if interrupted:
+            return 130
         return 0 if self.summary.failed == 0 else 1
 
     # ------------------------------------------------------------------ #

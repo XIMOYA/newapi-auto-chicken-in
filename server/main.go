@@ -3,28 +3,56 @@ server/main.go
 NewAPI 签到配置管理平台 · 服务入口
 
 职责：
-- 读取环境变量（NCF_DB_PATH / NCF_JWT_SECRET / NCF_ADMIN_USER / NCF_ADMIN_PASS / NCF_HTTP_ADDR）
+- 读取环境变量（NCF_DB_PATH / NCF_JWT_SECRET / NCF_ADMIN_USER / NCF_ADMIN_PASS / NCF_HTTP_ADDR / NCF_ENV）
 - 初始化 SQLite（建表、初始管理员、默认配置）
-- 注册路由并启动 HTTP 服务
+- 注册路由并启动 HTTP 服务（带读/写超时与优雅关闭）
 - 托管前端静态文件（web/dist 存在时）
 
 环境变量：
 - NCF_DB_PATH    SQLite 文件路径，默认 ./data/config.db
-- NCF_JWT_SECRET JWT 签名密钥（至少 32 字符，必填）
-- NCF_ADMIN_USER / NCF_ADMIN_PASS 初始管理员账号密码（仅 users 表为空时生效）
+- NCF_JWT_SECRET JWT 签名密钥（至少 32 字符；NCF_ENV=production 时必填）
+- NCF_ADMIN_USER / NCF_ADMIN_PASS 初始管理员账号密码（仅 users 表为空时生效；无内置默认弱密码）
 - NCF_HTTP_ADDR  监听地址，默认 127.0.0.1:8080
+- NCF_ENV        环境标记；production 时强制要求显式设置 NCF_JWT_SECRET
 */
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 )
+
+// resolveJWTSecret 根据环境与已设置的密钥决定最终 JWT 签名密钥：
+// - NCF_ENV=production：必须显式提供至少 32 字符密钥，否则报错（绝不随机生成）。
+// - 其他环境：未设置时随机生成（调用方不得打印密钥本身）；弱密钥仅警告照常使用。
+func resolveJWTSecret(env, secret string) (string, error) {
+	if isProduction(env) {
+		if len(secret) < 32 {
+			return "", fmt.Errorf("NCF_ENV=production 时必须设置 NCF_JWT_SECRET（至少 32 字符）")
+		}
+		return secret, nil
+	}
+	if secret == "" {
+		return randomHex(32), nil
+	}
+	return secret, nil
+}
+
+// isProduction 判断 NCF_ENV 是否为 production（忽略大小写与空白）。
+func isProduction(env string) bool {
+	return strings.EqualFold(strings.TrimSpace(env), "production")
+}
 
 func main() {
 	// 自动加载 .env 文件（若存在），便于宝塔/手动部署：目录里放 .env 即可配置
@@ -35,17 +63,25 @@ func main() {
 	dbPath := getenv("NCF_DB_PATH", "./data/config.db")
 	addr := getenv("NCF_HTTP_ADDR", "127.0.0.1:8080")
 
-	// JWT 密钥：未设置时自动生成随机密钥，保证开箱即用；
-	// 重启后已签发的登录态会失效，生产环境请用环境变量固定。
-	jwtSecret := os.Getenv("NCF_JWT_SECRET")
-	if jwtSecret == "" {
-		jwtSecret = randomHex(32)
-		log.Printf("NCF_JWT_SECRET 未设置，已自动生成随机密钥（重启后登录态失效；生产环境请固定该值）")
-	} else if len(jwtSecret) < 32 {
-		log.Printf("NCF_JWT_SECRET 长度不足 32 字符（当前 %d），已按所设值使用；建议使用至少 32 字符的强密钥", len(jwtSecret))
+	// JWT 密钥：生产必须显式配置；非生产未设置时随机生成（绝不打印密钥内容）。
+	env := os.Getenv("NCF_ENV")
+	jwtSecret, err := resolveJWTSecret(env, os.Getenv("NCF_JWT_SECRET"))
+	if err != nil {
+		log.Fatalf("JWT 密钥配置错误: %v", err)
 	}
+	if envSecret := os.Getenv("NCF_JWT_SECRET"); !isProduction(env) {
+		if envSecret == "" {
+			log.Printf("NCF_JWT_SECRET 未设置，已自动生成随机密钥（重启后登录态失效；生产环境请用 NCF_ENV=production + NCF_JWT_SECRET 固定）")
+		} else if len(envSecret) < 32 {
+			log.Printf("NCF_JWT_SECRET 长度不足 32 字符（当前 %d）；建议使用至少 32 字符的强密钥", len(envSecret))
+		}
+	}
+
+	// 初始管理员：不再提供默认弱密码。
+	// NCF_ADMIN_PASS 未设置时，users 表已有账号则照常启动（升级场景）；
+	// users 表为空则直接失败，提示通过环境变量提供初始凭据。
 	adminUser := getenv("NCF_ADMIN_USER", "admin")
-	adminPass := getenv("NCF_ADMIN_PASS", "admin123456")
+	adminPass := os.Getenv("NCF_ADMIN_PASS")
 
 	db, err := OpenDB(dbPath)
 	if err != nil {
@@ -70,7 +106,6 @@ func main() {
 
 	srv := NewServer(db, jwtSecret)
 	log.Printf("NewAPI 签到配置管理平台已启动，监听 %s（数据库: %s）", addr, dbPath)
-	log.Printf("初始管理员: %s / %s（仅首次创建，建议登录后修改密码）", adminUser, adminPass)
 	if dist := findDistDir(); dist != "" {
 		log.Printf("托管前端静态文件（外部目录，开发热更新）: %s", dist)
 	} else if hasEmbeddedFrontend() {
@@ -82,8 +117,38 @@ func main() {
 	// 代理池后台刷新：按 proxy_pool.refresh_minutes 周期抓取+测通（可配置，<=0 关闭）
 	startProxyRefresher(db, srv.proxies)
 
-	if err := http.ListenAndServe(addr, srv.routes()); err != nil {
+	// HTTP 服务：统一超时防慢速攻击与连接耗尽
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           srv.routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// 优雅关闭：收到 SIGINT/SIGTERM 后停止接收新连接，等待存量请求完成
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case err := <-errCh:
 		log.Fatalf("HTTP 服务异常退出: %v", err)
+	case <-ctx.Done():
+		log.Printf("收到退出信号，正在优雅关闭 HTTP 服务…")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("优雅关闭超时或失败: %v", err)
+		}
+		log.Printf("HTTP 服务已关闭")
 	}
 }
 

@@ -1,4 +1,4 @@
-"""远程配置 API 获取、AES-GCM 解密和本地明文落盘。"""
+"""远程配置 API 获取、AES-GCM 解密和本地保存（保留本地加密状态）。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from curl_cffi import requests as cffi
 
+from . import logger as log
 from .config import (
     ConfigError,
     ConfigSyncConfig,
@@ -22,6 +23,33 @@ from .utils import sanitize_header_value
 
 class RemoteSyncError(ValueError):
     """远程配置同步失败。"""
+
+
+# 远端永远不能覆盖的本地模块：同步设置和密钥必须由本地控制，
+# 否则覆盖后可能再也无法同步/解密。
+_LOCAL_CONTROLLED_KEYS = frozenset({"security", "config_sync"})
+# 参与合并的业务模块（缺失告警用）。
+_SYNC_MODULES = ("accounts", "ai", "browser", "http", "defaults", "proxy_pool", "notify")
+
+
+def _merge_payload(local_raw: dict, payload: dict) -> dict:
+    """把远端 payload 合并到本地配置。
+
+    - 远端没带的顶级模块保留本地（缺键不动）。
+    - 远端显式给出的值（包括显式空数组）按远端意图覆盖。
+    - security / config_sync 永远由本地控制。
+    """
+    merged = copy.deepcopy(local_raw)
+    for key, value in payload.items():
+        if key in _LOCAL_CONTROLLED_KEYS:
+            continue
+        merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _missing_modules(local_raw: dict, payload: dict) -> list:
+    """本地存在但远端没提供的业务模块（保留本地并告警）。"""
+    return [key for key in _SYNC_MODULES if key in local_raw and key not in payload]
 
 
 def _json_value(value: Any) -> Any:
@@ -142,7 +170,7 @@ def sync_remote_config(
     force: bool = False,
     auto_only: bool = False,
 ) -> dict:
-    """请求远程配置，解密后校验并明文写回当前 config.json。"""
+    """请求远程配置，解密后校验并按本地加密状态写回 config.json。"""
     try:
         document = load_document(path)
         sync = ConfigSyncConfig.from_raw(document.raw.get("config_sync"))
@@ -155,16 +183,19 @@ def sync_remote_config(
         key = config_key_from_environment(document.security.config_key)
         payload, encrypted = _decode_payload(response_data, sync, key)
 
-        merged = copy.deepcopy(document.raw)
-        merged.update(payload)
+        merged = _merge_payload(document.raw, payload)
+        missing = _missing_modules(document.raw, payload)
+        if missing:
+            log.warn(f"远程配置缺少本地模块: {', '.join(missing)}；保留本地设置")
         # 同步设置和密钥由本地控制，避免远端配置覆盖后无法再次同步。
         merged["config_sync"] = copy.deepcopy(document.raw.get("config_sync") or sync.to_dict())
-        merged["security"] = {
-            "encryption_enabled": False,
-            "config_key": document.security.config_key,
-            "encrypted_file": document.security.encrypted_file,
-        }
-        saved = save_document(merged, document.path, encryption_enabled=False)
+        # 保留本地 security 加密状态：原配置加密时用原密钥继续加密保存，
+        # 禁止同步后明文落盘或删除密文文件。
+        saved = save_document(
+            merged,
+            document.path,
+            encryption_enabled=document.security.encryption_enabled,
+        )
         cfg = load_config(saved.path)
         return {
             "ok": True,
@@ -173,7 +204,7 @@ def sync_remote_config(
             "encrypted_response": encrypted,
             "path": str(saved.path),
             "account_count": len(cfg.accounts),
-            "message": "远程配置已获取、解密并明文保存到本地",
+            "message": "远程配置已获取并保存到本地",
         }
     except (ConfigError, OSError, ValueError) as exc:
         return {"ok": False, "operation": "sync_config", "error": str(exc)}

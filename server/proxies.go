@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -170,10 +171,54 @@ func NewProxyManager(db *sql.DB) *ProxyManager {
 	return &ProxyManager{db: db}
 }
 
+// beginRun 尝试获取「刷新/测速」互斥执行权；已有任务在进行时返回 false。
+// 刷新与测速共用同一个互斥位：禁止并发清库/写库/覆盖同一进度对象。
+func (m *ProxyManager) beginRun(stage string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running {
+		return false
+	}
+	m.running = true
+	m.progress = ProxyProgress{
+		Running:   true,
+		Stage:     stage,
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	return true
+}
+
+// endRun 释放互斥执行权并记录完成时间；errMsg 非空时写入 lastErr。
+func (m *ProxyManager) endRun(errMsg string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.running = false
+	m.lastRun = time.Now()
+	m.progress.Running = false
+	m.progress.Stage = "done"
+	if t, err := time.Parse(time.RFC3339, m.progress.StartedAt); err == nil {
+		m.progress.DurationSec = int(time.Since(t).Seconds())
+	}
+	if errMsg != "" {
+		m.lastErr = errMsg
+	}
+}
+
 // LastRun / LastError / IsRunning 供状态接口展示。
 func (m *ProxyManager) LastRun() time.Time { m.mu.RLock(); defer m.mu.RUnlock(); return m.lastRun }
 func (m *ProxyManager) LastError() string  { m.mu.RLock(); defer m.mu.RUnlock(); return m.lastErr }
 func (m *ProxyManager) IsRunning() bool    { m.mu.RLock(); defer m.mu.RUnlock(); return m.running }
+
+// LastRunRFC3339 返回最近一次刷新/测速完成时间（RFC3339）；从未运行过返回空串，
+// 避免前端拿到 Go 时间零点（0001-01-01T00:00:00Z）。
+func (m *ProxyManager) LastRunRFC3339() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.lastRun.IsZero() {
+		return ""
+	}
+	return m.lastRun.UTC().Format(time.RFC3339)
+}
 
 // Progress 返回当前进度快照。
 func (m *ProxyManager) Progress() ProxyProgress {
@@ -238,10 +283,36 @@ func fetchSourceOnce(url string, timeout int) []string {
 	return parseProxyLines(buf.String())
 }
 
+// proxyTestTransport 测通/测速共用的 HTTP Transport：连接池跨代理复用，
+// 避免每测一条代理就新建 Transport，堆积大量空闲连接与端口。
+// 目标代理地址经请求上下文传入（见 ctxKeyProxyAddr / proxyFromRequest）。
+var proxyTestTransport = &http.Transport{
+	Proxy: proxyFromRequest,
+	DialContext: (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	MaxIdleConns:          256,
+	MaxIdleConnsPerHost:   16,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
+// ctxKeyProxyAddr 请求上下文键：当前请求要经过的代理地址（host:port）。
+type ctxKeyProxyAddr struct{}
+
+// proxyFromRequest 从请求上下文读取代理地址；未设置时直连。
+func proxyFromRequest(r *http.Request) (*url.URL, error) {
+	if addr, ok := r.Context().Value(ctxKeyProxyAddr{}).(string); ok && addr != "" {
+		return url.Parse("http://" + addr)
+	}
+	return nil, nil
+}
+
 // testProxyLatency 测一个代理：GET test_url，返回延迟毫秒；失败返回 -1。
 // 使用 ctx 控制生命周期：时间盒一到，进行中的请求立即取消，不拖住刷新流程。
 func testProxyLatency(ctx context.Context, addr, testURL string, timeout int) int {
-	proxyURL := "http://" + addr
 	reqCtx := ctx
 	if timeout > 0 {
 		// 单条也有超时上限；与整体时间盒取更早生效的一个
@@ -249,17 +320,13 @@ func testProxyLatency(ctx context.Context, addr, testURL string, timeout int) in
 		reqCtx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 		defer cancel()
 	}
+	reqCtx = context.WithValue(reqCtx, ctxKeyProxyAddr{}, addr)
 	req, err := http.NewRequestWithContext(reqCtx, "GET", testURL, nil)
 	if err != nil {
 		return -1
 	}
-	client := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(mustParseURL(proxyURL)),
-		},
-	}
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := proxyTestTransport.RoundTrip(req)
 	if err != nil {
 		return -1
 	}
@@ -267,9 +334,8 @@ func testProxyLatency(ctx context.Context, addr, testURL string, timeout int) in
 	if resp.StatusCode != http.StatusOK {
 		return -1
 	}
-	// 读一点 body 确保链路真的通
-	one := make([]byte, 16)
-	_, _ = resp.Body.Read(one)
+	// 读完整 body 确保链路真的通（请求受 ctx 超时约束），并支持连接复用
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return int(time.Since(start).Milliseconds())
 }
 
@@ -280,23 +346,17 @@ func testProxyLatency(ctx context.Context, addr, testURL string, timeout int) in
 //   - saveLimit>0 时，测通过程中一旦可用数达到 saveLimit 就提前收手（免费代理够用即可，省时间）
 //   - 达不到 saveLimit（或未限制）就继续测完全部候选，直到耗尽（不中途放弃）
 //   - 仅保留一个宽泛的绝对上限 REFRESH_ABSOLUTE_MAX，防止极端卡死拖死后台
-func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error) {
-	m.mu.Lock()
-	if m.running {
-		m.mu.Unlock()
-		return 0, fmt.Errorf("代理池刷新已在进行中")
+func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (aliveCount int, retErr error) {
+	// 刷新与测速共用互斥位：并发刷新/测速时直接拒绝，避免清库/写库互相踩踏
+	if !m.beginRun("fetching") {
+		return 0, fmt.Errorf("代理池刷新或测速已在进行中")
 	}
-	m.running = true
-	started := time.Now()
-	m.mu.Unlock()
 	defer func() {
-		m.mu.Lock()
-		m.running = false
-		m.lastRun = time.Now()
-		m.progress.Running = false
-		m.progress.Stage = "done"
-		m.progress.DurationSec = int(time.Since(started).Seconds())
-		m.mu.Unlock()
+		msg := ""
+		if retErr != nil {
+			msg = retErr.Error()
+		}
+		m.endRun(msg)
 	}()
 
 	sources := cfg.Sources
@@ -315,6 +375,7 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 	}
 
 	// 1) 并发抓取所有源（阶段：fetching）。每个源写自己的下标，不需要加锁。
+	started := time.Now()
 	progressTarget := saveLimit
 	if unlimited {
 		progressTarget = 0
@@ -376,7 +437,7 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 	})
 
 	results := make([]ProxyEntry, 0, len(all))
-	aliveCount := 0
+	aliveCount = 0
 	var mu2 sync.Mutex
 	sem := make(chan struct{}, workers)
 	var wg2 sync.WaitGroup
@@ -548,24 +609,19 @@ const SpeedTestBytes = 1048576
 
 // testProxySpeed 通过代理下载测速数据，返回实际吞吐（字节/秒）；失败返回 -1。
 func testProxySpeed(ctx context.Context, addr, speedURL string, timeout int) int64 {
-	proxyURL := "http://" + addr
 	reqCtx := ctx
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		reqCtx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 		defer cancel()
 	}
+	reqCtx = context.WithValue(reqCtx, ctxKeyProxyAddr{}, addr)
 	req, err := http.NewRequestWithContext(reqCtx, "GET", speedURL, nil)
 	if err != nil {
 		return -1
 	}
-	client := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(mustParseURL(proxyURL)),
-		},
-	}
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := proxyTestTransport.RoundTrip(req)
 	if err != nil {
 		return -1
 	}
@@ -593,21 +649,27 @@ func testProxySpeed(ctx context.Context, addr, speedURL string, timeout int) int
 	return int64(float64(total) / elapsed)
 }
 
+// speedTestBackgroundTimeout 测速后台任务的独立绝对超时：
+// 不随 HTTP 请求结束/取消而中断（handler 在独立 context 中执行测速）。
+const speedTestBackgroundTimeout = 120 * time.Second
+
 // SpeedTest 对指定代理列表测速并写库（返回成功更新的条目数）。
 // addrs 为空表示对全部可用代理测速。
-func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout int) (int, error) {
+// 与 RefreshProxies 共用互斥位：并发刷新/测速时直接拒绝。
+func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout int) (updated int, retErr error) {
+	if !m.beginRun("speedtest") {
+		return 0, fmt.Errorf("代理池刷新或测速已在进行中")
+	}
+	defer func() {
+		msg := ""
+		if retErr != nil {
+			msg = retErr.Error()
+		}
+		m.endRun(msg)
+	}()
 	if timeout <= 0 {
 		timeout = 15
 	}
-	started := time.Now()
-	m.setProgress(ProxyProgress{Running: true, Stage: "speedtest", Target: len(addrs), StartedAt: started.UTC().Format(time.RFC3339)})
-	defer func() {
-		m.updateProgress(func(p *ProxyProgress) {
-			p.Running = false
-			p.Stage = "done"
-			p.DurationSec = int(time.Since(started).Seconds())
-		})
-	}()
 
 	entries, err := m.ListProxies(true, 2000)
 	if err != nil {
@@ -640,7 +702,6 @@ func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout in
 		workers = len(target)
 	}
 	var mu sync.Mutex
-	var updated int
 	var done int
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, workers)
@@ -766,14 +827,6 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func mustParseURL(raw string) *url.URL {
-	u, err := url.Parse(raw)
-	if err != nil {
-		panic(err)
-	}
-	return u
 }
 
 var defaultProxySources = []string{

@@ -186,6 +186,7 @@ import {
 } from '@vicons/ionicons5'
 import { listProxies, getProxyStats, refreshProxies, speedTestProxies } from '@/api/proxies'
 import { extractErrorMessage } from '@/utils/error'
+import { pollStateFromStats, shouldReloadAfterCompletion, type ProxyPollSnapshot } from '@/utils/proxyPolling'
 import type { ProxyEntry, ProxyProgress, ProxyStatsResult } from '@/types'
 
 const message = useMessage()
@@ -203,6 +204,8 @@ const sortBy = ref<'latency' | 'speed'>('latency')
 const selectedKeys = ref<number[]>([])
 const speedModalVisible = ref(false)
 let pollTimer: number | undefined
+/** 上一次轮询快照，用于检测后台任务「恰好完成」的转移 */
+let lastPollState: ProxyPollSnapshot | null = null
 
 // ---- 进度轮询 ----
 const progressStage = computed(() => progress.value?.stage ?? '')
@@ -342,6 +345,8 @@ async function loadProxyData() {
     proxies.value = listRes.proxies
     stats.value = statsRes
     progress.value = statsRes.progress ?? null
+    // 同步记录当前轮询快照，保证「运行中 -> 完成」的转移判断基线正确
+    lastPollState = pollStateFromStats(statsRes)
   } catch (e) {
     message.error(extractErrorMessage(e, '获取代理列表失败'))
   } finally {
@@ -355,12 +360,15 @@ function startPolling() {
   pollTimer = window.setInterval(async () => {
     try {
       const statsRes = await getProxyStats()
+      // 先用旧快照判断任务是否「恰好完成」，再更新页面状态，避免被新值覆盖后漏判
+      const nextSnapshot = pollStateFromStats(statsRes)
+      const completed = shouldReloadAfterCompletion(lastPollState, nextSnapshot)
+      lastPollState = nextSnapshot
       stats.value = statsRes
       progress.value = statsRes.progress ?? null
-      // 后台任务结束则刷新一次列表
-      const prevRunning = progress.value?.running
-      if (prevRunning === false && statsRes.running === false && statsRes.progress?.running === false) {
-        if (prevRunning) loadProxyData()
+      if (completed) {
+        // 后台刷新/测速已结束，刷新一次列表，保证列表与最新进度一致
+        loadProxyData()
       }
     } catch {
       // 轮询失败静默，不打扰用户

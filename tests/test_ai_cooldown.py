@@ -133,6 +133,20 @@ class TestCooldown:
         assert client.classify_page(b"png").state == "unknown"
         assert 1 <= len(session.calls) <= 3
 
+    def test_cooldown_wait_capped_by_remaining_budget(self, monkeypatch):
+        """避让等待不能超过任务剩余预算，否则会把整个任务拖过墙钟上限。"""
+        monkeypatch.setattr(vision_mod, "TIMEOUT_COOLDOWN", 5.0)
+        monkeypatch.setattr(vision_mod, "MIN_TASK_DEADLINE", 1.0)
+        monkeypatch.setattr(vision_mod, "TASK_DEADLINE_FACTOR", 0.1)
+        client, session = _client([TimeoutLike("t"), TimeoutLike("t")], monkeypatch,
+                                  cooldown=5.0, timeout=2, max_retries=2)
+        started = time.monotonic()
+        assert client.classify_page(b"png").state == "unknown"
+        elapsed = time.monotonic() - started
+        # 任务预算只有 1s：即使避让期长达 5s，也不能真的等满 5s
+        assert elapsed < 2.0
+        assert 1 <= len(session.calls) <= 2
+
     def test_cooldown_waits_are_serialised_not_stacked(self, monkeypatch):
         """两个线程同时撞上同一个避让期，总等待时间不应该叠加。"""
         client, _session = _client([FakeResp(), FakeResp()], monkeypatch, cooldown=0.4)
@@ -282,6 +296,28 @@ class TestAIRequiresProxy:
             assert client.classify_page(b"png").state == "passed"
         # 被换掉的 p1/p2 都上报，最后跑通的 p3 不上报
         assert dropped == ["p1:80", "p2:80"]
+
+    def test_thread_local_proxy_updated_after_swap(self, monkeypatch):
+        """换代理成功后线程本地代理跟着更新，避免下次请求拿到旧代理。"""
+        client, _session, _handed = self._pooled(
+            monkeypatch,
+            [RuntimeError("proxy down"), FakeResp()],
+            ["p2:80"],
+        )
+        with client.use_proxy("p1:80"):
+            assert client.classify_page(b"png").state == "passed"
+            assert client.current_proxy() == "p2:80"
+        assert client.current_proxy() is None
+
+    def test_thread_local_proxy_cleared_on_direct_fallback(self, monkeypatch):
+        """降级直连时线程本地代理要清掉，current_proxy() 保持一致。"""
+        client, _session, _handed = self._pooled(
+            monkeypatch, [RuntimeError("x"), FakeResp()], [], require=False,
+        )
+        with client.use_proxy("p1:80"):
+            assert client.classify_page(b"png").state == "passed"
+            assert client.current_proxy() is None
+        assert client.current_proxy() is None
 
     def test_reused_ip_is_not_reported_when_pool_is_dry(self, monkeypatch):
         """池子空了只能沿用当前 IP 重试时不上报——下一轮还得靠它。
