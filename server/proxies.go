@@ -6,7 +6,7 @@ server/proxies.go
 - proxies 表：保存抓取到的代理条目（来源 / host:port / 延迟 / 存活状态 / 时间）
 - FetchProxiesFromSources：并发抓取所有配置的 sources，解析 host:port
 - TestProxyLatency：对单个代理打 test_url 测通并返回延迟（毫秒）
-- RefreshProxies：全量刷新流程（抓取 → 去重 → 并发测通 → 按延迟排序 → 截断保存）
+- RefreshProxies：全量刷新流程（抓取 → 去重 → 并发测通 → 按延迟排序 → 保存；saveLimit<=0 不限制）
 - 后台协程：按 refresh_minutes 周期调用 RefreshProxies（由 main 启动）
 
 安全边界：测通只打配置的 test_url（默认 api.ipify.org），绝不打目标站点。
@@ -19,9 +19,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -154,15 +157,15 @@ type ProxyManager struct {
 
 // ProxyProgress 刷新/测速的实时进度（前端轮询 /api/proxies/stats 展示）。
 type ProxyProgress struct {
-	Running   bool   `json:"running"`
-	Stage     string `json:"stage"` // fetching | testing | speedtest | done
-	Fetched   int    `json:"fetched"`   // 去重后的候选总数
-	Candidates int   `json:"candidates"` // 本次候选数（=Fetched）
-	Tested    int    `json:"tested"`    // 已测完条数
-	Alive     int    `json:"alive"`     // 当前可用条数
-	Target    int    `json:"target"`    // 目标可用数（达到即提前结束）
-	StartedAt string `json:"started_at"`
-	DurationSec int  `json:"duration_sec"`
+	Running     bool   `json:"running"`
+	Stage       string `json:"stage"`      // fetching | testing | speedtest | done
+	Fetched     int    `json:"fetched"`    // 去重后的候选总数
+	Candidates  int    `json:"candidates"` // 本次候选数（=Fetched）
+	Tested      int    `json:"tested"`     // 已测完条数
+	Alive       int    `json:"alive"`      // 当前可用条数
+	Target      int    `json:"target"`     // 目标可用数（达到即提前结束）
+	StartedAt   string `json:"started_at"`
+	DurationSec int    `json:"duration_sec"`
 }
 
 func NewProxyManager(db *sql.DB) *ProxyManager {
@@ -272,12 +275,12 @@ func testProxyLatency(ctx context.Context, addr, testURL string, timeout int) in
 	return int(time.Since(start).Milliseconds())
 }
 
-// RefreshProxies 全量刷新：抓取 → 去重 → 并发测通 → 按延迟排序 → 截断保存。
-// 返回可用代理数；saveLimit<=0 时默认 100。
+// RefreshProxies 全量刷新：抓取 → 去重 → 并发测通 → 按延迟排序 → 保存。
+// 返回可用代理数；saveLimit<=0 表示不限制（上游抓到多少就全测，测通多少存多少）。
 //
 // 结束策略（目标驱动，不做死时间盒）：
-//   - 测通过程中一旦可用数达到 saveLimit 就提前收手（免费代理够用即可，省时间）
-//   - 达不到 saveLimit 就继续测完全部候选，直到耗尽（不中途放弃）
+//   - saveLimit>0 时，测通过程中一旦可用数达到 saveLimit 就提前收手（免费代理够用即可，省时间）
+//   - 达不到 saveLimit（或未限制）就继续测完全部候选，直到耗尽（不中途放弃）
 //   - 仅保留一个宽泛的绝对上限 REFRESH_ABSOLUTE_MAX，防止极端卡死拖死后台
 func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error) {
 	m.mu.Lock()
@@ -302,9 +305,8 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 	if len(sources) == 0 {
 		sources = defaultProxySources
 	}
-	if saveLimit <= 0 {
-		saveLimit = 100
-	}
+	// saveLimit <= 0 表示不限制：上游抓到多少就全测、测通多少就全存
+	unlimited := saveLimit <= 0
 	testURL := cfg.TestURL
 	if testURL == "" {
 		testURL = "https://api.ipify.org"
@@ -314,39 +316,54 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 		timeout = 8
 	}
 
-	// 1) 并发抓取所有源（阶段：fetching）
-	m.setProgress(ProxyProgress{Running: true, Stage: "fetching", Target: saveLimit, StartedAt: started.UTC().Format(time.RFC3339)})
-	seen := map[string]string{} // addr -> source（首次出现的源保留）
-	var mu sync.Mutex
+	// 1) 并发抓取所有源（阶段：fetching）。每个源写自己的下标，不需要加锁。
+	progressTarget := saveLimit
+	if unlimited {
+		progressTarget = 0
+	}
+	m.setProgress(ProxyProgress{Running: true, Stage: "fetching", Target: progressTarget, StartedAt: started.UTC().Format(time.RFC3339)})
+	perSource := make([][]string, len(sources))
 	var wg sync.WaitGroup
-	for _, src := range sources {
+	for i, src := range sources {
 		wg.Add(1)
-		go func(s string) {
+		go func(idx int, s string) {
 			defer wg.Done()
-			items := fetchSource(s, timeout)
-			mu.Lock()
-			for _, addr := range items {
-				if _, ok := seen[addr]; !ok {
-					seen[addr] = s
-				}
-			}
-			mu.Unlock()
-		}(src)
+			perSource[idx] = fetchSource(s, timeout)
+		}(i, src)
 	}
 	wg.Wait()
-	if len(seen) == 0 {
+
+	// 2) 按源轮转合并去重：免费代理源普遍把「刚验过/存活率高」的排在列表前面，
+	//    用 map 迭代会把这个顺序打乱，导致提前停时测到的是随机子集。
+	type item struct{ addr, source string }
+	all := make([]item, 0)
+	seen := map[string]bool{}
+	for round := 0; ; round++ {
+		progressed := false
+		for i, entries := range perSource {
+			if round >= len(entries) {
+				continue
+			}
+			progressed = true
+			addr := entries[round]
+			if seen[addr] {
+				continue
+			}
+			seen[addr] = true
+			all = append(all, item{addr, sources[i]})
+		}
+		if !progressed {
+			break
+		}
+	}
+	if len(all) == 0 {
 		m.mu.Lock()
 		m.lastErr = "所有代理源均未返回可用条目"
 		m.mu.Unlock()
 		return 0, nil
 	}
 
-	// 2) 并发测通（目标驱动：达到 saveLimit 即停；否则测完全部候选）
-	type item struct{ addr, source string }
-	all := make([]item, 0, len(seen))
-	for addr, src := range seen {
-		all = append(all, item{addr, src})
-	}
+	// 3) 并发测通（saveLimit > 0 时达标提前停；不限制时测完全部候选）
 	workers := cfg.MaxWorkers
 	if workers <= 0 {
 		workers = 25
@@ -357,7 +374,7 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 
 	m.setProgress(ProxyProgress{
 		Running: true, Stage: "testing", Fetched: len(all), Candidates: len(all),
-		Target: saveLimit, StartedAt: started.UTC().Format(time.RFC3339),
+		Target: progressTarget, StartedAt: started.UTC().Format(time.RFC3339),
 	})
 
 	results := make([]ProxyEntry, 0, len(all))
@@ -366,22 +383,42 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 	sem := make(chan struct{}, workers)
 	var wg2 sync.WaitGroup
 	stop := false
+dispatch:
 	for _, it := range all {
 		mu2.Lock()
-		if stop {
-			mu2.Unlock()
+		halted := stop
+		mu2.Unlock()
+		if halted {
 			break
 		}
-		mu2.Unlock()
+		// 信号量必须在**派发之前**获取：放在 goroutine 里获取等于不限流，
+		// 几千个候选会瞬间 spawn 出几千个 goroutine 全堵在这里，
+		// 而且 stop 标志根本来不及生效。
+		select {
+		case sem <- struct{}{}:
+			// 抢到名额，正常派发；槽位由 goroutine 的 defer 归还（严格 1:1）
+		case <-ctx.Done():
+			// 整体时间盒已到：这一支没有占到信号量，绝不能继续往下走
+			// 去 `<-sem`，那会误释放其他 goroutine 的槽位（channel 空时
+			// 甚至永久阻塞）。直接跳出派发循环不再 spawn；
+			// 已派发的 goroutine 各自检查 ctx.Err() 后归还自己的槽位退出。
+			break dispatch
+		}
 		wg2.Add(1)
 		go func(it item) {
 			defer wg2.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
+			defer func() { <-sem }()
+			// 抢到名额到真正开工之间，可能有别的 goroutine 已把 alive 推到
+			// saveLimit 并置位 stop：此时立即退出并归还名额，别让「达标即停」失效
+			mu2.Lock()
+			halted := stop
+			mu2.Unlock()
+			if halted {
 				return
 			}
-			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
 			latency := testProxyLatency(ctx, it.addr, testURL, timeout)
 			alive := latency >= 0
 			mu2.Lock()
@@ -401,22 +438,27 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (int, error)
 				p.Alive = aliveCount
 				p.Stage = "testing"
 			})
-			// 达标提前停：可用数够用了就不测剩下的
-			if aliveCount >= saveLimit {
+			// 达标提前停：只在显式配了 saveLimit 时生效
+			if !unlimited && aliveCount >= saveLimit {
 				stop = true
 			}
 			mu2.Unlock()
 		}(it)
 	}
 	wg2.Wait()
-	log.Printf("[proxy] 刷新完成: 抓取 %d 候选，测通 %d 条，可用 %d 条（目标 %d，耗时 %.0fs）",
-		len(all), len(results), aliveCount, saveLimit, time.Since(started).Seconds())
+	if unlimited {
+		log.Printf("[proxy] 刷新完成: 抓取 %d 候选，测通 %d 条，可用 %d 条（不限数量，耗时 %.0fs）",
+			len(all), len(results), aliveCount, time.Since(started).Seconds())
+	} else {
+		log.Printf("[proxy] 刷新完成: 抓取 %d 候选，测通 %d 条，可用 %d 条（目标 %d，耗时 %.0fs）",
+			len(all), len(results), aliveCount, saveLimit, time.Since(started).Seconds())
+	}
 
-	// 3) 排序：alive 在前，按延迟升序；dead 在后
+	// 4) 排序：alive 在前，按延迟升序；dead 在后
 	sortProxies(results)
 
-	// 4) 截断保存：只保留前 saveLimit 条（alive 优先，凑不齐也保留 dead 以便观察）
-	if len(results) > saveLimit {
+	// 5) 截断保存：只在显式配了 saveLimit 时截断；不限制时全量落库
+	if !unlimited && len(results) > saveLimit {
 		results = results[:saveLimit]
 	}
 
@@ -475,8 +517,9 @@ func (m *ProxyManager) replaceAll(entries []ProxyEntry) error {
 
 // ListProxies 查询代理列表。aliveOnly=true 只返回可用；orderByLatency=true 按延迟排序。
 func (m *ProxyManager) ListProxies(aliveOnly bool, limit int) ([]ProxyEntry, error) {
+	// limit <= 0 表示不限制：SQLite 里 LIMIT -1 就是「全部」
 	if limit <= 0 {
-		limit = 1000
+		limit = -1
 	}
 	q := `SELECT id, source, addr, latency_ms, alive, last_checked, COALESCE(last_alive_at,''), speed_bps FROM proxies`
 	if aliveOnly {
@@ -501,6 +544,7 @@ func (m *ProxyManager) ListProxies(aliveOnly bool, limit int) ([]ProxyEntry, err
 
 // SpeedTestURL Cloudflare 官方测速端点（下载 1MB 数据）。
 const SpeedTestURL = "https://speed.cloudflare.com/__down?bytes=1048576"
+
 // SpeedTestBytes 期望下载的字节数（与 URL 一致，用于计算吞吐）。
 const SpeedTestBytes = 1048576
 
@@ -603,15 +647,28 @@ func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout in
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, workers)
 	for _, e := range target {
+		// 与 RefreshProxies 同理：信号量必须在**派发之前**获取。
+		// save_limit=0 不限量后 target 可能有几千条，放在 goroutine 里抢
+		// 等于不限流，会瞬间 spawn 出几千个 goroutine 全堵在信号量上。
+		acquired := false
+		select {
+		case sem <- struct{}{}:
+			acquired = true
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			if acquired {
+				<-sem
+			}
+			break
+		}
 		wg.Add(1)
 		go func(e ProxyEntry) {
 			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
 				return
 			}
-			defer func() { <-sem }()
 			speed := testProxySpeed(ctx, e.Addr, SpeedTestURL, timeout)
 			mu.Lock()
 			done++
@@ -670,9 +727,7 @@ func (m *ProxyManager) Stats() (ProxyStats, error) {
 
 // AvailableAddrs 返回当前可用代理地址列表（供 Actions 预取）。
 func (m *ProxyManager) AvailableAddrs(limit int) []string {
-	if limit <= 0 {
-		limit = 100
-	}
+	// limit <= 0 表示不限制：上游有多少可用就返回多少
 	entries, err := m.ListProxies(true, limit)
 	if err != nil {
 		return nil
@@ -687,24 +742,18 @@ func (m *ProxyManager) AvailableAddrs(limit int) []string {
 // --- helpers ---
 
 func sortProxies(entries []ProxyEntry) {
-	// 简单排序：alive 优先，再按延迟升序（不引额外依赖）
-	for i := 1; i < len(entries); i++ {
-		for j := i; j > 0; j-- {
-			a, b := entries[j-1], entries[j]
-			better := false
-			if a.Alive != b.Alive {
-				better = a.Alive // alive 在前
-			} else if a.LatencyMs != b.LatencyMs {
-				better = a.LatencyMs < b.LatencyMs
-			} else {
-				better = a.Addr < b.Addr
-			}
-			if better {
-				break
-			}
-			entries[j-1], entries[j] = b, a
+	// alive 优先 -> 延迟升序 -> addr 字典序。用标准库排序：不限数量之后
+	// results 可能有几千条，手写插入排序是 O(n²)。
+	sort.Slice(entries, func(i, j int) bool {
+		a, b := entries[i], entries[j]
+		if a.Alive != b.Alive {
+			return a.Alive
 		}
-	}
+		if a.LatencyMs != b.LatencyMs {
+			return a.LatencyMs < b.LatencyMs
+		}
+		return a.Addr < b.Addr
+	})
 }
 
 func boolToInt(b bool) int {

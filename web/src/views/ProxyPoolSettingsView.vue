@@ -61,8 +61,8 @@ web/src/views/ProxyPoolSettingsView.vue
           <span class="switch-tip">0 = 关闭后台自动刷新（仍可在「代理管理」页手动刷新）</span>
         </n-form-item>
         <n-form-item label="可用代理保存数量">
-          <n-input-number v-model:value="form.save_limit" :min="1" :max="2000" class="num-input" />
-          <span class="switch-tip">最多保留多少条测通可用的代理（达标即提前停止测通）</span>
+          <n-input-number v-model:value="form.save_limit" :min="0" :max="100000" class="num-input" />
+          <span class="switch-tip">0 = 不限制（上游抓到多少就全测、测通多少就全存）；填正数则达标即提前停止测通</span>
         </n-form-item>
         <n-form-item label="后台刷新时测通">
           <n-switch v-model:value="form.auto_test" />
@@ -119,7 +119,7 @@ const form = reactive<ProxyPoolConfig>({
   ip_swap_limit: 5,
   sources: [],
   refresh_minutes: 30,
-  save_limit: 100,
+  save_limit: 0,
   auto_test: true,
   remote_url: '',
   remote_token: '',
@@ -137,7 +137,7 @@ function initForm(cfg: AppConfig) {
   form.ip_swap_limit = p.ip_swap_limit
   form.sources = [...(p.sources ?? [])]
   form.refresh_minutes = p.refresh_minutes ?? 30
-  form.save_limit = p.save_limit ?? 100
+  form.save_limit = p.save_limit ?? 0
   form.auto_test = p.auto_test ?? true
   form.remote_url = p.remote_url ?? ''
   form.remote_token = p.remote_token ?? ''

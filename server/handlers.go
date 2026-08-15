@@ -518,12 +518,13 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 // handleListProxies GET /api/proxies（JWT）—— 代理列表（页面展示）。
-// 支持 ?alive=1 只返回可用、?limit=N 数量、?source=xxx 按来源过滤。
+// 支持 ?alive=1 只返回可用、?limit=N 数量（0 = 不限制）、?source=xxx 按来源过滤。
 func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
 	aliveOnly := r.URL.Query().Get("alive") == "1"
+	// 页面展示默认给 500 条够用；显式传 ?limit=0 才拉全量
 	limit := 500
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 2000 {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			limit = n
 		}
 	}
@@ -541,9 +542,10 @@ func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
 // handleAvailableProxies GET /api/proxies/available（API Key）—— Actions 预取可用代理列表。
 // 返回 {"proxies": ["ip:port", ...], "count": N, "checked_at": "..."}。
 func (s *Server) handleAvailableProxies(w http.ResponseWriter, r *http.Request) {
-	limit := 100
+	// 默认不限制：上游有多少可用就全部返回。?limit=N 可显式限制。
+	limit := 0
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 2000 {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			limit = n
 		}
 	}

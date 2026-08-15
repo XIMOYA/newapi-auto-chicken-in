@@ -99,14 +99,14 @@ type ProxyPool struct {
 	// 服务器端代理池后台刷新：服务常驻抓取+测通，供页面展示与 Actions 预取。
 	// RefreshMinutes <= 0 表示关闭后台刷新（仅手动/页面触发）。
 	RefreshMinutes int  `json:"refresh_minutes"`
-	SaveLimit      int  `json:"save_limit"` // 最多保留多少条可用代理（默认 100）
+	SaveLimit      int  `json:"save_limit"` // 保留多少条可用代理；0 = 不限制（测通多少存多少）
 	AutoTest       bool `json:"auto_test"`  // 后台刷新时是否测通+测延迟（默认 true）
 	// Actions 预取：Python 端配置的 remote_url / remote_token 等字段，这里透传保存。
 	// 实际 Actions 通过 /api/proxies/available 取，鉴权用同一个 API Key（remote_token）。
-	RemoteURL           string `json:"remote_url"`
-	RemoteToken         string `json:"remote_token"`
-	RemoteTokenHeader   string `json:"remote_token_header"`
-	RemoteTokenPrefix   string `json:"remote_token_prefix"`
+	RemoteURL         string `json:"remote_url"`
+	RemoteToken       string `json:"remote_token"`
+	RemoteTokenHeader string `json:"remote_token_header"`
+	RemoteTokenPrefix string `json:"remote_token_prefix"`
 }
 
 // Notify 通知配置。
@@ -183,18 +183,18 @@ func DefaultConfig() Config {
 			IntervalSeconds: []int{3, 8},
 		},
 		ProxyPool: ProxyPool{
-			Enabled:          false,
-			TestURL:          "https://api.ipify.org",
-			Timeout:          8,
-			MaxWorkers:       25,
-			MaxProxies:       250,
-			IPSwapLimit:      5,
-			Sources:          []string{},
-			RefreshMinutes:   30,
-			SaveLimit:        100,
-			AutoTest:         true,
-			RemoteURL:        "",
-			RemoteToken:      "",
+			Enabled:           false,
+			TestURL:           "https://api.ipify.org",
+			Timeout:           8,
+			MaxWorkers:        25,
+			MaxProxies:        250,
+			IPSwapLimit:       5,
+			Sources:           []string{},
+			RefreshMinutes:    30,
+			SaveLimit:         0,
+			AutoTest:          true,
+			RemoteURL:         "",
+			RemoteToken:       "",
 			RemoteTokenHeader: "Authorization",
 			RemoteTokenPrefix: "Bearer",
 		},
