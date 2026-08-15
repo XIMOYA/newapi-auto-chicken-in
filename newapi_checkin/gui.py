@@ -39,6 +39,7 @@ try:  # 可选依赖：CLI/测试不应因没有 PySide6 而无法导入项目
         QMessageBox,
         QPlainTextEdit,
         QPushButton,
+        QScrollArea,
         QSpinBox,
         QSplitter,
         QStackedWidget,
@@ -212,7 +213,10 @@ else:
             self._daemon_process: Optional[subprocess.Popen] = None
             self._daemon_enabled = daemon_control.is_enabled()
             self.setWindowTitle("NewAPI 签到中心")
-            self.setMinimumSize(1000, 690)
+            # tab 内容都包了滚动区（见 _scrollable），布局最小需求降到约
+            # 460x332，这个下限才真正生效——改之前写 690 也是白写，会被
+            # 「账号管理」那页 1275 的高度需求直接盖掉。
+            self.setMinimumSize(760, 540)
             self.resize(1180, 760)
             self._build_ui()
             self._build_tray()
@@ -265,10 +269,10 @@ else:
 
             tabs = QTabWidget()
             tabs.setDocumentMode(True)
-            tabs.addTab(self._build_dashboard_tab(), "总览")
-            tabs.addTab(self._build_account_tab(), "账号管理")
-            tabs.addTab(self._build_schedule_tab(), "定时任务")
-            tabs.addTab(self._build_logs_tab(), "运行日志")
+            tabs.addTab(self._scrollable(self._build_dashboard_tab()), "总览")
+            tabs.addTab(self._scrollable(self._build_account_tab()), "账号管理")
+            tabs.addTab(self._scrollable(self._build_schedule_tab()), "定时任务")
+            tabs.addTab(self._scrollable(self._build_logs_tab()), "运行日志")
             outer.addWidget(tabs, 1)
 
             self.setStyleSheet(
@@ -287,6 +291,18 @@ else:
                     selection-background-color: #28549b; padding: 6px;
                 }
                 QHeaderView::section { background: #182947; color: #b8c7e0; border: 0; padding: 8px; }
+                QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+                QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+                QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+                    background: #2a3f66; border-radius: 5px;
+                }
+                QScrollBar::handle:vertical { min-height: 32px; }
+                QScrollBar::handle:horizontal { min-width: 32px; }
+                QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+                    background: #3a5a94;
+                }
+                QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+                QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
                 QPushButton {
                     min-height: 34px;
                     padding: 7px 16px 9px 16px;
@@ -358,6 +374,23 @@ else:
                 QLabel#Hint { color: #8193b0; }
                 """
             )
+
+        def _scrollable(self, inner: QWidget) -> QWidget:
+            """把 tab 内容包进滚动区，让窗口能缩到小屏也放得下。
+
+            「账号管理」那一页三个 QGroupBox 竖着堆起来，最小需求约 978x997，
+            带上主窗口的标题/状态卡片后整窗要 1032x1275。1080p 屏扣掉任务栏
+            只剩约 1040 高，没有滚动区的话底部控件既够不着、也没法把窗口缩小
+            —— setMinimumSize 里那个 690 会被布局需求直接盖掉，形同虚设。
+            """
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setFrameShape(QFrame.NoFrame)
+            # 深色主题下滚动区和它的 viewport 默认是浅底，会在 tab 里露出白块
+            area.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+            area.viewport().setStyleSheet("background: transparent;")
+            area.setWidget(inner)
+            return area
 
         def _build_dashboard_tab(self) -> QWidget:
             page = QWidget()
