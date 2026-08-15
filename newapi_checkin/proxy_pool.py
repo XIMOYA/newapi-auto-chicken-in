@@ -362,11 +362,15 @@ class ProxyPool:
     # ------------------------------------------------------------------ #
 
     def acquire(self) -> Optional[str]:
-        """分配一个代理。优先独占；池子用尽时复用已分配的，绝不返回「直连」。
+        """分配一个代理。优先独占且按质量择优；池子用尽时复用已分配的，绝不返回「直连」。
 
         调用方的要求是「宁可几个账号共用一个代理 IP，也不要降级直连」，所以只有
         池里连一个未拉黑的代理都没有时才返回 None。共用时挑「当前使用账号数最少」
         的那个，把账号尽量摊平到各个出口 IP 上。
+
+        择优取代理：服务器预取时 available 已按速度/延迟排序（speed_bps 高、
+        延迟低在前），本地抓取时 _available 也是按存活+延迟排好序的，所以这里
+        顺序取第一个空闲代理就能实现「优选」，而不是随机选。
         """
         with self._lock:
             healthy = [p for p in self._available if p not in self._bad]
@@ -374,7 +378,7 @@ class ProxyPool:
                 return None
             fresh = [p for p in healthy if p not in self._used]
             if fresh:
-                proxy = random.choice(fresh)
+                proxy = fresh[0]  # 顺序取优：列表头 = 质量最好（服务器已排序）
                 self._used.add(proxy)
                 self._share_count[proxy] = 1
                 return proxy

@@ -11,6 +11,7 @@ NewAPI 签到配置管理平台 · HTTP 处理器与路由
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"io/fs"
@@ -64,6 +65,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/proxies/available", s.requireAPIKey(s.handleAvailableProxies))
 	mux.HandleFunc("GET /api/proxies/stats", s.requireJWT(s.handleProxyStats))
 	mux.HandleFunc("POST /api/proxies/refresh", s.requireJWT(s.handleRefreshProxies))
+	mux.HandleFunc("POST /api/proxies/speedtest", s.requireJWT(s.handleSpeedTestProxies))
 
 	mux.Handle("/", s.staticHandler())
 	return mux
@@ -591,6 +593,38 @@ func (s *Server) handleRefreshProxies(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "代理池刷新已开始"})
+}
+
+// handleSpeedTestProxies POST /api/proxies/speedtest（JWT）—— 对代理实测下载速度。
+// body: {"proxies": ["ip:port", ...]}；proxies 为空 = 全部可用代理。
+// 返回 {"ok": true, "tested": N, "url": "..."}。
+func (s *Server) handleSpeedTestProxies(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Proxies []string `json:"proxies"`
+	}
+	if err := readJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法的 JSON")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+	cfg, _, err := LoadConfig(s.db)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "服务器内部错误")
+		return
+	}
+	timeout := cfg.ProxyPool.Timeout
+	go func() {
+		updated, terr := s.proxies.SpeedTest(ctx, req.Proxies, timeout)
+		if terr != nil {
+			log.Printf("[proxy] 测速失败: %v", terr)
+		} else {
+			log.Printf("[proxy] 测速完成，更新 %d 条", updated)
+		}
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "tested": len(req.Proxies), "url": "https://speed.cloudflare.com/__down?bytes=1048576",
+	})
 }
 
 // writeJSON 以指定状态码输出 JSON 响应（统一 Content-Type）。

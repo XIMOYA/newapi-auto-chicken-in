@@ -194,6 +194,8 @@ export interface ProxyEntry {
   alive: boolean
   last_checked_at: string
   last_alive_at?: string
+  /** 实测下载吞吐（字节/秒），0=未测速 */
+  speed_bps: number
 }
 
 export interface ProxyStatsResult {

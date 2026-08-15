@@ -113,3 +113,24 @@ func TestProxyManager_ListAndStats(t *testing.T) {
 		t.Fatalf("available addrs = %v", addrs)
 	}
 }
+
+// 优选：available 必须按速度优先、延迟其次排序（最快的放前面给 Actions 用）
+func TestProxyManager_AvailableOrderedByQuality(t *testing.T) {
+	srv := newTestServer(t)
+	entries := []ProxyEntry{
+		{Source: "s1", Addr: "slow:80", LatencyMs: 50, Alive: true, SpeedBps: 100_000, LastChecked: "now", LastAliveAt: "now"},
+		{Source: "s1", Addr: "fast:80", LatencyMs: 200, Alive: true, SpeedBps: 5_000_000, LastChecked: "now", LastAliveAt: "now"},
+		{Source: "s2", Addr: "mid:80", LatencyMs: 30, Alive: true, SpeedBps: 800_000, LastChecked: "now", LastAliveAt: "now"},
+	}
+	if err := srv.proxies.replaceAll(entries); err != nil {
+		t.Fatalf("replaceAll: %v", err)
+	}
+	addrs := srv.proxies.AvailableAddrs(10)
+	if len(addrs) != 3 {
+		t.Fatalf("available = %v, want 3 条", addrs)
+	}
+	// 速度高的在前：fast(5MB/s) > mid(800KB/s) > slow(100KB/s)
+	if addrs[0] != "fast:80" || addrs[1] != "mid:80" || addrs[2] != "slow:80" {
+		t.Fatalf("available 排序错误（应速度优先）: %v", addrs)
+	}
+}

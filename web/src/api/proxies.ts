@@ -21,3 +21,7 @@ export function getProxyStats(): Promise<ProxyStatsResult> {
 export function refreshProxies(): Promise<{ ok: boolean; message: string }> {
   return http.post<{ ok: boolean; message: string }>('/proxies/refresh').then((r) => r.data)
 }
+
+export function speedTestProxies(params: { proxies: string[] }): Promise<{ ok: boolean; tested: number; url: string }> {
+  return http.post<{ ok: boolean; tested: number; url: string }>('/proxies/speedtest', params).then((r) => r.data)
+}

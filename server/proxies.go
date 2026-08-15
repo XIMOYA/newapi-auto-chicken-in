@@ -36,6 +36,7 @@ type ProxyEntry struct {
 	Alive       bool   `json:"alive"`
 	LastChecked string `json:"last_checked_at"`
 	LastAliveAt string `json:"last_alive_at,omitempty"`
+	SpeedBps    int64  `json:"speed_bps"` // 实测下载字节/秒（0=未测速）
 }
 
 var ipPortRe = regexp.MustCompile(`\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\b`)
@@ -49,10 +50,31 @@ func createProxiesTable(db *sql.DB) error {
 		latency_ms    INTEGER NOT NULL DEFAULT 0,
 		alive         INTEGER NOT NULL DEFAULT 0,
 		last_checked  TEXT    NOT NULL,
-		last_alive_at TEXT
+		last_alive_at TEXT,
+		speed_bps     INTEGER NOT NULL DEFAULT 0
 	)`)
 	if err != nil {
 		return fmt.Errorf("建 proxies 表失败: %w", err)
+	}
+	// 老库迁移：表已存在但缺 speed_bps 列时补上（幂等，报错说明列已在则忽略）
+	cols, err := db.Query(`PRAGMA table_info(proxies)`)
+	if err == nil {
+		hasSpeed := false
+		for cols.Next() {
+			var cid int
+			var cname, ctype string
+			var notnull, pk int
+			var dflt any
+			if cols.Scan(&cid, &cname, &ctype, &notnull, &dflt, &pk) == nil && cname == "speed_bps" {
+				hasSpeed = true
+			}
+		}
+		cols.Close()
+		if !hasSpeed {
+			if _, err := db.Exec(`ALTER TABLE proxies ADD COLUMN speed_bps INTEGER NOT NULL DEFAULT 0`); err != nil {
+				return fmt.Errorf("迁移 proxies.speed_bps 列失败: %w", err)
+			}
+		}
 	}
 	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_proxies_addr ON proxies(addr)`)
 	if err != nil {
@@ -339,7 +361,7 @@ func (m *ProxyManager) replaceAll(entries []ProxyEntry) error {
 	if _, err := tx.Exec(`DELETE FROM proxies`); err != nil {
 		return fmt.Errorf("清空 proxies: %w", err)
 	}
-	stmt, err := tx.Prepare(`INSERT INTO proxies (source, addr, latency_ms, alive, last_checked, last_alive_at) VALUES (?, ?, ?, ?, ?, ?)`)
+	stmt, err := tx.Prepare(`INSERT INTO proxies (source, addr, latency_ms, alive, last_checked, last_alive_at, speed_bps) VALUES (?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("准备插入: %w", err)
 	}
@@ -349,7 +371,7 @@ func (m *ProxyManager) replaceAll(entries []ProxyEntry) error {
 		if e.Alive {
 			lastAlive = sql.NullString{String: e.LastAliveAt, Valid: true}
 		}
-		if _, err := stmt.Exec(e.Source, e.Addr, e.LatencyMs, boolToInt(e.Alive), e.LastChecked, lastAlive); err != nil {
+		if _, err := stmt.Exec(e.Source, e.Addr, e.LatencyMs, boolToInt(e.Alive), e.LastChecked, lastAlive, e.SpeedBps); err != nil {
 			return fmt.Errorf("插入代理: %w", err)
 		}
 	}
@@ -364,11 +386,11 @@ func (m *ProxyManager) ListProxies(aliveOnly bool, limit int) ([]ProxyEntry, err
 	if limit <= 0 {
 		limit = 1000
 	}
-	q := `SELECT id, source, addr, latency_ms, alive, last_checked, COALESCE(last_alive_at,'') FROM proxies`
+	q := `SELECT id, source, addr, latency_ms, alive, last_checked, COALESCE(last_alive_at,''), speed_bps FROM proxies`
 	if aliveOnly {
 		q += ` WHERE alive = 1`
 	}
-	q += ` ORDER BY alive DESC, latency_ms ASC LIMIT ?`
+	q += ` ORDER BY alive DESC, speed_bps DESC, latency_ms ASC LIMIT ?`
 	rows, err := m.db.Query(q, limit)
 	if err != nil {
 		return nil, err
@@ -377,12 +399,126 @@ func (m *ProxyManager) ListProxies(aliveOnly bool, limit int) ([]ProxyEntry, err
 	out := []ProxyEntry{}
 	for rows.Next() {
 		var e ProxyEntry
-		if err := rows.Scan(&e.ID, &e.Source, &e.Addr, &e.LatencyMs, &e.Alive, &e.LastChecked, &e.LastAliveAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.Source, &e.Addr, &e.LatencyMs, &e.Alive, &e.LastChecked, &e.LastAliveAt, &e.SpeedBps); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// SpeedTestURL Cloudflare 官方测速端点（下载 1MB 数据）。
+const SpeedTestURL = "https://speed.cloudflare.com/__down?bytes=1048576"
+// SpeedTestBytes 期望下载的字节数（与 URL 一致，用于计算吞吐）。
+const SpeedTestBytes = 1048576
+
+// testProxySpeed 通过代理下载测速数据，返回实际吞吐（字节/秒）；失败返回 -1。
+func testProxySpeed(ctx context.Context, addr, speedURL string, timeout int) int64 {
+	proxyURL := "http://" + addr
+	reqCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(reqCtx, "GET", speedURL, nil)
+	if err != nil {
+		return -1
+	}
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(mustParseURL(proxyURL)),
+		},
+	}
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return -1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return -1
+	}
+	// 读全部响应用来测真实下载吞吐
+	var total int64
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := resp.Body.Read(buf)
+		total += int64(n)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return -1
+		}
+	}
+	elapsed := time.Since(start).Seconds()
+	if elapsed <= 0 {
+		return -1
+	}
+	return int64(float64(total) / elapsed)
+}
+
+// SpeedTest 对指定代理列表测速并写库（返回成功更新的条目数）。
+// addrs 为空表示对全部可用代理测速。
+func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout int) (int, error) {
+	if timeout <= 0 {
+		timeout = 15
+	}
+	entries, err := m.ListProxies(true, 2000)
+	if err != nil {
+		return 0, err
+	}
+	target := make([]ProxyEntry, 0, len(entries))
+	if len(addrs) == 0 {
+		target = entries
+	} else {
+		want := map[string]bool{}
+		for _, a := range addrs {
+			want[a] = true
+		}
+		for _, e := range entries {
+			if want[e.Addr] {
+				target = append(target, e)
+			}
+		}
+	}
+	if len(target) == 0 {
+		return 0, nil
+	}
+
+	workers := 8
+	if len(target) < workers {
+		workers = len(target)
+	}
+	var mu sync.Mutex
+	var updated int
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, workers)
+	for _, e := range target {
+		wg.Add(1)
+		go func(e ProxyEntry) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			speed := testProxySpeed(ctx, e.Addr, SpeedTestURL, timeout)
+			if speed < 0 {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if _, err := m.db.Exec(`UPDATE proxies SET speed_bps = ? WHERE id = ?`, speed, e.ID); err != nil {
+				return
+			}
+			updated++
+		}(e)
+	}
+	wg.Wait()
+	return updated, nil
 }
 
 // ProxyStats 各源统计。

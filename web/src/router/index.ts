@@ -58,6 +58,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '代理池配置' }
       },
       {
+        path: 'proxies',
+        name: 'proxies',
+        component: () => import('@/views/ProxiesView.vue'),
+        meta: { title: '代理管理' }
+      },
+      {
         path: 'settings/notify',
         name: 'settings-notify',
         component: () => import('@/views/NotifySettingsView.vue'),
