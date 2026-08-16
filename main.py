@@ -39,7 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--account", action="append", metavar="NAME",
                         help="只跑指定账号，可重复传入或用逗号分隔")
     parser.add_argument("--dry-run", action="store_true",
-                        help="只调用 /api/user/self 验证连通性，不执行签到")
+                        help="只验证当前登录方式的凭据与连通性，不执行签到")
+    parser.add_argument(
+        "--cookie-test",
+        choices=("newapi_cookie", "github_cookie"),
+        help="只检查指定类型 Cookie 的可用性；两种登录方式需分别执行",
+    )
     display_group = parser.add_mutually_exclusive_group()
     display_group.add_argument("--headful", action="store_true", help="强制有头浏览器")
     display_group.add_argument(
@@ -157,6 +162,7 @@ def main(argv=None) -> int:
         use_ai=args.use_ai,
         use_browser=args.use_browser,
         verbose=args.verbose,
+        cookie_test=args.cookie_test,
         parallelism=1 if args.manual else (args.parallel or 1),
         # 参数保留兼容；Runner 自动签到统一固定 4 个账号并发。
         parallelism_explicit=args.parallel is not None and not args.manual,

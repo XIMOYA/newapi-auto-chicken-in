@@ -69,6 +69,42 @@ class TestAccounts:
         cfg = build(accounts=[{"url": "https://a.com"}])
         assert cfg.accounts[0].name == "Task_1"
 
+    def test_default_login_method_is_newapi_cookie(self):
+        account = build().accounts[0]
+        assert account.login_method == cfgmod.LOGIN_METHOD_NEWAPI_COOKIE
+        assert account.github_user_session == ""
+
+    def test_github_cookie_fields_and_client_id(self):
+        account = build(accounts=[{
+            "name": "GitHub",
+            "url": "https://a.com",
+            "login_method": "github_cookie",
+            "github_user_session": "session-value",
+            "github_client_id": "client-id",
+        }]).accounts[0]
+        assert account.uses_github_cookie is True
+        assert account.github_user_session == "session-value"
+        assert account.effective_github_client_id == "client-id"
+
+    def test_reference_github_alias_is_inferred_when_newapi_cookie_empty(self):
+        account = build(accounts=[{
+            "name": "GitHub",
+            "url": "https://a.com",
+            "user_session": "session-value",
+        }]).accounts[0]
+        assert account.login_method == cfgmod.LOGIN_METHOD_GITHUB_COOKIE
+        assert account.github_user_session == "session-value"
+
+    def test_explicit_newapi_method_wins_over_github_alias(self):
+        account = build(accounts=[{
+            "name": "NewAPI",
+            "url": "https://a.com",
+            "login_method": "newapi_cookie",
+            "cookie": "session=value",
+            "user_session": "github-value",
+        }]).accounts[0]
+        assert account.login_method == cfgmod.LOGIN_METHOD_NEWAPI_COOKIE
+
 
 class TestSelect:
     def test_only_enabled_by_default(self):
@@ -193,6 +229,16 @@ class TestEnvOverride:
         monkeypatch.setenv("CHECKIN_ACCOUNT_MY_SITE_COOKIE", "session=env")
         cfg = build(accounts=[{"name": "my site", "url": "https://a.com", "cookie": "old"}])
         assert cfg.accounts[0].cookie == "session=env"
+
+    def test_github_fields_and_method_from_env(self, monkeypatch):
+        monkeypatch.setenv("CHECKIN_ACCOUNT_MY_SITE_GITHUB_USER_SESSION", "gh-env")
+        monkeypatch.setenv("CHECKIN_ACCOUNT_MY_SITE_GITHUB_CLIENT_ID", "client-env")
+        monkeypatch.setenv("CHECKIN_ACCOUNT_MY_SITE_LOGIN_METHOD", "github_cookie")
+        cfg = build(accounts=[{"name": "my site", "url": "https://a.com"}])
+        account = cfg.accounts[0]
+        assert account.login_method == "github_cookie"
+        assert account.github_user_session == "gh-env"
+        assert account.github_client_id == "client-env"
 
 
 class TestMigration:

@@ -17,7 +17,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from .. import client as api
 from .. import logger as log
 from ..ai import prompts
-from ..config import SELF_PATH, SHOTS_DIR, Account, Config
+from ..config import LOGIN_METHOD_GITHUB_COOKIE, SELF_PATH, SHOTS_DIR, Account, Config
 from ..utils import now
 from . import detect
 from .driver_base import (
@@ -80,22 +80,29 @@ def solve(*, cfg: Config, account: Account, exit_ip: Optional[str], options,
 
 def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional[str],
          options, ai) -> SolveOutcome:
+    is_github = account.login_method == LOGIN_METHOD_GITHUB_COOKIE
     log.info(f"启动 {driver.name} 过盾（profile: {account.profile_dir.name}）")
+    # NewAPI 模式注入站点登录 Cookie；GitHub 模式只需要站点 CF 上下文，
+    # GitHub user_session 由 OAuth HTTP 客户端按 github.com 域名单独发送。
     driver.inject_cookies(account.cookie)
-    if account.user_id:
+    if not is_github and account.user_id:
         if driver.seed_auth_state(account.user_id):
             log.debug(f"浏览器入口已预置 localStorage 登录态 user_id={account.user_id}")
         if driver.set_extra_http_headers({"New-Api-User": str(account.user_id)}):
             log.debug(f"浏览器入口已设置 New-Api-User={account.user_id}")
 
-    state = driver.goto(account.browser_url)
-    log.debug(f"浏览器入口: {account.browser_url}")
+    browser_url = (
+        account.api("/api/oauth/state?mode=login")
+        if is_github else account.browser_url
+    )
+    state = driver.goto(browser_url)
+    log.debug(f"浏览器入口: {browser_url}")
     log.debug(f"首屏状态: {state.brief()}")
     strategy = "S2"
 
-    # 浏览器没登录时，Turnstile 不会渲染在正确的业务页面上；
-    # 继续调用 AI 只会得到 found=false，直接给出可操作的 cookie 提示。
-    if state.challenge == detect.LOGIN_REQUIRED:
+    # NewAPI 模式必须先确认站点登录态；GitHub 模式进入公开 OAuth state
+    # 地址即可开始处理站点 Cloudflare，不能把未完成 OAuth 的页面误判为失效。
+    if state.challenge == detect.LOGIN_REQUIRED and not is_github:
         artifact = _dump(driver, cfg, account, "login-required")
         return SolveOutcome(
             False,
@@ -108,6 +115,9 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
             terminal=True,
             result_kind=api.LOGIN_REQUIRED,
         )
+    if state.challenge == detect.LOGIN_REQUIRED and is_github:
+        log.debug("GitHub 模式忽略站点登录页判定：OAuth Cookie 将在 GitHub authorize 阶段校验")
+        state = PageState(url=state.url, title=state.title, challenge=None)
 
     # ---------------- S2：等质询自解 ----------------
     if not state.passed:
@@ -152,6 +162,12 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
     cf = _harvest(driver, account, exit_ip)
     log.debug(f"收割 cookie {len(cf.cookies)} 条"
               + ("（含 cf_clearance）" if "cf_clearance" in cf.cookies else "（无 cf_clearance）"))
+
+    if is_github:
+        # GitHub Cookie 的签到动作绑定 OAuth 回调，不能在未登录的站点页面
+        # 直接 POST NewAPI checkin；把 CF session 交回 runner 的 OAuth 客户端。
+        return SolveOutcome(True, strategy, cf=cf,
+                            detail="站点过盾完成，交回 GitHub OAuth 登录链路")
 
     # ---------------- S4：直接在页面里完成签到 ----------------
     result = _checkin_in_page(driver, account)

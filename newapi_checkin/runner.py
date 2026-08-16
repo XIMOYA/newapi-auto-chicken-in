@@ -10,7 +10,12 @@ from typing import Optional
 from . import client as api
 from . import logger as log
 from .cf.session_store import SessionStore
-from .config import SESSIONS_FILE, Account, Config
+from .config import (
+    LOGIN_METHOD_GITHUB_COOKIE,
+    SESSIONS_FILE,
+    Account,
+    Config,
+)
 from .utils import jitter_sleep, probe_exit_ip
 
 STRATEGY_LABEL = {
@@ -68,6 +73,7 @@ class RunOptions:
     use_ai: bool = True
     use_browser: bool = True
     verbose: bool = False
+    cookie_test: Optional[str] = None  # 仅检查指定登录方式的 Cookie，不执行签到
     parallelism: int = 1          # 兼容调用方字段；自动签到实际固定为 6，人工模式为 1
     parallelism_explicit: bool = False   # 兼容字段；固定并发模式下不改变实际账号并发
     browser_parallelism: int = 0         # 兼容调用方字段；浏览器实际固定为 2（人工模式为 1）
@@ -301,6 +307,11 @@ class Runner:
 
     def run(self) -> int:
         accounts = self.cfg.select(self.options.account_names)
+        if self.options.cookie_test:
+            accounts = [a for a in accounts if a.login_method == self.options.cookie_test]
+            if not accounts:
+                log.warn(f"没有匹配 {self.options.cookie_test} 的启用账号")
+                return 2
         if not accounts:
             log.warn("没有启用的账号（检查 accounts[].enabled）")
             return 2
@@ -313,7 +324,10 @@ class Runner:
         self.init_proxy_pool(desired=len(accounts) + 10, accounts=len(accounts))
 
         try:
-            mode = "dry-run 连通性检查" if self.options.dry_run else "签到"
+            if self.options.cookie_test:
+                mode = f"{self.options.cookie_test} Cookie 可用性检查"
+            else:
+                mode = "dry-run 连通性检查" if self.options.dry_run else "签到"
             log.step(f"开始{mode}，共 {len(accounts)} 个账号")
             workers = self._parallelism()
             browser_workers = self._browser_workers()
@@ -459,9 +473,15 @@ class Runner:
             return self._checkin_account(account)
 
     def _checkin_account(self, account: Account) -> log.SummaryRow:
-        if not account.cookie:
-            log.warn("缺少 cookie，跳过（浏览器里复制完整 Cookie 到配置）")
-            return log.SummaryRow(account.name, "skipped", "-", "缺少 cookie")
+        if account.login_method == LOGIN_METHOD_GITHUB_COOKIE:
+            if not account.github_user_session:
+                log.warn("缺少 GitHub Cookie，跳过（配置 github_user_session）")
+                return log.SummaryRow(
+                    account.name, "skipped", "-", "缺少 GitHub Cookie（github_user_session）"
+                )
+        elif not account.cookie:
+            log.warn("缺少 cookie（NewAPI Cookie），跳过（配置 accounts[].cookie）")
+            return log.SummaryRow(account.name, "skipped", "-", "缺少 NewAPI Cookie")
 
         record = self.store.get(account.slug)
         if account.user_id is None and record.user_id:
@@ -595,6 +615,9 @@ class Runner:
     def _attempt(self, account: Account, record) -> log.SummaryRow:
         ip = self.exit_ip(account.proxy)
 
+        if account.login_method == LOGIN_METHOD_GITHUB_COOKIE:
+            return self._attempt_github(account, record, ip)
+
         # ---------------- S0 缓存直连 ----------------
         if record.cf is not None:
             usable, reason = record.cf.check(ip, account.proxy)
@@ -636,6 +659,58 @@ class Runner:
 
         self._take_browser_attempt(account)
         return self._solve(account, record, ip, result)
+
+    def _attempt_github(self, account: Account, record, ip: Optional[str]) -> log.SummaryRow:
+        """GitHub Cookie 账号：复用站点 CF 缓存，但 OAuth 回调由专用客户端完成。"""
+        if record.cf is not None:
+            usable, reason = record.cf.check(ip, account.proxy)
+            log.debug(f"GitHub S0 缓存判定: {reason}")
+            if usable:
+                result = self._github_api_call(account, record.cf)
+                if result.kind in _SETTLED:
+                    return self._row(account, result, "S0")
+                if result.kind == api.CF_BLOCKED:
+                    log.warn("缓存的 cf_clearance 已被拒绝，作废后重新过盾")
+                    self.store.clear_cf(account.slug)
+                    record.cf = None
+            else:
+                self.store.clear_cf(account.slug)
+                record.cf = None
+
+        result = self._github_api_call(account, None)
+        if result.kind in _SETTLED:
+            return self._row(account, result, "S1")
+        if result.kind == api.NETWORK_ERROR:
+            return self._row(account, result, "S1")
+
+        verdict = result.verdict
+        if result.kind == api.CF_BLOCKED:
+            log.warn(f"GitHub OAuth 站点命中 Cloudflare: {result.message}")
+            if verdict is not None and not verdict.recoverable:
+                result.kind = api.WAF_BLOCKED
+                return self._row(
+                    account, result, "S1",
+                    detail=f"{verdict.label}：脚本无法绕过，需要换出口 IP 或联系站点放行",
+                )
+        else:
+            log.warn(f"GitHub OAuth 响应异常，尝试用浏览器复核: {result.message}")
+
+        if not self.options.use_browser:
+            return self._row(account, result, "S1", detail="已禁用浏览器过盾（--no-browser）")
+
+        self._take_browser_attempt(account)
+        return self._solve(account, record, ip, result)
+
+    def _github_api_call(self, account: Account, cf) -> api.ApiResult:
+        from .github_oauth import GithubOAuthClient
+
+        with GithubOAuthClient(account, self.cfg.http, cf) as client:
+            log.debug(
+                f"GitHub OAuth impersonate={client.impersonate}, "
+                + ("缓存 UA" if cf is not None and cf.user_agent else "默认 UA")
+                + (f", cookie 条数={len(cf.cookies)}" if cf is not None else "")
+            )
+            return client.checkin(dry_run=bool(self.options.cookie_test or self.options.dry_run))
 
     # ------------------------------------------------------------------ #
     # 浏览器过盾（S2 / S3 / S4 / S5）
@@ -710,8 +785,12 @@ class Runner:
                                     user_id=outcome.api_result.user_id)
             return self._row(account, outcome.api_result, outcome.strategy)
 
-        # S2/S3：拿到 cookie，回到快路径重发
-        result = self._api_call(account, outcome.cf)
+        # S2/S3：拿到 CF session，回到对应登录链路重发
+        result = (
+            self._github_api_call(account, outcome.cf)
+            if account.login_method == LOGIN_METHOD_GITHUB_COOKIE
+            else self._api_call(account, outcome.cf)
+        )
         return self._row(account, result, outcome.strategy)
 
     # ------------------------------------------------------------------ #

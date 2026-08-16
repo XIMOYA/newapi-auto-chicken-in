@@ -57,6 +57,11 @@ CHECKIN_PATH_CANDIDATES = (
 
 SELF_PATH = "/api/user/self"
 
+LOGIN_METHOD_NEWAPI_COOKIE = "newapi_cookie"
+LOGIN_METHOD_GITHUB_COOKIE = "github_cookie"
+LOGIN_METHODS = (LOGIN_METHOD_NEWAPI_COOKIE, LOGIN_METHOD_GITHUB_COOKIE)
+DEFAULT_GITHUB_CLIENT_ID = "Ov23lidtiR4LeVZvVRNL"
+
 
 class ConfigError(Exception):
     """配置文件缺失或不合法。"""
@@ -225,11 +230,26 @@ class Account:
     name: str
     url: str
     cookie: str = ""
+    login_method: str = LOGIN_METHOD_NEWAPI_COOKIE
+    github_user_session: str = ""
+    github_client_id: str = ""
     user_id: Optional[int] = None
     proxy: Optional[str] = None
     checkin_path: Optional[str] = None
     browser_path: str = "/dashboard"
     enabled: bool = True
+
+    @property
+    def uses_github_cookie(self) -> bool:
+        return self.login_method == LOGIN_METHOD_GITHUB_COOKIE
+
+    @property
+    def credential_label(self) -> str:
+        return "GitHub Cookie" if self.uses_github_cookie else "NewAPI Cookie"
+
+    @property
+    def effective_github_client_id(self) -> str:
+        return self.github_client_id or DEFAULT_GITHUB_CLIENT_ID
 
     @property
     def base_url(self) -> str:
@@ -386,6 +406,42 @@ def _build_accounts(raw_list: Any, problems: list) -> list:
                 user_id = int(raw_uid)
             except (TypeError, ValueError):
                 problems.append(f"账号 {name}: user_id 不是整数（{raw_uid!r}）")
+
+        cookie = str(item.get("cookie") or "").strip()
+        github_user_session = str(
+            item.get("github_user_session")
+            or item.get("user_session")
+            or item.get("github_cookie")
+            or ""
+        ).strip()
+        raw_method = item.get("login_method", item.get("login_type", item.get("auth_type")))
+        method_text = str(raw_method or "").strip().lower()
+        if not method_text:
+            # 显式保留旧 NewAPI Cookie 的默认行为；只有明显是参考项目格式的账号
+            # 才自动推断为 GitHub Cookie，避免空账号被误切换登录链路。
+            method_text = (
+                LOGIN_METHOD_GITHUB_COOKIE
+                if github_user_session and not cookie
+                else LOGIN_METHOD_NEWAPI_COOKIE
+            )
+        aliases = {
+            "newapi": LOGIN_METHOD_NEWAPI_COOKIE,
+            "cookie": LOGIN_METHOD_NEWAPI_COOKIE,
+            "newapi-cookie": LOGIN_METHOD_NEWAPI_COOKIE,
+            "github": LOGIN_METHOD_GITHUB_COOKIE,
+            "github-cookie": LOGIN_METHOD_GITHUB_COOKIE,
+            "github_user_session": LOGIN_METHOD_GITHUB_COOKIE,
+        }
+        method_text = aliases.get(method_text, method_text)
+        if method_text not in LOGIN_METHODS:
+            problems.append(
+                f"账号 {name}: login_method 只能是 {', '.join(LOGIN_METHODS)}（当前 {method_text}）"
+            )
+            method_text = LOGIN_METHOD_NEWAPI_COOKIE
+
+        client_id = str(
+            item.get("github_client_id") or item.get("client_id") or ""
+        ).strip()
         checkin_path = item.get("checkin_path") or item.get("checkinPath") or None
         if checkin_path and not str(checkin_path).startswith("/"):
             checkin_path = "/" + str(checkin_path).lstrip("/")
@@ -404,7 +460,10 @@ def _build_accounts(raw_list: Any, problems: list) -> list:
             Account(
                 name=name,
                 url=url,
-                cookie=str(item.get("cookie") or "").strip(),
+                cookie=cookie,
+                login_method=method_text,
+                github_user_session=github_user_session,
+                github_client_id=client_id,
                 user_id=user_id,
                 proxy=(str(item.get("proxy")).strip() or None) if item.get("proxy") else None,
                 checkin_path=checkin_path,
@@ -434,12 +493,26 @@ def _apply_env(cfg: Config) -> list:
 
     for acct in cfg.accounts:
         key = _env_key(acct.name)
-        for suffix, attr in (("COOKIE", "cookie"), ("PROXY", "proxy")):
+        for suffix, attr in (
+            ("COOKIE", "cookie"),
+            ("GITHUB_USER_SESSION", "github_user_session"),
+            ("GITHUB_CLIENT_ID", "github_client_id"),
+            ("PROXY", "proxy"),
+        ):
             env_name = f"CHECKIN_ACCOUNT_{key}_{suffix}"
             value = os.environ.get(env_name)
             if value:
                 setattr(acct, attr, value.strip())
                 notes.append(f"{env_name} -> {acct.name}.{attr}")
+        method_env = f"CHECKIN_ACCOUNT_{key}_LOGIN_METHOD"
+        method_value = os.environ.get(method_env)
+        if method_value:
+            method = method_value.strip().lower()
+            if method in LOGIN_METHODS:
+                acct.login_method = method
+                notes.append(f"{method_env} -> {acct.name}.login_method")
+            else:
+                notes.append(f"{method_env} 无效，忽略: {method}")
     return notes
 
 
@@ -531,6 +604,9 @@ def migrate_legacy(raw_list: list) -> dict:
                 "name": item.get("name") or f"Task_{idx}",
                 "url": item.get("url") or "",
                 "cookie": item.get("cookie") or "",
+                "login_method": LOGIN_METHOD_NEWAPI_COOKIE,
+                "github_user_session": "",
+                "github_client_id": "",
                 "user_id": item.get("userId") or item.get("user_id"),
                 "proxy": item.get("proxy"),
                 "checkin_path": None,

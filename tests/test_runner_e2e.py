@@ -186,6 +186,69 @@ class TestDryRun:
         assert not any(method == "POST" for method, _ in STATE["hits"])
 
 
+class TestGithubCookieMode:
+    def test_github_cookie_uses_github_session_and_dry_run(self, tmp_path, monkeypatch):
+        from newapi_checkin import client as api
+        from newapi_checkin import github_oauth
+
+        calls = []
+
+        class FakeGithubClient:
+            def __init__(self, account, http, cf=None):
+                calls.append(("init", account.login_method, account.github_user_session, cf))
+                self.impersonate = "chrome"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                pass
+
+            def checkin(self, dry_run=False):
+                calls.append(("checkin", dry_run))
+                return api.ApiResult(api.SUCCESS, message="GitHub Cookie 可用")
+
+        monkeypatch.setattr(github_oauth, "GithubOAuthClient", FakeGithubClient)
+        monkeypatch.setattr(runner_mod, "probe_exit_ip", lambda proxy=None, timeout=8: "127.0.0.1")
+        monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
+        cfg = cfgmod.build_config({
+            "defaults": {"interval_seconds": [0, 0]},
+            "accounts": [{
+                "name": "GitHub",
+                "url": "https://github.example.com",
+                "login_method": "github_cookie",
+                "github_user_session": "secret-session",
+            }],
+        })
+        options = runner_mod.RunOptions(
+            use_browser=False,
+            use_ai=False,
+            cookie_test="github_cookie",
+        )
+
+        runner = runner_mod.Runner(cfg, options)
+        assert runner.run() == 0
+        assert runner.summary.rows[0].status == api.SUCCESS
+        assert calls == [
+            ("init", "github_cookie", "secret-session", None),
+            ("checkin", True),
+        ]
+
+    def test_missing_github_cookie_is_skipped_without_network(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
+        cfg = cfgmod.build_config({
+            "accounts": [{
+                "name": "缺 GitHub Cookie",
+                "url": "https://github.example.com",
+                "login_method": "github_cookie",
+            }],
+        })
+        runner = runner_mod.Runner(cfg, runner_mod.RunOptions(use_browser=False, use_ai=False))
+        assert runner.run() == 0
+        assert runner.summary.rows[0].status == "skipped"
+        assert "GitHub Cookie" in runner.summary.rows[0].detail
+
+
 class TestSessionCache:
     def test_cf_cookie_cache_is_used_then_invalidated(self, server, wire, monkeypatch):
         from newapi_checkin.cf.session_store import CFSession, SessionStore

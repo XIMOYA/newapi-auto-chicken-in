@@ -21,6 +21,11 @@ def test_parser_supports_explicit_headless_mode():
     assert args.parallel == 3
 
 
+def test_parser_supports_separate_cookie_test_modes():
+    args = main.build_parser().parse_args(["--cookie-test", "github_cookie"])
+    assert args.cookie_test == "github_cookie"
+
+
 def test_headless_and_manual_are_rejected(monkeypatch):
     monkeypatch.setattr(main, "load_config", lambda _path: _fake_cfg())
     monkeypatch.setattr(main.log, "setup", lambda **_kwargs: None)
