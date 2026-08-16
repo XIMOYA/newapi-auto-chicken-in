@@ -206,9 +206,10 @@ class TestGithubCookieMode:
 
             def checkin(self, dry_run=False):
                 calls.append(("checkin", dry_run))
-                return api.ApiResult(api.SUCCESS, message="GitHub Cookie 可用")
+                return api.ApiResult(api.SUCCESS, message="GitHub Cookie 可用", user_id=42)
 
         monkeypatch.setattr(github_oauth, "GithubOAuthClient", FakeGithubClient)
+
         monkeypatch.setattr(runner_mod, "probe_exit_ip", lambda proxy=None, timeout=8: "127.0.0.1")
         monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
         cfg = cfgmod.build_config({
@@ -233,6 +234,8 @@ class TestGithubCookieMode:
             ("init", "github_cookie", "secret-session", None),
             ("checkin", True),
         ]
+        session_data = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
+        assert session_data[cfg.accounts[0].slug]["user_id"] == 42
 
     def test_missing_github_cookie_is_skipped_without_network(self, tmp_path, monkeypatch):
         monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")

@@ -710,7 +710,11 @@ class Runner:
                 + ("缓存 UA" if cf is not None and cf.user_agent else "默认 UA")
                 + (f", cookie 条数={len(cf.cookies)}" if cf is not None else "")
             )
-            return client.checkin(dry_run=bool(self.options.cookie_test or self.options.dry_run))
+            result = client.checkin(dry_run=bool(self.options.cookie_test or self.options.dry_run))
+        if result.kind in _SETTLED and result.user_id:
+            account.user_id = result.user_id
+            self.store.remember(account.slug, user_id=result.user_id)
+        return result
 
     # ------------------------------------------------------------------ #
     # 浏览器过盾（S2 / S3 / S4 / S5）

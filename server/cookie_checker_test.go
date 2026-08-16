@@ -133,31 +133,24 @@ func TestCheckNewAPICookieAbnormalResponses(t *testing.T) {
 func TestCheckGithubCookieGetsCodeWithoutCallback(t *testing.T) {
 	var callbackCalls atomic.Int32
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/oauth/github":
+		if r.URL.Path == "/api/oauth/github" {
 			callbackCalls.Add(1)
 			http.Error(w, "callback must not be called", http.StatusInternalServerError)
-		case "/api/oauth/state":
-			if r.Method != http.MethodPost {
-				t.Fatalf("OAuth state method = %s", r.Method)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"success": true,
-				"data":    map[string]any{"flow_token": "state-123"},
-			})
-		case "/api/status":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"success": true,
-				"data":    map[string]any{"github_client_id": "site-client-id"},
-			})
-		default:
-			http.NotFound(w, r)
+			return
 		}
+		if r.URL.Path != "/api/oauth/state" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet || r.URL.Query().Get("mode") != "login" {
+			t.Fatalf("OAuth state request = %s %s", r.Method, r.URL.String())
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "data": "state-123"})
 	}))
 	defer site.Close()
 
 	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("client_id") != "site-client-id" {
+		if r.URL.Query().Get("client_id") != cookieTestDefaultClientID {
 			t.Fatalf("client_id = %q", r.URL.Query().Get("client_id"))
 		}
 		if r.URL.Query().Get("state") != "state-123" {
@@ -166,11 +159,8 @@ func TestCheckGithubCookieGetsCodeWithoutCallback(t *testing.T) {
 		if r.URL.Query().Get("scope") != "user:email" {
 			t.Fatalf("scope = %q", r.URL.Query().Get("scope"))
 		}
-		cookie := r.Header.Get("Cookie")
-		for _, part := range []string{"user_session=github-session", "__Host-user_session_same_site=github-session", "logged_in=yes"} {
-			if !strings.Contains(cookie, part) {
-				t.Fatalf("cookie %q missing %q", cookie, part)
-			}
+		if got := r.Header.Get("Cookie"); got != "user_session=github-session; __Host-user_session_same_site=github-session; logged_in=yes" {
+			t.Fatalf("cookie = %q", got)
 		}
 		w.Header().Set("Location", "https://example.test/oauth/callback?code=secret-code&state=state-123")
 		w.WriteHeader(http.StatusFound)
@@ -187,43 +177,6 @@ func TestCheckGithubCookieGetsCodeWithoutCallback(t *testing.T) {
 	}
 	if strings.Contains(result.Message, "secret-code") || callbackCalls.Load() != 0 {
 		t.Fatalf("GitHub code/callback leaked or callback called: message=%q calls=%d", result.Message, callbackCalls.Load())
-	}
-}
-
-func TestCheckGithubCookieLegacyStateFallback(t *testing.T) {
-	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/oauth/state" {
-			http.NotFound(w, r)
-			return
-		}
-		if r.Method == http.MethodPost {
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "未知的 OAuth 提供商"})
-			return
-		}
-		if r.Method != http.MethodGet || r.URL.Query().Get("mode") != "login" {
-			t.Fatalf("legacy OAuth state request = %s %s", r.Method, r.URL.String())
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "data": "legacy-state"})
-	}))
-	defer site.Close()
-
-	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("state") != "legacy-state" {
-			t.Fatalf("state = %q", r.URL.Query().Get("state"))
-		}
-		w.Header().Set("Location", "https://example.test/oauth/callback?code=legacy-code")
-		w.WriteHeader(http.StatusFound)
-	}))
-	defer authorize.Close()
-
-	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
-		Name:              "github-legacy",
-		URL:               site.URL,
-		GithubUserSession: "github-session",
-	}, authorize.URL)
-	if result.State != cookieTestStateValid {
-		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
 }
 
