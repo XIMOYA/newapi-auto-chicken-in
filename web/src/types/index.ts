@@ -141,6 +141,36 @@ export interface ApiError {
   error: string
 }
 
+// ===== Cookie 可用性测试 =====
+
+export type CookieTestMode = 'newapi_cookie' | 'github_cookie'
+
+export type CookieTestState = 'valid' | 'invalid' | 'abnormal' | 'skipped'
+
+export interface CookieTestResult {
+  name: string
+  url: string
+  state: CookieTestState
+  user_id: number | null
+  duration_ms: number
+  message: string
+}
+
+export interface CookieTestSummary {
+  total: number
+  valid: number
+  invalid: number
+  abnormal: number
+  skipped: number
+}
+
+export interface CookieTestResponse {
+  mode: CookieTestMode
+  checked_at: string
+  summary: CookieTestSummary
+  results: CookieTestResult[]
+}
+
 // ===== 鉴权 =====
 
 export interface LoginParams {

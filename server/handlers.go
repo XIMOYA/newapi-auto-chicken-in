@@ -69,6 +69,10 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("PUT /api/password", s.requireJWT(s.handlePassword))
 	mux.HandleFunc("POST /api/auth/verify-password", s.requireJWT(s.handleVerifyPassword))
 
+	// Cookie 可用性测试：NewAPI Cookie 与 GitHub Cookie 严格分开。
+	mux.HandleFunc("POST /api/cookie-tests/newapi", s.requireJWT(s.handleNewAPICookieTest))
+	mux.HandleFunc("POST /api/cookie-tests/github", s.requireJWT(s.handleGithubCookieTest))
+
 	// 代理池管理
 	mux.HandleFunc("GET /api/proxies", s.requireJWT(s.handleListProxies))
 	mux.HandleFunc("GET /api/proxies/available", s.requireAPIKey(s.handleAvailableProxies))
@@ -404,6 +408,43 @@ func (s *Server) handleVerifyPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleNewAPICookieTest POST /api/cookie-tests/newapi（JWT）—— 独立检测 NewAPI Cookie。
+func (s *Server) handleNewAPICookieTest(w http.ResponseWriter, r *http.Request) {
+	s.handleCookieTest(w, r, LoginMethodNewAPICookie)
+}
+
+// handleGithubCookieTest POST /api/cookie-tests/github（JWT）—— 独立检测 GitHub Cookie。
+func (s *Server) handleGithubCookieTest(w http.ResponseWriter, r *http.Request) {
+	s.handleCookieTest(w, r, LoginMethodGitHubCookie)
+}
+
+func (s *Server) handleCookieTest(w http.ResponseWriter, r *http.Request, mode string) {
+	var req struct {
+		AccountNames []string `json:"account_names"`
+	}
+	if err := readJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法的 JSON")
+		return
+	}
+	cfg, _, err := LoadConfig(s.db)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "服务器内部错误")
+		return
+	}
+	results, err := runCookieTests(r.Context(), &cfg, mode, req.AccountNames)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	response := CookieTestResponse{
+		Mode:      mode,
+		CheckedAt: time.Now().UTC().Format(time.RFC3339),
+		Summary:   summarizeCookieTestResults(results),
+		Results:   results,
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // handleRawConfig GET /api/config/raw（API Key）—— 直接返回完整明文配置对象（非包裹结构）。

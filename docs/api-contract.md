@@ -128,6 +128,48 @@
 响应（200）：`{ "ok": true }`
 错误（400）：`{ "error": "旧密码错误" }` 或 `{ "error": "新密码至少 8 个字符" }`
 
+## 9. Cookie 可用性测试（JWT）
+
+NewAPI Cookie 与 GitHub Cookie 必须通过两个独立接口检测。前端只提交账号名称，后端从数据库读取明文凭据；响应不会返回 Cookie、token、OAuth state 或 code。
+
+### NewAPI Cookie
+
+`POST /api/cookie-tests/newapi`
+
+请求体：
+```json
+{ "account_names": ["可选账号名"] }
+```
+
+只检测 `login_method=newapi_cookie` 且启用的账号。`account_names` 为空数组时检测该类型的全部启用账号。普通 Cookie 请求 `/api/user/self`；包含 `new_api_refresh=` 时先执行 refresh，再用新凭据验证 self。
+
+### GitHub Cookie
+
+`POST /api/cookie-tests/github`
+
+请求体格式与 NewAPI Cookie 相同，但只检测 `login_method=github_cookie` 且启用的账号。检测流程为站点 OAuth state + GitHub authorize，并在取得 OAuth code 后结束，**不会调用站点 OAuth callback，也不会执行签到**。
+
+响应（200）：
+```json
+{
+  "mode": "newapi_cookie",
+  "checked_at": "2026-08-16T14:00:00Z",
+  "summary": { "total": 1, "valid": 1, "invalid": 0, "abnormal": 0, "skipped": 0 },
+  "results": [
+    {
+      "name": "站点A",
+      "url": "https://example.com",
+      "state": "valid",
+      "user_id": 123,
+      "duration_ms": 321,
+      "message": "tester"
+    }
+  ]
+}
+```
+
+状态含义：`valid` 有效、`invalid` 凭据失效、`abnormal` 网络/服务器/响应异常、`skipped` 对应 Cookie 未配置或检测被取消。
+
 ---
 
 ## 账号登录字段

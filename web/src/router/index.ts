@@ -28,6 +28,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '配置总览' }
       },
       {
+        path: 'cookie-tests',
+        name: 'cookie-tests',
+        component: () => import('@/views/CookieTestsView.vue'),
+        meta: { title: 'Cookie 测试' }
+      },
+      {
         path: 'settings/ai',
         name: 'settings-ai',
         component: () => import('@/views/AISettingsView.vue'),
