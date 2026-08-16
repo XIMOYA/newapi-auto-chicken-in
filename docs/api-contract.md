@@ -51,7 +51,9 @@
 ```
 
 打码规则：
-- `accounts[].cookie`：非空时返回 `"***"`（值不返回，编辑时原样保留）
+- `accounts[].cookie`：NewAPI 登录 Cookie，非空时返回 `"***"`（值不返回，编辑时原样保留）
+- `accounts[].github_user_session`：GitHub `user_session`，非空时返回 `"***"`（值不返回，编辑时原样保留）
+- `accounts[].github_client_id`：OAuth Client ID，非敏感，正常返回
 - `ai.api_key`：非空时返回 `"***"`
 - `notify.email.password`：非空时返回 `"***"`
 - `config_sync.token`：非空时返回 `"***"`
@@ -70,7 +72,7 @@
 
 规则：
 - 后端把 `"***"` 占位符还原为旧值（深合并）
-- 校验：`accounts` 必须有 `name` / `url`，`cookie` 可为空（未设置时该账号无法依赖 Cookie 完成签到）；`sites` 必须有 `name` / `url`；URL 需 http(s) 开头
+- 校验：`accounts` 必须有 `name` / `url`；`login_method` 只能是 `newapi_cookie` 或 `github_cookie`，缺省按 `newapi_cookie` 处理；两种 Cookie 均可为空（实际运行时只检查当前登录方式对应字段）；`sites` 必须有 `name` / `url`；URL 需 http(s) 开头
 - 校验通过才落库
 
 响应（200）：`{ "ok": true, "updated_at": "2026-08-12T10:00:00Z" }`
@@ -127,6 +129,25 @@
 错误（400）：`{ "error": "旧密码错误" }` 或 `{ "error": "新密码至少 8 个字符" }`
 
 ---
+
+## 账号登录字段
+
+每个 `accounts[]` 至少包含 `name`、`url`，并可使用以下登录字段：
+
+```json
+{
+  "name": "站点A",
+  "url": "https://xxx.com",
+  "login_method": "newapi_cookie",
+  "cookie": "",
+  "github_user_session": "",
+  "github_client_id": ""
+}
+```
+
+- `newapi_cookie`：使用 `cookie`，沿用现有 NewAPI Cookie + 浏览器/AI 过盾链路。
+- `github_cookie`：使用 `github_user_session`，按 GitHub OAuth state/authorize/callback 链路签到；站点质询仍复用浏览器/AI 过盾。
+- 可用性检查分开执行：`python main.py --cookie-test newapi_cookie` 或 `python main.py --cookie-test github_cookie`；检查命令不会执行真正签到回调。
 
 ## 配置对象默认结构（后端初始化时内置）
 

@@ -20,6 +20,7 @@ func TestMigrateConfig_UpgradesOldDefaults(t *testing.T) {
 	srv := newTestServer(t)
 	old := DefaultConfig()
 	old.ConfigVersion = 0 // 旧库没有这个字段，反序列化后就是 0
+	old.Accounts = []Account{{Name: "旧账号", URL: "https://a.com", Cookie: "cookie"}}
 	old.ProxyPool.SaveLimit = 100
 	old.ProxyPool.IPSwapLimit = 5
 	writeCfg(t, srv, old)
@@ -37,6 +38,9 @@ func TestMigrateConfig_UpgradesOldDefaults(t *testing.T) {
 	}
 	if cfg.ProxyPool.IPSwapLimit != 10 {
 		t.Errorf("ip_swap_limit = %d, want 10", cfg.ProxyPool.IPSwapLimit)
+	}
+	if cfg.Accounts[0].LoginMethod != LoginMethodNewAPICookie {
+		t.Errorf("旧账号 login_method = %q, want %q", cfg.Accounts[0].LoginMethod, LoginMethodNewAPICookie)
 	}
 	if cfg.ConfigVersion != currentConfigVersion {
 		t.Errorf("config_version = %d, want %d", cfg.ConfigVersion, currentConfigVersion)
@@ -65,6 +69,31 @@ func TestMigrateConfig_KeepsExplicitValues(t *testing.T) {
 	}
 	if cfg.ConfigVersion != currentConfigVersion {
 		t.Errorf("config_version = %d, want %d", cfg.ConfigVersion, currentConfigVersion)
+	}
+}
+
+func TestMigrateConfig_KeepsExplicitLoginMethod(t *testing.T) {
+	srv := newTestServer(t)
+	cfg := DefaultConfig()
+	cfg.ConfigVersion = 1
+	cfg.Accounts = []Account{{
+		Name: "GitHub", URL: "https://a.com", LoginMethod: LoginMethodGitHubCookie,
+		GithubUserSession: "session",
+	}}
+	writeCfg(t, srv, cfg)
+
+	if err := MigrateConfig(srv.db); err != nil {
+		t.Fatalf("MigrateConfig: %v", err)
+	}
+	got, _, err := LoadConfig(srv.db)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got.Accounts[0].LoginMethod != LoginMethodGitHubCookie {
+		t.Fatalf("显式登录方式被覆盖: %q", got.Accounts[0].LoginMethod)
+	}
+	if got.ConfigVersion != currentConfigVersion {
+		t.Fatalf("config_version = %d, want %d", got.ConfigVersion, currentConfigVersion)
 	}
 }
 

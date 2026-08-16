@@ -165,7 +165,10 @@ func TestDefaultConfig(t *testing.T) {
 
 func TestMaskConfig(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.Accounts = []Account{{Name: "A", URL: "https://a.com", Cookie: "secret-cookie"}}
+	cfg.Accounts = []Account{{
+		Name: "A", URL: "https://a.com", LoginMethod: LoginMethodGitHubCookie,
+		Cookie: "secret-cookie", GithubUserSession: "github-secret", GithubClientID: "client-id",
+	}}
 	cfg.AI.APIKey = "sk-x"
 	cfg.Notify.Email.Password = "pw"
 	cfg.ConfigSync.Token = "tok"
@@ -175,6 +178,12 @@ func TestMaskConfig(t *testing.T) {
 
 	if m.Accounts[0].Cookie != MaskPlaceholder {
 		t.Errorf("cookie 未打码: %q", m.Accounts[0].Cookie)
+	}
+	if m.Accounts[0].GithubUserSession != MaskPlaceholder {
+		t.Errorf("github_user_session 未打码: %q", m.Accounts[0].GithubUserSession)
+	}
+	if m.Accounts[0].GithubClientID != "client-id" || m.Accounts[0].LoginMethod != LoginMethodGitHubCookie {
+		t.Errorf("GitHub 非敏感字段被改动: %+v", m.Accounts[0])
 	}
 	if m.AI.APIKey != MaskPlaceholder {
 		t.Errorf("ai.api_key 未打码: %q", m.AI.APIKey)
@@ -213,15 +222,21 @@ func TestMaskConfigEmptyStaysEmpty(t *testing.T) {
 
 func TestUnmaskConfig(t *testing.T) {
 	old := DefaultConfig()
-	old.Accounts = []Account{{Name: "A", URL: "https://a.com", Cookie: "old-cookie"}}
+	old.Accounts = []Account{{
+		Name: "A", URL: "https://a.com", LoginMethod: LoginMethodGitHubCookie,
+		Cookie: "old-cookie", GithubUserSession: "old-github-session", GithubClientID: "old-client-id",
+	}}
 	old.AI.APIKey = "old-key"
 	old.Notify.Email.Password = "old-pass"
 	old.ConfigSync.Token = "old-token"
 
 	in := DefaultConfig()
 	in.Accounts = []Account{
-		{Name: "A", URL: "https://a.com", Cookie: MaskPlaceholder}, // "***" → 按账号名还原旧 cookie
-		{Name: "B", URL: "https://b.com", Cookie: "new-cookie"},    // 新账号，非占位符
+		{
+			Name: "A", URL: "https://a.com", LoginMethod: LoginMethodGitHubCookie,
+			Cookie: MaskPlaceholder, GithubUserSession: MaskPlaceholder,
+		}, // "***" → 按账号名分别还原两类 Cookie
+		{Name: "B", URL: "https://b.com", Cookie: "new-cookie"}, // 新账号，非占位符
 	}
 	in.AI.APIKey = MaskPlaceholder        // 还原
 	in.Notify.Email.Password = "new-pass" // 非占位符，保留新值
@@ -231,6 +246,9 @@ func TestUnmaskConfig(t *testing.T) {
 
 	if out.Accounts[0].Cookie != "old-cookie" {
 		t.Errorf("占位符 cookie 未还原: %q", out.Accounts[0].Cookie)
+	}
+	if out.Accounts[0].GithubUserSession != "old-github-session" {
+		t.Errorf("占位符 github_user_session 未还原: %q", out.Accounts[0].GithubUserSession)
 	}
 	if out.Accounts[0].Name != "A" {
 		t.Errorf("非敏感字段应以输入为准: %q", out.Accounts[0].Name)
@@ -248,7 +266,7 @@ func TestUnmaskConfig(t *testing.T) {
 		t.Errorf("占位符 config_sync.token 未还原: %q", out.ConfigSync.Token)
 	}
 	// 深拷贝：输入对象不受影响
-	if in.Accounts[0].Cookie != MaskPlaceholder {
+	if in.Accounts[0].Cookie != MaskPlaceholder || in.Accounts[0].GithubUserSession != MaskPlaceholder {
 		t.Error("UnmaskConfig 修改了输入配置对象（非深拷贝）")
 	}
 }
@@ -273,6 +291,28 @@ func TestUnmaskConfigAccountIndexOutOfRange(t *testing.T) {
 // ---------------------------------------------------------------------------
 // config.go：校验
 // ---------------------------------------------------------------------------
+
+func TestAccountLoginMethodDefaultsAndValidation(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Accounts = []Account{{Name: "NewAPI", URL: "https://a.com"}}
+	if err := ValidateConfig(&cfg); err != nil {
+		t.Fatalf("缺省登录方式不应报错: %v", err)
+	}
+	if cfg.Accounts[0].LoginMethod != LoginMethodNewAPICookie {
+		t.Fatalf("缺省登录方式 = %q, want %q", cfg.Accounts[0].LoginMethod, LoginMethodNewAPICookie)
+	}
+
+	cfg.Accounts[0].LoginMethod = LoginMethodGitHubCookie
+	cfg.Accounts[0].GithubUserSession = "session"
+	if err := ValidateConfig(&cfg); err != nil {
+		t.Fatalf("GitHub 登录方式不应报错: %v", err)
+	}
+
+	cfg.Accounts[0].LoginMethod = "unknown"
+	if err := ValidateConfig(&cfg); err == nil || !strings.Contains(err.Error(), "login_method") {
+		t.Fatalf("未知登录方式应被拒绝: %v", err)
+	}
+}
 
 func TestValidateConfig(t *testing.T) {
 	valid := DefaultConfig()

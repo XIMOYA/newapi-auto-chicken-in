@@ -274,13 +274,14 @@ func EnsureDefaultConfig(db *sql.DB) error {
 
 // MigrateConfig 一次性升级旧配置里过时的默认值（幂等，靠 config_version 判定）。
 //
-// v0 -> v1：
+// v0 -> v2：
 //   - proxy_pool.save_limit  旧默认 100 -> 0（不限制，上游有多少可用就存多少）
 //   - proxy_pool.ip_swap_limit 旧默认 5 -> 10
+//   - accounts[].login_method 缺失 -> newapi_cookie
 //
-// 只在 config_version 缺失/为 0 时跑一次，跑完就写入版本号；之后用户在界面上
-// 改成什么都不会再被覆盖。旧库里这两个值等于旧默认值时才动，用户显式改成别的
-// 值一律保留。
+// 只在配置版本低于当前版本时运行，跑完就写入版本号；之后用户在界面上
+// 改成什么都不会再被覆盖。旧库里代理池字段等于旧默认值时才动，用户显式改成别的
+// 值一律保留；登录方式只有缺失时才补默认值。
 func MigrateConfig(db *sql.DB) error {
 	cfg, _, err := LoadConfig(db)
 	if err != nil {
@@ -297,6 +298,12 @@ func MigrateConfig(db *sql.DB) error {
 	if cfg.ProxyPool.IPSwapLimit == 5 {
 		cfg.ProxyPool.IPSwapLimit = 10
 		changed = append(changed, "ip_swap_limit 5 -> 10")
+	}
+	for i := range cfg.Accounts {
+		if strings.TrimSpace(cfg.Accounts[i].LoginMethod) == "" {
+			cfg.Accounts[i].LoginMethod = LoginMethodNewAPICookie
+			changed = append(changed, fmt.Sprintf("accounts[%d].login_method -> %s", i, LoginMethodNewAPICookie))
+		}
 	}
 	cfg.ConfigVersion = currentConfigVersion
 	if _, err := SaveConfig(db, cfg); err != nil {

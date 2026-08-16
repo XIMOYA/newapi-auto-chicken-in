@@ -35,15 +35,18 @@ web/src/components/AccountModal.vue
       <n-form-item label="站点 URL" path="url">
         <n-input v-model:value="form.url" placeholder="https://newapi.example.com" />
       </n-form-item>
-      <n-form-item label="Cookie" path="cookie">
+      <n-form-item label="登录方式" path="login_method">
+        <n-select v-model:value="form.login_method" :options="loginMethodOptions" />
+      </n-form-item>
+      <n-form-item v-if="form.login_method === 'newapi_cookie'" label="NewAPI Cookie" path="cookie">
         <div class="cookie-field">
           <masked-input
             v-model="form.cookie"
             :original-value="originalCookie"
             type="textarea"
             :autosize="{ minRows: 2, maxRows: 6 }"
-            placeholder="粘贴完整 Cookie（如 session=...）"
-            :custom-tip="isEdit ? '该账号 Cookie 已设置（出于安全原因接口不回传明文），留空保持不变，输入新值可修改' : 'Cookie 可稍后补充；未设置时该账号无法依赖 Cookie 完成签到'"
+            placeholder="粘贴站点完整 Cookie（如 session=...）"
+            :custom-tip="isEdit ? 'NewAPI Cookie 已设置（接口不回传明文），留空保持不变，输入新值可修改' : '可稍后补充；该登录方式运行时需要有效 Cookie'"
           />
           <n-button
             v-if="isEdit && isMaskedCookie"
@@ -51,12 +54,38 @@ web/src/components/AccountModal.vue
             secondary
             type="info"
             class="reveal-btn"
-            @click="passwordConfirmVisible = true"
+            @click="openReveal('cookie')"
           >
             <template #icon><n-icon><eye-outline /></n-icon></template>
             查看明文
           </n-button>
         </div>
+      </n-form-item>
+      <n-form-item v-else label="GitHub Cookie" path="github_user_session">
+        <div class="cookie-field">
+          <masked-input
+            v-model="form.github_user_session"
+            :original-value="originalGithubUserSession"
+            type="textarea"
+            :autosize="{ minRows: 2, maxRows: 6 }"
+            placeholder="粘贴 GitHub user_session Cookie 值"
+            :custom-tip="isEdit ? 'GitHub user_session 已设置（接口不回传明文），留空保持不变，输入新值可修改' : '仅填写 user_session 值；该登录方式会通过 GitHub OAuth 回调签到'"
+          />
+          <n-button
+            v-if="isEdit && isMaskedGithubUserSession"
+            size="tiny"
+            secondary
+            type="info"
+            class="reveal-btn"
+            @click="openReveal('github_user_session')"
+          >
+            <template #icon><n-icon><eye-outline /></n-icon></template>
+            查看明文
+          </n-button>
+        </div>
+      </n-form-item>
+      <n-form-item v-if="form.login_method === 'github_cookie'" label="GitHub Client ID" path="github_client_id">
+        <n-input v-model:value="form.github_client_id" placeholder="留空使用默认 OAuth Client ID" />
       </n-form-item>
       <n-form-item label="用户 ID" path="user_id">
         <n-input v-model:value="form.user_id" placeholder="可选，留空自动识别" />
@@ -100,7 +129,7 @@ import CookieRevealModal from './CookieRevealModal.vue'
 import { verifyPassword } from '@/api/auth'
 import { exportConfig } from '@/api/export'
 import { extractErrorMessage } from '@/utils/error'
-import type { Account, Site } from '@/types'
+import type { Account, LoginMethod, Site } from '@/types'
 
 const props = defineProps<{
   show: boolean
@@ -117,6 +146,11 @@ const emit = defineEmits<{
 }>()
 
 const isEdit = computed(() => props.account !== null)
+
+const loginMethodOptions = [
+  { label: 'NewAPI Cookie 登录（默认）', value: 'newapi_cookie' as LoginMethod },
+  { label: 'GitHub Cookie 登录', value: 'github_cookie' as LoginMethod }
+]
 
 // 站点预设下拉选项
 const siteOptions = computed<SelectOption[]>(() =>
@@ -162,13 +196,17 @@ function watchUrlInput(value: string) {
   }
 }
 
-// 服务端返回的原始 cookie（可能是 "***"），用于打码判断与「留空保持不变」
+// 服务端返回的原始敏感字段（可能是 "***"），用于打码判断与「留空保持不变」
 const originalCookie = computed(() => (props.account ? props.account.cookie : ''))
+const originalGithubUserSession = computed(() => (props.account ? props.account.github_user_session : ''))
 
 interface AccountForm {
   name: string
   url: string
+  login_method: LoginMethod
   cookie: string
+  github_user_session: string
+  github_client_id: string
   user_id: string
   proxy: string
   checkin_path: string
@@ -180,7 +218,10 @@ const formRef = ref<FormInst | null>(null)
 const form = reactive<AccountForm>({
   name: '',
   url: '',
+  login_method: 'newapi_cookie',
   cookie: '',
+  github_user_session: '',
+  github_client_id: '',
   user_id: '',
   proxy: '',
   checkin_path: '',
@@ -195,7 +236,10 @@ watch(
     if (props.account) {
       form.name = props.account.name
       form.url = props.account.url
+      form.login_method = props.account.login_method || 'newapi_cookie'
       form.cookie = props.account.cookie // 可能是 "***"
+      form.github_user_session = props.account.github_user_session || ''
+      form.github_client_id = props.account.github_client_id || ''
       form.user_id = props.account.user_id == null ? '' : String(props.account.user_id)
       form.proxy = props.account.proxy ?? ''
       form.checkin_path = props.account.checkin_path ?? ''
@@ -205,7 +249,10 @@ watch(
     } else {
       form.name = ''
       form.url = ''
+      form.login_method = 'newapi_cookie'
       form.cookie = ''
+      form.github_user_session = ''
+      form.github_client_id = ''
       form.user_id = ''
       form.proxy = ''
       form.checkin_path = ''
@@ -231,24 +278,34 @@ const passwordConfirmVisible = ref(false)
 const revealing = ref(false)
 const revealVisible = ref(false)
 const revealedCookie = ref('')
+const revealField = ref<'cookie' | 'github_user_session'>('cookie')
 
-/** 编辑且 Cookie 是打码占位时，才显示「查看明文」按钮 */
+/** 编辑且对应 Cookie 是打码占位时，才显示「查看明文」按钮 */
 const isMaskedCookie = computed(() => originalCookie.value !== '' && form.cookie === '***')
+const isMaskedGithubUserSession = computed(
+  () => originalGithubUserSession.value !== '' && form.github_user_session === '***'
+)
+
+function openReveal(field: 'cookie' | 'github_user_session') {
+  revealField.value = field
+  passwordConfirmVisible.value = true
+}
 
 async function handleRevealCookie(password: string) {
   revealing.value = true
   try {
     await verifyPassword(password)
-    // 密码确认通过 → 拉取完整明文配置，取当前账号的 cookie
+    // 密码确认通过 → 拉取完整明文配置，取当前账号对应的 Cookie
     const res = await exportConfig()
     const cfg = JSON.parse(res.json) as { accounts?: Account[] }
     const target = (cfg.accounts ?? []).find((a) => a.name === props.account?.name)
-    if (!target || !target.cookie) {
-      message.error('未找到该账号的 Cookie')
+    const value = target?.[revealField.value]
+    if (!target || typeof value !== 'string' || !value) {
+      message.error(`未找到该账号的${revealField.value === 'cookie' ? 'NewAPI' : 'GitHub'} Cookie`)
       passwordConfirmVisible.value = false
       return
     }
-    revealedCookie.value = target.cookie
+    revealedCookie.value = value
     passwordConfirmVisible.value = false
     revealVisible.value = true
   } catch (e) {
@@ -298,12 +355,18 @@ function normalizePath(v: string) {
 function handleSubmit() {
   formRef.value?.validate((errors) => {
     if (errors) return
-    // cookie：编辑时留空 → 提交原值（"***" 或原明文），保持服务端「原样保留」语义
+    // 两类 Cookie：编辑时留空 → 提交对应原值（"***" 或原明文），保持服务端「原样保留」语义
     const finalCookie = isEdit.value && form.cookie === '' ? originalCookie.value : form.cookie
+    const finalGithubUserSession = isEdit.value && form.github_user_session === ''
+      ? originalGithubUserSession.value
+      : form.github_user_session
     const payload: Account = {
       name: form.name.trim(),
       url: form.url.trim(),
+      login_method: form.login_method,
       cookie: finalCookie,
+      github_user_session: finalGithubUserSession,
+      github_client_id: form.github_client_id.trim(),
       user_id: normalizeUserID(form.user_id),
       proxy: form.proxy.trim() === '' ? null : form.proxy.trim(),
       checkin_path: normalizePath(form.checkin_path),

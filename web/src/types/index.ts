@@ -9,10 +9,15 @@ web/src/types/index.ts
 
 // ===== 配置对象类型（与 config.example.json 结构一致）=====
 
+export type LoginMethod = 'newapi_cookie' | 'github_cookie'
+
 export interface Account {
   name: string
   url: string
+  login_method: LoginMethod
   cookie: string
+  github_user_session: string
+  github_client_id: string
   user_id: number | null
   proxy: string | null
   checkin_path: string | null

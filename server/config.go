@@ -18,8 +18,13 @@ import (
 // MaskPlaceholder 敏感字段占位符：前端展示打码值，后端识别为「未修改，保留原值」。
 const MaskPlaceholder = "***"
 
+const (
+	LoginMethodNewAPICookie = "newapi_cookie"
+	LoginMethodGitHubCookie = "github_cookie"
+)
+
 // currentConfigVersion 用于一次性迁移旧默认值。旧配置没有该字段，视为 0。
-const currentConfigVersion = 1
+const currentConfigVersion = 2
 
 // Config 完整配置对象 = 契约文档中的顶层结构。
 type Config struct {
@@ -44,16 +49,19 @@ type Site struct {
 	BrowserPath *string `json:"browser_path"`
 }
 
-// Account 签到账号：name/url 为必填；cookie 可暂不设置，其余字段可选。
+// Account 签到账号：name/url 为必填；两种 Cookie 均可暂不设置，其余字段可选。
 type Account struct {
-	Name        string  `json:"name"`
-	URL         string  `json:"url"`
-	Cookie      string  `json:"cookie"`
-	UserID      *int64  `json:"user_id"`
-	Proxy       *string `json:"proxy"`
-	CheckinPath *string `json:"checkin_path"`
-	BrowserPath *string `json:"browser_path"`
-	Enabled     bool    `json:"enabled"`
+	Name              string  `json:"name"`
+	URL               string  `json:"url"`
+	LoginMethod       string  `json:"login_method"`
+	Cookie            string  `json:"cookie"`
+	GithubUserSession string  `json:"github_user_session"`
+	GithubClientID    string  `json:"github_client_id"`
+	UserID            *int64  `json:"user_id"`
+	Proxy             *string `json:"proxy"`
+	CheckinPath       *string `json:"checkin_path"`
+	BrowserPath       *string `json:"browser_path"`
+	Enabled           bool    `json:"enabled"`
 }
 
 // AIConfig AI 辅助配置。
@@ -239,13 +247,16 @@ func DefaultConfig() Config {
 }
 
 // MaskConfig 返回敏感字段被替换为 "***" 的深拷贝配置（仅用于 GET /api/config）。
-// 打码字段：accounts[].cookie、ai.api_key、notify.email.password、config_sync.token；
-// 非空才打码，空值原样保留；proxy_pool.sources 等非敏感字段正常返回。
+// 打码字段：accounts[].cookie、accounts[].github_user_session、ai.api_key、
+// notify.email.password、config_sync.token；非空才打码，空值原样保留。
 func MaskConfig(cfg *Config) *Config {
 	m := cloneConfig(cfg)
 	for i := range m.Accounts {
 		if m.Accounts[i].Cookie != "" {
 			m.Accounts[i].Cookie = MaskPlaceholder
+		}
+		if m.Accounts[i].GithubUserSession != "" {
+			m.Accounts[i].GithubUserSession = MaskPlaceholder
 		}
 	}
 	if m.AI.APIKey != "" {
@@ -268,9 +279,11 @@ func UnmaskConfig(in, old *Config) *Config {
 	out := cloneConfig(in)
 
 	oldCookieByName := make(map[string]string, len(old.Accounts))
+	oldGithubSessionByName := make(map[string]string, len(old.Accounts))
 	for _, a := range old.Accounts {
 		if a.Name != "" {
 			oldCookieByName[a.Name] = a.Cookie
+			oldGithubSessionByName[a.Name] = a.GithubUserSession
 		}
 	}
 	for i := range out.Accounts {
@@ -278,6 +291,14 @@ func UnmaskConfig(in, old *Config) *Config {
 			if c, ok := oldCookieByName[out.Accounts[i].Name]; ok {
 				out.Accounts[i].Cookie = c
 			}
+		}
+		if out.Accounts[i].GithubUserSession == MaskPlaceholder {
+			if c, ok := oldGithubSessionByName[out.Accounts[i].Name]; ok {
+				out.Accounts[i].GithubUserSession = c
+			}
+		}
+		if strings.TrimSpace(out.Accounts[i].LoginMethod) == "" {
+			out.Accounts[i].LoginMethod = LoginMethodNewAPICookie
 		}
 	}
 
@@ -382,6 +403,15 @@ func ValidateConfig(cfg *Config) error {
 		lowerURL := strings.ToLower(strings.TrimSpace(a.URL))
 		if !strings.HasPrefix(lowerURL, "http://") && !strings.HasPrefix(lowerURL, "https://") {
 			return fmt.Errorf("accounts[%d].url 必须以 http:// 或 https:// 开头", i)
+		}
+		method := strings.ToLower(strings.TrimSpace(a.LoginMethod))
+		if method == "" {
+			method = LoginMethodNewAPICookie
+			cfg.Accounts[i].LoginMethod = method
+		}
+		if method != LoginMethodNewAPICookie && method != LoginMethodGitHubCookie {
+			return fmt.Errorf("accounts[%d].login_method 只能是 %s 或 %s", i,
+				LoginMethodNewAPICookie, LoginMethodGitHubCookie)
 		}
 
 	}

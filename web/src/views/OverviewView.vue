@@ -218,7 +218,11 @@ const tableData = computed<AccountRow[]>(() => {
     .map((a, i) => ({ ...a, _index: i }))
     .filter((row) => {
       if (!keyword) return true
-      return [row.name, row.url, row.proxy, row.checkin_path, row.browser_path].some(
+      const loginLabel = row.login_method === 'github_cookie' ? 'github cookie' : 'newapi cookie'
+      const credentialState = row.login_method === 'github_cookie'
+        ? (row.github_user_session ? 'github cookie 已设置' : 'github cookie 未设置')
+        : (row.cookie ? 'newapi cookie 已设置' : 'newapi cookie 未设置')
+      return [row.name, row.url, row.proxy, row.checkin_path, row.browser_path, loginLabel, credentialState].some(
         (value) => value?.toLowerCase().includes(keyword) ?? false
       )
     })
@@ -242,6 +246,7 @@ const revealing = ref(false)
 const revealVisible = ref(false)
 const revealedCookie = ref('')
 const cookieRevealTarget = ref('')
+const cookieRevealField = ref<'cookie' | 'github_user_session'>('cookie')
 
 async function handleRevealCookie(password: string) {
   revealing.value = true
@@ -250,12 +255,13 @@ async function handleRevealCookie(password: string) {
     const res = await exportConfig()
     const cfg = JSON.parse(res.json) as { accounts?: Account[] }
     const target = (cfg.accounts ?? []).find((a) => a.name === cookieRevealTarget.value)
-    if (!target || !target.cookie) {
-      message.error('未找到该账号的 Cookie')
+    const value = target?.[cookieRevealField.value]
+    if (!target || typeof value !== 'string' || !value) {
+      message.error(`未找到该账号的${cookieRevealField.value === 'cookie' ? 'NewAPI' : 'GitHub'} Cookie`)
       passwordConfirmVisible.value = false
       return
     }
-    revealedCookie.value = target.cookie
+    revealedCookie.value = value
     passwordConfirmVisible.value = false
     revealVisible.value = true
   } catch (e) {
@@ -378,13 +384,15 @@ function confirmSiteDelete(row: SiteRow) {
   })
 }
 
-function viewCookie(row: AccountRow) {
-  if (row.cookie === '' || row.cookie == null) {
-    message.info(`账号「${row.name}」未设置 Cookie`)
+function viewCookie(row: AccountRow, field: 'cookie' | 'github_user_session') {
+  const value = row[field]
+  if (value === '' || value == null) {
+    message.info(`账号「${row.name}」未设置${field === 'cookie' ? 'NewAPI' : 'GitHub'} Cookie`)
     return
   }
   // 高敏操作：先弹密码确认，通过后再拉明文展示
   cookieRevealTarget.value = row.name
+  cookieRevealField.value = field
   passwordConfirmVisible.value = true
 }
 
@@ -406,6 +414,14 @@ const columns: DataTableColumns<AccountRow> = [
       h('a', { href: row.url, target: '_blank', rel: 'noopener', class: 'url-link' }, row.url)
   },
   {
+    title: '登录方式',
+    key: 'login_method',
+    width: 150,
+    render: (row) => h(NTag, { size: 'small', type: row.login_method === 'github_cookie' ? 'warning' : 'info' }, {
+      default: () => row.login_method === 'github_cookie' ? 'GitHub Cookie' : 'NewAPI Cookie'
+    })
+  },
+  {
     title: '启用',
     key: 'enabled',
     width: 84,
@@ -424,16 +440,19 @@ const columns: DataTableColumns<AccountRow> = [
     render: (row) => (row.proxy ? h('span', { class: 'mono-inline' }, row.proxy) : h('span', { class: 'muted' }, '未设置'))
   },
   {
-    title: 'Cookie',
-    key: 'cookie',
+    title: '当前凭据',
+    key: 'credential',
     width: 190,
     render: (row) => {
-      const text = row.cookie === '***' ? '***（已设置）' : row.cookie ? '已设置' : '未设置'
+      const field = row.login_method === 'github_cookie' ? 'github_user_session' : 'cookie'
+      const value = row[field]
+      const label = row.login_method === 'github_cookie' ? 'GitHub Cookie' : 'NewAPI Cookie'
+      const text = value === '***' ? `${label}（已设置）` : value ? `${label}已设置` : '未设置'
       return h('div', { class: 'cookie-cell' }, [
-        h('span', { class: row.cookie ? 'cookie-masked' : 'muted' }, text),
+        h('span', { class: value ? 'cookie-masked' : 'muted' }, text),
         h(
           NButton,
-          { size: 'tiny', quaternary: true, circle: true, type: 'info', onClick: () => viewCookie(row), class: 'view-cookie-btn' },
+          { size: 'tiny', quaternary: true, circle: true, type: 'info', onClick: () => viewCookie(row, field), class: 'view-cookie-btn' },
           { icon: () => h(NIcon, null, { default: () => h(EyeOutline) }) }
         )
       ])
