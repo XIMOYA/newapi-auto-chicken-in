@@ -68,7 +68,9 @@ def install_session(monkeypatch, routes):
 def default_routes(method, url, kwargs):
     path = urlparse(url).path
     if path == "/api/oauth/state":
-        return FakeResponse(payload={"success": True, "data": "state-1"})
+        return FakeResponse(payload={"success": True, "data": {"flow_token": "state-1"}})
+    if path == "/api/status":
+        return FakeResponse(payload={"success": True, "data": {"github_client_id": "site-client-id"}})
     if "github.com/login/oauth/authorize" in url:
         return FakeResponse(
             status=302,
@@ -95,11 +97,39 @@ def test_cookie_check_gets_code_without_callback(monkeypatch):
 
     assert result.kind == client.SUCCESS
     assert "未执行签到" in result.message
-    assert urlparse(holder["session"].calls[0][1]).path == "/api/oauth/state"
+    state_call = holder["session"].calls[0]
+    assert state_call[0] == "POST"
+    assert urlparse(state_call[1]).path == "/api/oauth/state"
     assert not any("/api/oauth/github" in call[1] for call in holder["session"].calls)
     github_call = next(call for call in holder["session"].calls if "github.com/login/oauth/authorize" in call[1])
+    assert github_call[2]["params"]["client_id"] == "site-client-id"
     assert "user_session=github-session" in github_call[2]["headers"]["Cookie"]
     assert "__Host-user_session_same_site=github-session" in github_call[2]["headers"]["Cookie"]
+
+
+def test_legacy_oauth_state_fallback(monkeypatch):
+    def routes(method, url, kwargs):
+        path = urlparse(url).path
+        if path == "/api/oauth/state":
+            if method == "POST":
+                return FakeResponse(status=400, payload={"success": False, "message": "未知的 OAuth 提供商"})
+            return FakeResponse(payload={"success": True, "data": "legacy-state"})
+        if "github.com/login/oauth/authorize" in url:
+            assert kwargs["params"]["state"] == "legacy-state"
+            return FakeResponse(
+                status=302,
+                headers={"Location": "https://site.example.com/oauth/callback?code=legacy-code&state=legacy-state"},
+                text="",
+            )
+        return FakeResponse(status=404, payload={"success": False, "message": "not found"})
+
+    holder = install_session(monkeypatch, routes)
+    with oauth.GithubOAuthClient(make_account(), HttpConfig()) as client_obj:
+        result = client_obj.test_cookie()
+
+    assert result.kind == client.SUCCESS
+    assert holder["session"].calls[0][0] == "POST"
+    assert any(call[0] == "GET" and "mode=login" in call[1] for call in holder["session"].calls)
 
 
 def test_checkin_callback_and_self_are_used(monkeypatch):

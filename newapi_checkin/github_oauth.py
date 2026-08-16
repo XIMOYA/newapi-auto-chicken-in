@@ -21,7 +21,9 @@ from .utils import sanitize_header_value
 
 GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 GITHUB_AUTHORIZE_PATH = "/login/oauth/authorize"
-OAUTH_STATE_PATH = "/api/oauth/state?mode=login"
+OAUTH_STATE_PATH = "/api/oauth/state"
+OAUTH_STATE_LEGACY_PATH = "/api/oauth/state?mode=login"
+OAUTH_STATUS_PATH = "/api/status"
 OAUTH_CALLBACK_PATH = "/api/oauth/github"
 
 BROWSER_UA = (
@@ -156,8 +158,16 @@ class GithubOAuthClient:
         return step
 
     def fetch_state(self) -> OAuthStep:
-        step = self._site_request("GET", OAUTH_STATE_PATH)
+        step = self._site_request(
+            "POST",
+            OAUTH_STATE_PATH,
+            json={"provider": "github", "intent": "login"},
+            headers={"Content-Type": "application/json"},
+        )
         step = self._decode_json(step, "OAuth state 接口")
+        if step.result.kind != api.SUCCESS and step.result.status in (400, 404, 405, 501):
+            step = self._site_request("GET", OAUTH_STATE_LEGACY_PATH)
+            step = self._decode_json(step, "兼容 OAuth state 接口")
         if step.result.kind != api.SUCCESS:
             if step.result.kind == api.FAILED:
                 message = step.result.message or "取 OAuth state 失败"
@@ -167,17 +177,33 @@ class GithubOAuthClient:
                     step.result.kind = api.AUTH_FAILED
                 step.result.message = message
             return step
-        state = str((step.data or {}).get("data") or "").strip()
+        state = self._extract_oauth_state(step.data or {})
         if not state:
             step.result = api.ApiResult(
                 api.FAILED,
                 message="取 OAuth state 成功但返回为空",
                 status=step.result.status,
-                path=OAUTH_STATE_PATH,
+                path=step.result.path,
             )
             return step
         step.data = {"state": state}
         return step
+
+    @staticmethod
+    def _extract_oauth_state(data: dict) -> str:
+        value = data.get("data")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            for key in ("flow_token", "flowToken", "state"):
+                state = str(value.get(key) or "").strip()
+                if state:
+                    return state
+        for key in ("flow_token", "flowToken", "state"):
+            state = str(data.get(key) or "").strip()
+            if state:
+                return state
+        return ""
 
     def _github_cookie_header(self) -> str:
         value = sanitize_header_value(self.account.github_user_session)
@@ -187,12 +213,27 @@ class GithubOAuthClient:
             "logged_in": "yes",
         })
 
+    def _effective_github_client_id(self) -> str:
+        status = self._site_request("GET", OAUTH_STATUS_PATH)
+        status = self._decode_json(status, "站点状态接口")
+        if status.result.kind == api.SUCCESS:
+            data = status.data or {}
+            value = data.get("data")
+            if isinstance(value, dict):
+                client_id = str(value.get("github_client_id") or value.get("githubClientId") or "").strip()
+                if client_id:
+                    return client_id
+            client_id = str(data.get("github_client_id") or data.get("githubClientId") or "").strip()
+            if client_id:
+                return client_id
+        return self.account.effective_github_client_id
+
     def fetch_github_code(self, state: str) -> OAuthStep:
         try:
             response = self._session.get(
                 GITHUB_AUTHORIZE_URL,
                 params={
-                    "client_id": self.account.effective_github_client_id,
+                    "client_id": self._effective_github_client_id(),
                     "scope": "user:email",
                     "state": state,
                 },

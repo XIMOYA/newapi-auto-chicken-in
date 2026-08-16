@@ -30,13 +30,15 @@ const (
 	cookieTestStateAbnormal = "abnormal"
 	cookieTestStateSkipped  = "skipped"
 
-	cookieTestSelfPath        = "/api/user/self"
-	cookieTestRefreshPath     = "/api/user/auth/refresh"
-	cookieTestOAuthStatePath  = "/api/oauth/state?mode=login"
-	cookieTestGithubAuthorize = "https://github.com/login/oauth/authorize"
-	cookieTestRefreshTokenKey = "new_api_refresh="
-	cookieTestDefaultClientID = "Ov23lidtiR4LeVZvVRNL"
-	cookieTestDefaultUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	cookieTestSelfPath            = "/api/user/self"
+	cookieTestRefreshPath         = "/api/user/auth/refresh"
+	cookieTestOAuthStatePath      = "/api/oauth/state"
+	cookieTestOAuthStateLegacyURL = "/api/oauth/state?mode=login"
+	cookieTestStatusPath          = "/api/status"
+	cookieTestGithubAuthorize     = "https://github.com/login/oauth/authorize"
+	cookieTestRefreshTokenKey     = "new_api_refresh="
+	cookieTestDefaultClientID     = "Ov23lidtiR4LeVZvVRNL"
+	cookieTestDefaultUA           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 var cookieTestAuthMarkers = []string{
@@ -493,20 +495,7 @@ func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, 
 		return cookieTestResult(account, cookieTestStateAbnormal, "HTTP 客户端配置失败: "+err.Error(), nil)
 	}
 
-	stateReq, err := http.NewRequestWithContext(ctx, http.MethodGet, base+cookieTestOAuthStatePath, nil)
-	if err != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "构造 OAuth state 请求失败: "+err.Error(), nil)
-	}
-	setCookieTestCommonHeaders(stateReq, base, "")
-	stateResp, err := client.Do(stateReq)
-	if err != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "OAuth state 网络错误: "+shortCookieTestError(err), nil)
-	}
-	stateBody, readErr := readCookieTestBody(stateResp)
-	if readErr != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "读取 OAuth state 响应失败: "+readErr.Error(), nil)
-	}
-	state, stateResult := classifyCookieTestOAuthState(account, stateResp.StatusCode, stateBody)
+	state, stateResult := fetchCookieTestOAuthState(ctx, client, base, account)
 	if stateResult != nil {
 		return *stateResult
 	}
@@ -516,11 +505,7 @@ func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, 
 		return cookieTestResult(account, cookieTestStateAbnormal, "GitHub authorize 地址无效", nil)
 	}
 	query := u.Query()
-	clientID := strings.TrimSpace(account.GithubClientID)
-	if clientID == "" {
-		clientID = cookieTestDefaultClientID
-	}
-	query.Set("client_id", clientID)
+	query.Set("client_id", resolveCookieTestGithubClientID(ctx, client, base, account))
 	query.Set("scope", "user:email")
 	query.Set("state", state)
 	u.RawQuery = query.Encode()
@@ -545,6 +530,100 @@ func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, 
 	}
 	defer authorizeResp.Body.Close()
 	return classifyCookieTestGithubAuthorize(account, authorizeResp.StatusCode, authorizeResp.Header.Get("Location"))
+}
+
+func fetchCookieTestOAuthState(ctx context.Context, client *http.Client, base string, account Account) (string, *CookieTestResult) {
+	postReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+cookieTestOAuthStatePath,
+		strings.NewReader(`{"provider":"github","intent":"login"}`))
+	if err != nil {
+		result := cookieTestResult(account, cookieTestStateAbnormal, "构造 OAuth state 请求失败: "+err.Error(), nil)
+		return "", &result
+	}
+	setCookieTestCommonHeaders(postReq, base, "")
+	postReq.Header.Set("Content-Type", "application/json")
+	postResp, err := client.Do(postReq)
+	if err != nil {
+		result := cookieTestResult(account, cookieTestStateAbnormal, "OAuth state 网络错误: "+shortCookieTestError(err), nil)
+		return "", &result
+	}
+	postBody, readErr := readCookieTestBody(postResp)
+	if readErr != nil {
+		result := cookieTestResult(account, cookieTestStateAbnormal, "读取 OAuth state 响应失败: "+readErr.Error(), nil)
+		return "", &result
+	}
+	state, stateResult := classifyCookieTestOAuthState(account, postResp.StatusCode, postBody)
+	if stateResult == nil {
+		return state, nil
+	}
+	if !cookieTestShouldFallbackOAuthState(postResp.StatusCode) {
+		return "", stateResult
+	}
+
+	legacyReq, err := http.NewRequestWithContext(ctx, http.MethodGet, base+cookieTestOAuthStateLegacyURL, nil)
+	if err != nil {
+		result := cookieTestResult(account, cookieTestStateAbnormal, "构造兼容 OAuth state 请求失败: "+err.Error(), nil)
+		return "", &result
+	}
+	setCookieTestCommonHeaders(legacyReq, base, "")
+	legacyResp, err := client.Do(legacyReq)
+	if err != nil {
+		result := cookieTestResult(account, cookieTestStateAbnormal, "兼容 OAuth state 网络错误: "+shortCookieTestError(err), nil)
+		return "", &result
+	}
+	legacyBody, readErr := readCookieTestBody(legacyResp)
+	if readErr != nil {
+		result := cookieTestResult(account, cookieTestStateAbnormal, "读取兼容 OAuth state 响应失败: "+readErr.Error(), nil)
+		return "", &result
+	}
+	return classifyCookieTestOAuthState(account, legacyResp.StatusCode, legacyBody)
+}
+
+func cookieTestShouldFallbackOAuthState(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusNotFound ||
+		status == http.StatusMethodNotAllowed || status == http.StatusNotImplemented
+}
+
+func resolveCookieTestGithubClientID(ctx context.Context, client *http.Client, base string, account Account) string {
+	if clientID := fetchCookieTestGithubClientID(ctx, client, base); clientID != "" {
+		return clientID
+	}
+	if clientID := strings.TrimSpace(account.GithubClientID); clientID != "" {
+		return clientID
+	}
+	return cookieTestDefaultClientID
+}
+
+func fetchCookieTestGithubClientID(ctx context.Context, client *http.Client, base string) string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+cookieTestStatusPath, nil)
+	if err != nil {
+		return ""
+	}
+	setCookieTestCommonHeaders(req, base, "")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	body, err := readCookieTestBody(resp)
+	if err != nil || resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return ""
+	}
+	data, ok := cookieTestJSONMap(body)
+	if !ok {
+		return ""
+	}
+	return cookieTestExtractGithubClientID(data)
+}
+
+func cookieTestExtractGithubClientID(data map[string]any) string {
+	for _, key := range []string{"github_client_id", "githubClientId"} {
+		if clientID := cookieTestString(data[key]); clientID != "" {
+			return clientID
+		}
+	}
+	if nested, ok := data["data"].(map[string]any); ok {
+		return cookieTestExtractGithubClientID(nested)
+	}
+	return ""
 }
 
 func classifyCookieTestOAuthState(account Account, status int, body []byte) (string, *CookieTestResult) {
@@ -579,12 +658,31 @@ func classifyCookieTestOAuthState(account Account, status int, body []byte) (str
 		result := cookieTestResult(account, state, cookieTestMessageOr(message, "OAuth state 获取失败"), nil)
 		return "", &result
 	}
-	state := strings.TrimSpace(cookieTestString(data["data"]))
+	state := cookieTestExtractOAuthState(data)
 	if state == "" {
 		result := cookieTestResult(account, cookieTestStateAbnormal, "OAuth state 成功但返回为空", nil)
 		return "", &result
 	}
 	return state, nil
+}
+
+func cookieTestExtractOAuthState(data map[string]any) string {
+	if state := cookieTestString(data["data"]); state != "" {
+		return state
+	}
+	for _, key := range []string{"flow_token", "flowToken", "state"} {
+		if state := cookieTestString(data[key]); state != "" {
+			return state
+		}
+	}
+	if nested, ok := data["data"].(map[string]any); ok {
+		for _, key := range []string{"flow_token", "flowToken", "state"} {
+			if state := cookieTestString(nested[key]); state != "" {
+				return state
+			}
+		}
+	}
+	return ""
 }
 
 func classifyCookieTestGithubAuthorize(account Account, status int, location string) CookieTestResult {

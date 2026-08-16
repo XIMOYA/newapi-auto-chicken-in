@@ -147,7 +147,7 @@ NewAPI Cookie 与 GitHub Cookie 必须通过两个独立接口检测。前端只
 
 `POST /api/cookie-tests/github`
 
-请求体格式与 NewAPI Cookie 相同，但只检测 `login_method=github_cookie` 且启用的账号。检测流程为站点 OAuth state + GitHub authorize，并在取得 OAuth code 后结束，**不会调用站点 OAuth callback，也不会执行签到**。
+请求体格式与 NewAPI Cookie 相同，但只检测 `login_method=github_cookie` 且启用的账号。检测流程为站点 OAuth state + GitHub authorize，并在取得 OAuth code 后结束，**不会调用站点 OAuth callback，也不会执行签到**。兼容新版站点的 `POST /api/oauth/state`（`provider=github`、`intent=login`）与旧版 GET 接口；GitHub `client_id` 优先从站点 `/api/status` 动态读取，配置字段仅作为兼容回退。
 
 响应（200）：
 ```json
