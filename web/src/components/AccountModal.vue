@@ -69,7 +69,7 @@ web/src/components/AccountModal.vue
             type="textarea"
             :autosize="{ minRows: 2, maxRows: 6 }"
             placeholder="粘贴 GitHub user_session Cookie 值"
-            :custom-tip="isEdit ? 'GitHub user_session 已设置（接口不回传明文），留空保持不变，输入新值可修改' : '仅填写 user_session 值；该登录方式会通过 GitHub OAuth 回调签到'"
+            :custom-tip="isEdit ? 'GitHub user_session 已设置（接口不回传明文），留空保持不变，输入新值可修改' : '只填写 user_session 值；Client ID 使用内置默认值'"
           />
           <n-button
             v-if="isEdit && isMaskedGithubUserSession"
@@ -83,9 +83,6 @@ web/src/components/AccountModal.vue
             查看明文
           </n-button>
         </div>
-      </n-form-item>
-      <n-form-item v-if="form.login_method === 'github_cookie'" label="GitHub Client ID" path="github_client_id">
-        <n-input v-model:value="form.github_client_id" placeholder="留空使用默认 OAuth Client ID" />
       </n-form-item>
       <n-form-item label="用户 ID" path="user_id">
         <n-input v-model:value="form.user_id" placeholder="可选，留空自动识别" />
