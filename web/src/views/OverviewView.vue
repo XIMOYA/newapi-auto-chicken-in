@@ -218,9 +218,7 @@ const tableData = computed<AccountRow[]>(() => {
     .map((a, i) => ({ ...a, _index: i }))
     .filter((row) => {
       if (!keyword) return true
-      const loginLabel = row.login_method === 'github_cookie'
-        ? `github oauth ${row.github_protocol || 'agent'}`
-        : 'site cookie'
+      const loginLabel = row.login_method === 'github_cookie' ? 'github oauth' : 'site cookie'
       const credentialState = row.login_method === 'github_cookie'
         ? (row.github_user_session ? 'github oauth 已设置' : 'github oauth 未设置')
         : (row.cookie ? 'site cookie 已设置' : 'site cookie 未设置')
@@ -420,9 +418,7 @@ const columns: DataTableColumns<AccountRow> = [
     key: 'login_method',
     width: 150,
     render: (row) => h(NTag, { size: 'small', type: row.login_method === 'github_cookie' ? 'warning' : 'info' }, {
-      default: () => row.login_method === 'github_cookie'
-        ? `GitHub OAuth · ${row.github_protocol === 'tabi' ? 'TaBi 协议' : 'Agent 协议'}`
-        : '站点 Cookie'
+      default: () => row.login_method === 'github_cookie' ? 'GitHub OAuth' : '站点 Cookie'
     })
   },
   {

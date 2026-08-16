@@ -73,7 +73,7 @@ const emit = defineEmits<{
 const selectedKeys = ref<string[]>([])
 const modeLabel = computed(() => props.mode === 'github_cookie' ? 'GitHub OAuth' : '站点 Cookie')
 const hint = computed(() => props.mode === 'github_cookie'
-  ? '按账号所选 GitHub 协议执行站点 OAuth state 与 GitHub authorize：Agent 协议 GET /api/oauth/state?mode=login，TaBi 协议 POST /api/oauth/state 并从 /api/status 取 Client ID。取得授权 code 即视为凭据可用，不会调用站点 OAuth 回调或执行签到。'
+  ? '只执行站点 OAuth state（POST /api/oauth/state）与 GitHub authorize：Client ID 取账号配置，未填则读站点 /api/status。取得授权 code 即视为凭据可用，不会调用站点 OAuth 回调或执行签到。'
   : '直接验证 /api/user/self；检测到 new_api_refresh 时会先刷新凭据再验证，不会执行签到。')
 const resultByName = computed(() => new Map(props.results.map((result) => [result.name, result])))
 const rows = computed<CookieTestRow[]>(() => props.accounts.map((account) => ({
@@ -127,88 +127,70 @@ function credentialState(row: CookieTestRow) {
   return value ? '已设置' : '未设置'
 }
 
-const columns = computed<DataTableColumns<CookieTestRow>>(() => {
-  const base: DataTableColumns<CookieTestRow> = [
-    { type: 'selection', width: 44, fixed: 'left' },
-    {
-      title: '账号',
-      key: 'name',
-      width: 160,
-      fixed: 'left',
-      ellipsis: { tooltip: true }
-    },
-    {
-      title: '站点 URL',
-      key: 'url',
-      width: 220,
-      ellipsis: { tooltip: true },
-      render: (row) => h('a', {
-        href: row.url,
-        target: '_blank',
-        rel: 'noopener',
-        class: 'url-link'
-      }, row.url)
-    }
-  ]
-  if (props.mode === 'github_cookie') {
-    // 两种协议的 state 请求方式不同，检测失败时需要一眼看出账号用的是哪套
-    base.push({
-      title: '协议',
-      key: 'github_protocol',
-      width: 110,
-      render: (row) => h(NTag, {
-        size: 'small',
-        type: row.github_protocol === 'tabi' ? 'warning' : 'info',
-        bordered: false
-      }, { default: () => (row.github_protocol === 'tabi' ? 'TaBi' : 'Agent') })
+const columns: DataTableColumns<CookieTestRow> = [
+  { type: 'selection', width: 44, fixed: 'left' },
+  {
+    title: '账号',
+    key: 'name',
+    width: 160,
+    fixed: 'left',
+    ellipsis: { tooltip: true }
+  },
+  {
+    title: '站点 URL',
+    key: 'url',
+    width: 220,
+    ellipsis: { tooltip: true },
+    render: (row) => h('a', {
+      href: row.url,
+      target: '_blank',
+      rel: 'noopener',
+      class: 'url-link'
+    }, row.url)
+  },
+  {
+    title: '凭据',
+    key: 'credential',
+    width: 100,
+    render: (row) => h(NTag, {
+      size: 'small',
+      type: credentialState(row) === '已设置' ? 'success' : 'default',
+      bordered: false
+    }, { default: () => credentialState(row) })
+  },
+  {
+    title: '检测状态',
+    key: 'state',
+    width: 110,
+    render: (row) => h(NTag, {
+      size: 'small',
+      type: statusType(row.result?.state),
+      bordered: false
+    }, {
+      icon: row.result?.state === 'valid' ? () => h(NIcon, null, { default: () => h(CheckmarkCircleOutline) }) : undefined,
+      default: () => statusLabel(row.result?.state)
     })
+  },
+  {
+    title: '结果说明',
+    key: 'message',
+    minWidth: 280,
+    ellipsis: { tooltip: true },
+    render: (row) => row.result?.message || h('span', { class: 'muted' }, '尚未检测')
+  },
+  {
+    title: '用户 ID',
+    key: 'user_id',
+    width: 100,
+    render: (row) => row.result?.user_id ? String(row.result.user_id) : h('span', { class: 'muted' }, '—')
+  },
+  {
+    title: '耗时',
+    key: 'duration_ms',
+    width: 100,
+    render: (row) => row.result ? formatDuration(row.result.duration_ms) : h('span', { class: 'muted' }, '—')
   }
-  base.push(
-    {
-      title: '凭据',
-      key: 'credential',
-      width: 100,
-      render: (row) => h(NTag, {
-        size: 'small',
-        type: credentialState(row) === '已设置' ? 'success' : 'default',
-        bordered: false
-      }, { default: () => credentialState(row) })
-    },
-    {
-      title: '检测状态',
-      key: 'state',
-      width: 110,
-      render: (row) => h(NTag, {
-        size: 'small',
-        type: statusType(row.result?.state),
-        bordered: false
-      }, {
-        icon: row.result?.state === 'valid' ? () => h(NIcon, null, { default: () => h(CheckmarkCircleOutline) }) : undefined,
-        default: () => statusLabel(row.result?.state)
-      })
-    },
-    {
-      title: '结果说明',
-      key: 'message',
-      minWidth: 280,
-      ellipsis: { tooltip: true },
-      render: (row) => row.result?.message || h('span', { class: 'muted' }, '尚未检测')
-    },
-    {
-      title: '用户 ID',
-      key: 'user_id',
-      width: 100,
-      render: (row) => row.result?.user_id ? String(row.result.user_id) : h('span', { class: 'muted' }, '—')
-    },
-    {
-      title: '耗时',
-      key: 'duration_ms',
-      width: 100,
-      render: (row) => row.result ? formatDuration(row.result.duration_ms) : h('span', { class: 'muted' }, '—')
-    }
-  )
-  return base
-})
+]
 </script>
 
 <style scoped>

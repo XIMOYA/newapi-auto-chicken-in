@@ -891,27 +891,15 @@ class TestSolverRun:
         assert outcome.strategy == "S2"
         assert outcome.cf.cookies["cf_clearance"] == "cf"
 
-    def test_agent_github_account_enters_oauth_state_page(self, wired):
+    def test_github_account_enters_public_sign_in_page(self, wired):
         page = FakePage([NORMAL])
         cfg, account, driver = build(page)
         account.login_method = cfgmod.LOGIN_METHOD_GITHUB_COOKIE
-        account.github_protocol = cfgmod.GITHUB_PROTOCOL_AGENT
         with driver:
             outcome = solver._run(driver, cfg, account, None, FakeOptions(), None)
         assert outcome.ok is True
         assert outcome.api_result is None          # 过盾后交回 OAuth 客户端，不在页内签到
-        assert page.goto_calls == [f"{BASE}/api/oauth/state?mode=login"]
-
-    def test_tabi_github_account_enters_public_sign_in_page(self, wired):
-        page = FakePage([NORMAL])
-        cfg, account, driver = build(page)
-        account.login_method = cfgmod.LOGIN_METHOD_GITHUB_COOKIE
-        account.github_protocol = cfgmod.GITHUB_PROTOCOL_TABI
-        with driver:
-            outcome = solver._run(driver, cfg, account, None, FakeOptions(), None)
-        assert outcome.ok is True
-        assert outcome.api_result is None
-        # TaBi 的 state 只接受 POST，浏览器不能直接导航过去
+        # state 接口只接受 POST，浏览器不能直接导航过去
         assert page.goto_calls == [f"{BASE}/sign-in"]
 
     def test_driver_unavailable_becomes_actionable_detail(self, wired, monkeypatch):

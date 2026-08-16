@@ -31,15 +31,13 @@ const (
 	cookieTestStateAbnormal = "abnormal"
 	cookieTestStateSkipped  = "skipped"
 
-	cookieTestSelfPath           = "/api/user/self"
-	cookieTestRefreshPath        = "/api/user/auth/refresh"
-	cookieTestOAuthStatePath     = "/api/oauth/state?mode=login"
-	cookieTestTabiOAuthStatePath = "/api/oauth/state"
-	cookieTestStatusPath         = "/api/status"
-	cookieTestGithubAuthorize    = "https://github.com/login/oauth/authorize"
-	cookieTestRefreshTokenKey    = "new_api_refresh="
-	cookieTestDefaultClientID    = "Ov23lidtiR4LeVZvVRNL"
-	cookieTestDefaultUA          = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
+	cookieTestSelfPath        = "/api/user/self"
+	cookieTestRefreshPath     = "/api/user/auth/refresh"
+	cookieTestOAuthStatePath  = "/api/oauth/state"
+	cookieTestStatusPath      = "/api/status"
+	cookieTestGithubAuthorize = "https://github.com/login/oauth/authorize"
+	cookieTestRefreshTokenKey = "new_api_refresh="
+	cookieTestDefaultUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
 )
 
 var cookieTestAuthMarkers = []string{
@@ -496,29 +494,21 @@ func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, 
 		return cookieTestResult(account, cookieTestStateAbnormal, "HTTP 客户端配置失败: "+err.Error(), nil)
 	}
 
-	statePath := cookieTestOAuthStatePath
-	method := http.MethodGet
-	var stateReqBody io.Reader
-	if strings.EqualFold(strings.TrimSpace(account.GithubProtocol), GithubProtocolTabi) {
-		statePath = cookieTestTabiOAuthStatePath
-		method = http.MethodPost
-		payload, marshalErr := json.Marshal(map[string]string{
-			"provider": "github",
-			"intent":   "login",
-		})
-		if marshalErr != nil {
-			return cookieTestResult(account, cookieTestStateAbnormal, "构造 TaBi OAuth state 请求失败: "+marshalErr.Error(), nil)
-		}
-		stateReqBody = bytes.NewReader(payload)
+	statePayload, marshalErr := json.Marshal(map[string]string{
+		"provider": "github",
+		"intent":   "login",
+	})
+	if marshalErr != nil {
+		return cookieTestResult(account, cookieTestStateAbnormal, "构造 OAuth state 请求失败: "+marshalErr.Error(), nil)
 	}
-	stateReq, err := http.NewRequestWithContext(ctx, method, base+statePath, stateReqBody)
+	stateReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		base+cookieTestOAuthStatePath, bytes.NewReader(statePayload))
 	if err != nil {
 		return cookieTestResult(account, cookieTestStateAbnormal, "构造 OAuth state 请求失败: "+err.Error(), nil)
 	}
 	setCookieTestCommonHeaders(stateReq, base, "")
-	if method == http.MethodPost {
-		stateReq.Header.Set("Content-Type", "application/json")
-	}
+	stateReq.Header.Set("Content-Type", "application/json")
+	stateReq.Header.Set("Cache-Control", "no-store")
 	stateResp, err := client.Do(stateReq)
 	if err != nil {
 		return cookieTestResult(account, cookieTestStateAbnormal, "OAuth state 网络错误: "+shortCookieTestError(err), nil)
@@ -538,7 +528,8 @@ func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, 
 	}
 	query := u.Query()
 	clientID := strings.TrimSpace(account.GithubClientID)
-	if clientID == "" && strings.EqualFold(strings.TrimSpace(account.GithubProtocol), GithubProtocolTabi) {
+	if clientID == "" {
+		// 站点自己的 OAuth 应用 ID 由 /api/status 公开，不能套用别站的默认值
 		statusReq, statusErr := http.NewRequestWithContext(ctx, http.MethodGet, base+cookieTestStatusPath, nil)
 		if statusErr != nil {
 			return cookieTestResult(account, cookieTestStateAbnormal, "构造站点状态请求失败: "+statusErr.Error(), nil)
@@ -556,16 +547,12 @@ func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, 
 		if !ok || statusResp.StatusCode >= 400 {
 			return cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("站点状态 HTTP %d 非法响应", statusResp.StatusCode), nil)
 		}
-		payload, ok := statusData["data"].(map[string]any)
-		if ok {
+		if payload, ok := statusData["data"].(map[string]any); ok {
 			clientID = strings.TrimSpace(cookieTestString(payload["github_client_id"]))
 		}
 		if clientID == "" {
 			return cookieTestResult(account, cookieTestStateAbnormal, "站点状态未返回 github_client_id", nil)
 		}
-	}
-	if clientID == "" {
-		clientID = cookieTestDefaultClientID
 	}
 	query.Set("client_id", clientID)
 	query.Set("scope", "user:email")
@@ -624,12 +611,25 @@ func classifyCookieTestOAuthState(account Account, status int, body []byte) (str
 		result := cookieTestResult(account, state, cookieTestMessageOr(message, "OAuth state 获取失败"), nil)
 		return "", &result
 	}
-	state := strings.TrimSpace(cookieTestString(data["data"]))
+	state := cookieTestFlowToken(data["data"])
 	if state == "" {
-		result := cookieTestResult(account, cookieTestStateAbnormal, "OAuth state 成功但返回为空", nil)
+		result := cookieTestResult(account, cookieTestStateAbnormal, "OAuth state 成功但未返回 flow_token", nil)
 		return "", &result
 	}
 	return state, nil
+}
+
+// cookieTestFlowToken 站点把 state 放在 data.flow_token；旧结构直接给字符串时也接受。
+func cookieTestFlowToken(value any) string {
+	if payload, ok := value.(map[string]any); ok {
+		for _, key := range []string{"flow_token", "state"} {
+			if token := strings.TrimSpace(cookieTestString(payload[key])); token != "" {
+				return token
+			}
+		}
+		return ""
+	}
+	return strings.TrimSpace(cookieTestString(value))
 }
 
 func classifyCookieTestGithubAuthorize(account Account, status int, location string) CookieTestResult {

@@ -480,8 +480,8 @@ class Runner:
                     account.name, "skipped", "-", "缺少 GitHub Cookie（github_user_session）"
                 )
         elif not account.cookie:
-            log.warn("缺少 cookie（NewAPI Cookie），跳过（配置 accounts[].cookie）")
-            return log.SummaryRow(account.name, "skipped", "-", "缺少 NewAPI Cookie")
+            log.warn("缺少 cookie（站点 Cookie），跳过（配置 accounts[].cookie）")
+            return log.SummaryRow(account.name, "skipped", "-", "缺少站点 Cookie")
 
         record = self.store.get(account.slug)
         if account.user_id is None and record.user_id:
@@ -706,8 +706,7 @@ class Runner:
 
         with GithubOAuthClient(account, self.cfg.http, cf) as client:
             log.debug(
-                f"GitHub OAuth 协议={account.github_protocol}, "
-                f"impersonate={client.impersonate}, "
+                f"GitHub OAuth impersonate={client.impersonate}, "
                 + ("缓存 UA" if cf is not None and cf.user_agent else "默认 UA")
                 + (f", cookie 条数={len(cf.cookies)}" if cf is not None else "")
             )

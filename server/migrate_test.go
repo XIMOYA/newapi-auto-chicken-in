@@ -42,9 +42,6 @@ func TestMigrateConfig_UpgradesOldDefaults(t *testing.T) {
 	if cfg.Accounts[0].LoginMethod != LoginMethodNewAPICookie {
 		t.Errorf("旧账号 login_method = %q, want %q", cfg.Accounts[0].LoginMethod, LoginMethodNewAPICookie)
 	}
-	if cfg.Accounts[0].GithubProtocol != GithubProtocolAgent {
-		t.Errorf("旧账号 github_protocol = %q, want %q", cfg.Accounts[0].GithubProtocol, GithubProtocolAgent)
-	}
 	if cfg.ConfigVersion != currentConfigVersion {
 		t.Errorf("config_version = %d, want %d", cfg.ConfigVersion, currentConfigVersion)
 	}
@@ -81,7 +78,7 @@ func TestMigrateConfig_KeepsExplicitLoginMethod(t *testing.T) {
 	cfg.ConfigVersion = 1
 	cfg.Accounts = []Account{{
 		Name: "GitHub", URL: "https://a.com", LoginMethod: LoginMethodGitHubCookie,
-		GithubUserSession: "session", GithubProtocol: GithubProtocolTabi,
+		GithubUserSession: "session",
 	}}
 	writeCfg(t, srv, cfg)
 
@@ -94,9 +91,6 @@ func TestMigrateConfig_KeepsExplicitLoginMethod(t *testing.T) {
 	}
 	if got.Accounts[0].LoginMethod != LoginMethodGitHubCookie {
 		t.Fatalf("显式登录方式被覆盖: %q", got.Accounts[0].LoginMethod)
-	}
-	if got.Accounts[0].GithubProtocol != GithubProtocolTabi {
-		t.Fatalf("显式 GitHub 协议被覆盖: %q", got.Accounts[0].GithubProtocol)
 	}
 	if got.ConfigVersion != currentConfigVersion {
 		t.Fatalf("config_version = %d, want %d", got.ConfigVersion, currentConfigVersion)

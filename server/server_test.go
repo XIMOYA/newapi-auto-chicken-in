@@ -331,8 +331,6 @@ func TestValidateConfig(t *testing.T) {
 		{"url 非 http", func(c *Config) { c.Accounts[0].URL = "ftp://x.com" }, "http"},
 		{"url 大写 http", func(c *Config) { c.Accounts[0].URL = "HTTPS://X.COM" }, ""}, // 大小写宽容
 		{"空 cookie 合法", func(c *Config) { c.Accounts[0].Cookie = "" }, ""},
-		{"TaBi 协议合法", func(c *Config) { c.Accounts[0].GithubProtocol = GithubProtocolTabi }, ""},
-		{"未知 GitHub 协议", func(c *Config) { c.Accounts[0].GithubProtocol = "unknown" }, "github_protocol"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

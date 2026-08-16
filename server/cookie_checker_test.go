@@ -138,19 +138,30 @@ func TestCheckGithubCookieGetsCodeWithoutCallback(t *testing.T) {
 			http.Error(w, "callback must not be called", http.StatusInternalServerError)
 			return
 		}
-		if r.URL.Path != "/api/oauth/state" {
+		if r.URL.Path != cookieTestOAuthStatePath {
 			http.NotFound(w, r)
 			return
 		}
-		if r.Method != http.MethodGet || r.URL.Query().Get("mode") != "login" {
+		if r.Method != http.MethodPost {
 			t.Fatalf("OAuth state request = %s %s", r.Method, r.URL.String())
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "data": "state-123"})
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode OAuth state payload: %v", err)
+		}
+		if payload["provider"] != "github" || payload["intent"] != "login" {
+			t.Fatalf("OAuth state payload = %#v", payload)
+		}
+		// 站点实测结构：state 在 data.flow_token
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data":    map[string]any{"flow_token": "state-123", "expires_at": 1786906774},
+		})
 	}))
 	defer site.Close()
 
 	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("client_id") != cookieTestDefaultClientID {
+		if r.URL.Query().Get("client_id") != "configured-client-id" {
 			t.Fatalf("client_id = %q", r.URL.Query().Get("client_id"))
 		}
 		if r.URL.Query().Get("state") != "state-123" {
@@ -170,6 +181,7 @@ func TestCheckGithubCookieGetsCodeWithoutCallback(t *testing.T) {
 	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
 		Name:              "github",
 		URL:               site.URL,
+		GithubClientID:    "configured-client-id",
 		GithubUserSession: "github-session",
 	}, authorize.URL)
 	if result.State != cookieTestStateValid {
@@ -180,9 +192,36 @@ func TestCheckGithubCookieGetsCodeWithoutCallback(t *testing.T) {
 	}
 }
 
+func TestCheckGithubCookieStateWithoutFlowTokenIsAbnormal(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data":    map[string]any{"expires_at": 1786906774},
+		})
+	}))
+	defer site.Close()
+	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("authorize 不应在 state 缺失时被调用")
+	}))
+	defer authorize.Close()
+
+	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
+		Name:              "github-no-token",
+		URL:               site.URL,
+		GithubClientID:    "configured-client-id",
+		GithubUserSession: "github-session",
+	}, authorize.URL)
+	if result.State != cookieTestStateAbnormal || !strings.Contains(result.Message, "flow_token") {
+		t.Fatalf("state = %q, message = %q", result.State, result.Message)
+	}
+}
+
 func TestCheckGithubCookieInvalidRedirect(t *testing.T) {
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "data": "state-123"})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data":    map[string]any{"flow_token": "state-123"},
+		})
 	}))
 	defer site.Close()
 	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -194,6 +233,7 @@ func TestCheckGithubCookieInvalidRedirect(t *testing.T) {
 	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
 		Name:              "github-invalid",
 		URL:               site.URL,
+		GithubClientID:    "configured-client-id",
 		GithubUserSession: "dead-session",
 	}, authorize.URL)
 	if result.State != cookieTestStateInvalid {
@@ -201,27 +241,23 @@ func TestCheckGithubCookieInvalidRedirect(t *testing.T) {
 	}
 }
 
-func TestCheckGithubCookieTabiUsesPostStateAndStatusClientID(t *testing.T) {
+func TestCheckGithubCookieLoadsClientIDFromSiteStatus(t *testing.T) {
 	var stateCalls atomic.Int32
 	var statusCalls atomic.Int32
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case cookieTestTabiOAuthStatePath:
+		case cookieTestOAuthStatePath:
 			stateCalls.Add(1)
 			if r.Method != http.MethodPost {
-				t.Fatalf("TaBi state method = %s", r.Method)
+				t.Fatalf("state method = %s", r.Method)
 			}
 			if got := r.Header.Get("Content-Type"); got != "application/json" {
-				t.Fatalf("TaBi state content type = %q", got)
+				t.Fatalf("state content type = %q", got)
 			}
-			var payload map[string]string
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-				t.Fatalf("decode TaBi state payload: %v", err)
-			}
-			if payload["provider"] != "github" || payload["intent"] != "login" {
-				t.Fatalf("TaBi state payload = %#v", payload)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "data": "tabi-state"})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data":    map[string]any{"flow_token": "site-state"},
+			})
 		case cookieTestStatusPath:
 			statusCalls.Add(1)
 			if r.Method != http.MethodGet {
@@ -229,7 +265,7 @@ func TestCheckGithubCookieTabiUsesPostStateAndStatusClientID(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"success": true,
-				"data":    map[string]any{"github_client_id": "tabi-client-id"},
+				"data":    map[string]any{"github_client_id": "site-client-id"},
 			})
 		default:
 			http.NotFound(w, r)
@@ -238,28 +274,60 @@ func TestCheckGithubCookieTabiUsesPostStateAndStatusClientID(t *testing.T) {
 	defer site.Close()
 
 	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("client_id") != "tabi-client-id" {
+		if r.URL.Query().Get("client_id") != "site-client-id" {
 			t.Fatalf("client_id = %q", r.URL.Query().Get("client_id"))
 		}
-		if r.URL.Query().Get("state") != "tabi-state" {
+		if r.URL.Query().Get("state") != "site-state" {
 			t.Fatalf("state = %q", r.URL.Query().Get("state"))
 		}
-		w.Header().Set("Location", "https://example.test/oauth/callback?code=tabi-code")
+		w.Header().Set("Location", "https://example.test/oauth/callback?code=site-code")
 		w.WriteHeader(http.StatusFound)
 	}))
 	defer authorize.Close()
 
 	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
-		Name:              "github-tabi",
+		Name:              "github-status-client-id",
 		URL:               site.URL,
-		GithubProtocol:    GithubProtocolTabi,
 		GithubUserSession: "github-session",
 	}, authorize.URL)
 	if result.State != cookieTestStateValid {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
 	if stateCalls.Load() != 1 || statusCalls.Load() != 1 {
-		t.Fatalf("TaBi calls = state:%d status:%d", stateCalls.Load(), statusCalls.Load())
+		t.Fatalf("calls = state:%d status:%d", stateCalls.Load(), statusCalls.Load())
+	}
+}
+
+func TestCheckGithubCookieMissingClientIDIsAbnormal(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case cookieTestOAuthStatePath:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data":    map[string]any{"flow_token": "site-state"},
+			})
+		case cookieTestStatusPath:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data":    map[string]any{"github_oauth": true},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer site.Close()
+	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("authorize 不应在缺少 client_id 时被调用")
+	}))
+	defer authorize.Close()
+
+	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
+		Name:              "github-no-client-id",
+		URL:               site.URL,
+		GithubUserSession: "github-session",
+	}, authorize.URL)
+	if result.State != cookieTestStateAbnormal || !strings.Contains(result.Message, "github_client_id") {
+		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
 }
 

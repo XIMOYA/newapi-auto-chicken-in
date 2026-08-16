@@ -61,11 +61,6 @@ LOGIN_METHOD_NEWAPI_COOKIE = "newapi_cookie"
 LOGIN_METHOD_GITHUB_COOKIE = "github_cookie"
 LOGIN_METHODS = (LOGIN_METHOD_NEWAPI_COOKIE, LOGIN_METHOD_GITHUB_COOKIE)
 
-GITHUB_PROTOCOL_AGENT = "agent"
-GITHUB_PROTOCOL_TABI = "tabi"
-GITHUB_PROTOCOLS = (GITHUB_PROTOCOL_AGENT, GITHUB_PROTOCOL_TABI)
-DEFAULT_GITHUB_PROTOCOL = GITHUB_PROTOCOL_AGENT
-DEFAULT_GITHUB_CLIENT_ID = "Ov23lidtiR4LeVZvVRNL"
 
 
 class ConfigError(Exception):
@@ -81,21 +76,6 @@ def slugify(name: str) -> str:
 
 def _env_key(name: str) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "_", name).upper().strip("_")
-
-
-def normalize_github_protocol(value: Any, default: str = DEFAULT_GITHUB_PROTOCOL) -> str:
-    """把配置里的 GitHub 协议名称归一化为内部值。"""
-    text = str(value or "").strip().lower().replace("_", "-")
-    aliases = {
-        "agent": GITHUB_PROTOCOL_AGENT,
-        "agentrouter": GITHUB_PROTOCOL_AGENT,
-        "agentroutercheckin": GITHUB_PROTOCOL_AGENT,
-        "agent-routercheckin": GITHUB_PROTOCOL_AGENT,
-        "tabi": GITHUB_PROTOCOL_TABI,
-        "tabitoken": GITHUB_PROTOCOL_TABI,
-        "tabi-token": GITHUB_PROTOCOL_TABI,
-    }
-    return aliases.get(text, text or default)
 
 
 @dataclass
@@ -253,7 +233,6 @@ class Account:
     login_method: str = LOGIN_METHOD_NEWAPI_COOKIE
     github_user_session: str = ""
     github_client_id: str = ""
-    github_protocol: str = DEFAULT_GITHUB_PROTOCOL
     user_id: Optional[int] = None
     proxy: Optional[str] = None
     checkin_path: Optional[str] = None
@@ -266,11 +245,7 @@ class Account:
 
     @property
     def credential_label(self) -> str:
-        return "GitHub Cookie" if self.uses_github_cookie else "NewAPI Cookie"
-
-    @property
-    def effective_github_client_id(self) -> str:
-        return self.github_client_id or DEFAULT_GITHUB_CLIENT_ID
+        return "GitHub Cookie" if self.uses_github_cookie else "站点 Cookie"
 
     @property
     def base_url(self) -> str:
@@ -438,7 +413,7 @@ def _build_accounts(raw_list: Any, problems: list) -> list:
         raw_method = item.get("login_method", item.get("login_type", item.get("auth_type")))
         method_text = str(raw_method or "").strip().lower()
         if not method_text:
-            # 显式保留旧 NewAPI Cookie 的默认行为；只有明显是参考项目格式的账号
+            # 显式保留旧站点 Cookie 的默认行为；只有明显是参考项目格式的账号
             # 才自动推断为 GitHub Cookie，避免空账号被误切换登录链路。
             method_text = (
                 LOGIN_METHOD_GITHUB_COOKIE
@@ -463,14 +438,6 @@ def _build_accounts(raw_list: Any, problems: list) -> list:
         client_id = str(
             item.get("github_client_id") or item.get("client_id") or ""
         ).strip()
-        github_protocol = normalize_github_protocol(
-            item.get("github_protocol", item.get("github_flow", item.get("oauth_protocol")))
-        )
-        if github_protocol not in GITHUB_PROTOCOLS:
-            problems.append(
-                f"账号 {name}: github_protocol 只能是 {', '.join(GITHUB_PROTOCOLS)}（当前 {github_protocol}）"
-            )
-            github_protocol = DEFAULT_GITHUB_PROTOCOL
         checkin_path = item.get("checkin_path") or item.get("checkinPath") or None
         if checkin_path and not str(checkin_path).startswith("/"):
             checkin_path = "/" + str(checkin_path).lstrip("/")
@@ -493,7 +460,6 @@ def _build_accounts(raw_list: Any, problems: list) -> list:
                 login_method=method_text,
                 github_user_session=github_user_session,
                 github_client_id=client_id,
-                github_protocol=github_protocol,
                 user_id=user_id,
                 proxy=(str(item.get("proxy")).strip() or None) if item.get("proxy") else None,
                 checkin_path=checkin_path,
@@ -534,15 +500,6 @@ def _apply_env(cfg: Config) -> list:
             if value:
                 setattr(acct, attr, value.strip())
                 notes.append(f"{env_name} -> {acct.name}.{attr}")
-        protocol_env = f"CHECKIN_ACCOUNT_{key}_GITHUB_PROTOCOL"
-        protocol_value = os.environ.get(protocol_env)
-        if protocol_value:
-            protocol = normalize_github_protocol(protocol_value)
-            if protocol in GITHUB_PROTOCOLS:
-                acct.github_protocol = protocol
-                notes.append(f"{protocol_env} -> {acct.name}.github_protocol")
-            else:
-                notes.append(f"{protocol_env} 无效，忽略: {protocol}")
         method_env = f"CHECKIN_ACCOUNT_{key}_LOGIN_METHOD"
         method_value = os.environ.get(method_env)
         if method_value:
@@ -646,7 +603,6 @@ def migrate_legacy(raw_list: list) -> dict:
                 "login_method": LOGIN_METHOD_NEWAPI_COOKIE,
                 "github_user_session": "",
                 "github_client_id": "",
-                "github_protocol": DEFAULT_GITHUB_PROTOCOL,
                 "user_id": item.get("userId") or item.get("user_id"),
                 "proxy": item.get("proxy"),
                 "checkin_path": None,

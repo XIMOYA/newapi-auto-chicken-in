@@ -72,26 +72,7 @@ class TestAccounts:
     def test_default_login_method_is_newapi_cookie(self):
         account = build().accounts[0]
         assert account.login_method == cfgmod.LOGIN_METHOD_NEWAPI_COOKIE
-        assert account.github_protocol == cfgmod.GITHUB_PROTOCOL_AGENT
         assert account.github_user_session == ""
-
-    def test_tabi_protocol_is_normalized(self):
-        account = build(accounts=[{
-            "name": "TaBi",
-            "url": "https://a.com",
-            "login_method": "github_cookie",
-            "github_protocol": "TaBi",
-        }]).accounts[0]
-        assert account.github_protocol == cfgmod.GITHUB_PROTOCOL_TABI
-
-    def test_invalid_github_protocol_raises(self):
-        with pytest.raises(cfgmod.ConfigError, match="github_protocol"):
-            build(accounts=[{
-                "name": "GitHub",
-                "url": "https://a.com",
-                "login_method": "github_cookie",
-                "github_protocol": "unknown",
-            }])
 
     def test_github_cookie_fields_and_client_id(self):
         account = build(accounts=[{
@@ -103,7 +84,7 @@ class TestAccounts:
         }]).accounts[0]
         assert account.uses_github_cookie is True
         assert account.github_user_session == "session-value"
-        assert account.effective_github_client_id == "client-id"
+        assert account.github_client_id == "client-id"
 
     def test_reference_github_alias_is_inferred_when_newapi_cookie_empty(self):
         account = build(accounts=[{
@@ -252,14 +233,12 @@ class TestEnvOverride:
     def test_github_fields_and_method_from_env(self, monkeypatch):
         monkeypatch.setenv("CHECKIN_ACCOUNT_MY_SITE_GITHUB_USER_SESSION", "gh-env")
         monkeypatch.setenv("CHECKIN_ACCOUNT_MY_SITE_GITHUB_CLIENT_ID", "client-env")
-        monkeypatch.setenv("CHECKIN_ACCOUNT_MY_SITE_GITHUB_PROTOCOL", "tabi")
         monkeypatch.setenv("CHECKIN_ACCOUNT_MY_SITE_LOGIN_METHOD", "github_cookie")
         cfg = build(accounts=[{"name": "my site", "url": "https://a.com"}])
         account = cfg.accounts[0]
         assert account.login_method == "github_cookie"
         assert account.github_user_session == "gh-env"
         assert account.github_client_id == "client-env"
-        assert account.github_protocol == "tabi"
 
 
 class TestMigration:

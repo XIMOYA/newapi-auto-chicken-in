@@ -18,7 +18,6 @@ from .. import client as api
 from .. import logger as log
 from ..ai import prompts
 from ..config import (
-    GITHUB_PROTOCOL_TABI,
     LOGIN_METHOD_GITHUB_COOKIE,
     SELF_PATH,
     SHOTS_DIR,
@@ -89,7 +88,7 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
          options, ai) -> SolveOutcome:
     is_github = account.login_method == LOGIN_METHOD_GITHUB_COOKIE
     log.info(f"启动 {driver.name} 过盾（profile: {account.profile_dir.name}）")
-    # NewAPI 模式注入站点登录 Cookie；GitHub 模式只需要站点 CF 上下文，
+    # 站点 Cookie 模式注入站点登录 Cookie；GitHub 模式只需要站点 CF 上下文，
     # GitHub user_session 由 OAuth HTTP 客户端按 github.com 域名单独发送。
     driver.inject_cookies(account.cookie)
     if not is_github and account.user_id:
@@ -98,21 +97,16 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
         if driver.set_extra_http_headers({"New-Api-User": str(account.user_id)}):
             log.debug(f"浏览器入口已设置 New-Api-User={account.user_id}")
 
-    if is_github and account.github_protocol == GITHUB_PROTOCOL_TABI:
-        # TaBi 的 state 接口只接受 POST，浏览器先进入公开登录页完成过盾。
-        browser_url = account.api("/sign-in")
-    else:
-        browser_url = (
-            account.api("/api/oauth/state?mode=login")
-            if is_github else account.browser_url
-        )
+    # GitHub 模式的 state 接口只接受 POST，不能直接当导航地址；
+    # 走站点公开登录页过盾，拿到 CF 会话后再由 HTTP 客户端发 POST。
+    browser_url = account.api("/sign-in") if is_github else account.browser_url
     state = driver.goto(browser_url)
     log.debug(f"浏览器入口: {browser_url}")
     log.debug(f"首屏状态: {state.brief()}")
     strategy = "S2"
 
-    # NewAPI 模式必须先确认站点登录态；GitHub 模式进入公开 OAuth state
-    # 地址即可开始处理站点 Cloudflare，不能把未完成 OAuth 的页面误判为失效。
+    # 站点 Cookie 模式必须先确认站点登录态；GitHub 模式进入公开登录页
+    # 即可开始处理站点 Cloudflare，不能把未完成 OAuth 的页面误判为失效。
     if state.challenge == detect.LOGIN_REQUIRED and not is_github:
         artifact = _dump(driver, cfg, account, "login-required")
         return SolveOutcome(
@@ -176,7 +170,7 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
 
     if is_github:
         # GitHub Cookie 的签到动作绑定 OAuth 回调，不能在未登录的站点页面
-        # 直接 POST NewAPI checkin；把 CF session 交回 runner 的 OAuth 客户端。
+        # 直接 POST 站点 checkin；把 CF session 交回 runner 的 OAuth 客户端。
         return SolveOutcome(True, strategy, cf=cf,
                             detail="站点过盾完成，交回 GitHub OAuth 登录链路")
 

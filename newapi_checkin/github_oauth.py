@@ -1,8 +1,16 @@
 """GitHub Cookie 登录与 OAuth 回调签到。
 
-该模块只负责 GitHub OAuth 相关 HTTP 请求，不把 OAuth 语义混入 NewAPI
-Cookie 的 ApiClient；Cloudflare 站点响应仍转换成现有 ApiResult，交由 runner
-决定是否启动浏览器/AI 过盾和换出口 IP。
+该模块只负责 GitHub OAuth 相关 HTTP 请求，不把 OAuth 语义混入站点 Cookie 的
+ApiClient；Cloudflare 站点响应仍转换成现有 ApiResult，交由 runner 决定是否启动
+浏览器/AI 过盾和换出口 IP。
+
+协议按 tabitoken.com（New API v1.0.0-rc.23）实测确认：
+  1. POST {site}/api/oauth/state  body {"provider":"github","intent":"login"}
+     -> data.flow_token 即 GitHub authorize 的 state
+  2. GET  {site}/api/status       -> data.github_client_id（账号显式配置优先）
+  3. GET  github.com/login/oauth/authorize?client_id=&scope=user:email&state=
+     不跟随重定向，从 302 Location 取 code
+  4. GET  {site}/api/oauth/github?code=&state=  完成登录并触发签到
 """
 
 from __future__ import annotations
@@ -16,17 +24,12 @@ from curl_cffi import requests as cffi
 from . import client as api
 from .cf import detect
 from .cf.session_store import CFSession
-from .config import (
-    GITHUB_PROTOCOL_TABI,
-    Account,
-    HttpConfig,
-)
+from .config import Account, HttpConfig
 from .utils import sanitize_header_value
 
 GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 GITHUB_AUTHORIZE_PATH = "/login/oauth/authorize"
-OAUTH_STATE_PATH = "/api/oauth/state?mode=login"
-TABI_OAUTH_STATE_PATH = "/api/oauth/state"
+OAUTH_STATE_PATH = "/api/oauth/state"
 STATUS_PATH = "/api/status"
 OAUTH_CALLBACK_PATH = "/api/oauth/github"
 
@@ -172,11 +175,11 @@ class GithubOAuthClient:
                     step.result.kind = api.AUTH_FAILED
                 step.result.message = message
             return step
-        state = str((step.data or {}).get("data") or "").strip()
+        state = self._extract_flow_token(step.data)
         if not state:
             step.result = api.ApiResult(
                 api.FAILED,
-                message="取 OAuth state 成功但返回为空",
+                message="OAuth state 成功但未返回 flow_token",
                 status=step.result.status,
                 path=step.result.path,
             )
@@ -184,20 +187,29 @@ class GithubOAuthClient:
         step.data = {"state": state}
         return step
 
+    @staticmethod
+    def _extract_flow_token(payload: Any) -> str:
+        """站点把 state 放在 data.flow_token；旧结构直接给字符串时也接受。"""
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, dict):
+            for key in ("flow_token", "state"):
+                value = str(data.get(key) or "").strip()
+                if value:
+                    return value
+            return ""
+        return str(data or "").strip()
+
     def fetch_state(self) -> OAuthStep:
-        if self.account.github_protocol == GITHUB_PROTOCOL_TABI:
-            step = self._site_request(
-                "POST",
-                TABI_OAUTH_STATE_PATH,
-                json={"provider": "github", "intent": "login"},
-                headers={"Content-Type": "application/json"},
-            )
-            return self._finish_state_step(step, "TaBi OAuth state 接口")
-        step = self._site_request("GET", OAUTH_STATE_PATH)
+        step = self._site_request(
+            "POST",
+            OAUTH_STATE_PATH,
+            json={"provider": "github", "intent": "login"},
+            headers={"Content-Type": "application/json", "Cache-Control": "no-store"},
+        )
         return self._finish_state_step(step, "OAuth state 接口")
 
     def fetch_github_client_id(self) -> OAuthStep:
-        """TaBi 协议优先使用账号配置，否则从站点状态读取 OAuth Client ID。"""
+        """账号显式配置优先，否则从站点状态接口读取该站点的 OAuth Client ID。"""
         configured = str(self.account.github_client_id or "").strip()
         if configured:
             return OAuthStep(
@@ -230,12 +242,11 @@ class GithubOAuthClient:
         })
 
     def fetch_github_code(self, state: str, client_id: Optional[str] = None) -> OAuthStep:
-        if self.account.github_protocol == GITHUB_PROTOCOL_TABI and not client_id:
+        if not client_id:
             client_step = self.fetch_github_client_id()
             if not client_step.result.ok:
                 return client_step
             client_id = str((client_step.data or {}).get("client_id") or "").strip()
-        client_id = client_id or self.account.effective_github_client_id
         try:
             response = self._session.get(
                 GITHUB_AUTHORIZE_URL,
@@ -299,10 +310,11 @@ class GithubOAuthClient:
         ), data={"code": code}, response=response)
 
     def oauth_callback(self, code: str, state: str) -> OAuthStep:
+        # 站点前端只带 code/state，不带 mode；多传参数在 rc 版本上有被拒风险
         step = self._site_request(
             "GET",
             OAUTH_CALLBACK_PATH,
-            params={"code": code, "state": state, "mode": "login"},
+            params={"code": code, "state": state},
             headers={"Referer": sanitize_header_value(self.account.base_url + "/oauth/github")},
         )
         step = self._decode_json(step, "OAuth 回调接口")

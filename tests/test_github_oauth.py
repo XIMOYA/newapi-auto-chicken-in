@@ -68,7 +68,11 @@ def install_session(monkeypatch, routes):
 def default_routes(method, url, kwargs):
     path = urlparse(url).path
     if path == "/api/oauth/state":
-        return FakeResponse(payload={"success": True, "data": "state-1"})
+        # 站点实测结构：state 藏在 data.flow_token，不是字符串 data
+        return FakeResponse(payload={
+            "success": True,
+            "data": {"flow_token": "state-1", "expires_at": 1786906774},
+        })
     if "github.com/login/oauth/authorize" in url:
         return FakeResponse(
             status=302,
@@ -96,9 +100,10 @@ def test_cookie_check_gets_code_without_callback(monkeypatch):
     assert result.kind == client.SUCCESS
     assert "未执行签到" in result.message
     state_call = holder["session"].calls[0]
-    assert state_call[0] == "GET"
+    assert state_call[0] == "POST"
     assert urlparse(state_call[1]).path == "/api/oauth/state"
-    assert urlparse(state_call[1]).query == "mode=login"
+    assert urlparse(state_call[1]).query == ""
+    assert state_call[2]["json"] == {"provider": "github", "intent": "login"}
     assert not any("/api/oauth/github" in call[1] for call in holder["session"].calls)
     github_call = next(call for call in holder["session"].calls if "github.com/login/oauth/authorize" in call[1])
     assert github_call[2]["params"]["client_id"] == "client-id"
@@ -110,8 +115,22 @@ def test_cookie_check_gets_code_without_callback(monkeypatch):
     )
 
 
+def test_state_object_without_flow_token_is_reported(monkeypatch):
+    def routes(method, url, kwargs):
+        if urlparse(url).path == "/api/oauth/state":
+            return FakeResponse(payload={"success": True, "data": {"expires_at": 1786906774}})
+        return default_routes(method, url, kwargs)
+
+    install_session(monkeypatch, routes)
+    with oauth.GithubOAuthClient(make_account(), HttpConfig()) as client_obj:
+        result = client_obj.test_cookie()
+
+    assert result.kind == client.FAILED
+    assert "flow_token" in result.message
+
+
 def test_checkin_callback_and_self_are_used(monkeypatch):
-    install_session(monkeypatch, default_routes)
+    holder = install_session(monkeypatch, default_routes)
     with oauth.GithubOAuthClient(make_account(), HttpConfig()) as client_obj:
         result = client_obj.checkin()
 
@@ -119,39 +138,30 @@ def test_checkin_callback_and_self_are_used(monkeypatch):
     assert result.user_id == 42
     assert result.quota == 1234
     assert "tester" in result.message
+    callback = next(c for c in holder["session"].calls if urlparse(c[1]).path == "/api/oauth/github")
+    # 站点前端只带 code/state，回调不能多传 mode
+    assert callback[2]["params"] == {"code": "code-1", "state": "state-1"}
 
 
-def test_tabi_cookie_check_posts_state_and_loads_client_id(monkeypatch):
+def test_client_id_is_loaded_from_site_status_when_unset(monkeypatch):
     calls = []
 
     def routes(method, url, kwargs):
         calls.append((method, url, kwargs))
         path = urlparse(url).path
-        if path == "/api/oauth/state":
-            assert method == "POST"
-            assert kwargs["json"] == {"provider": "github", "intent": "login"}
-            assert kwargs["headers"]["Content-Type"] == "application/json"
-            return FakeResponse(payload={"success": True, "data": "tabi-state"})
         if path == "/api/status":
             assert method == "GET"
             return FakeResponse(payload={
                 "success": True,
-                "data": {"github_client_id": "tabi-client-id"},
+                "data": {"github_client_id": "site-client-id"},
             })
         if "github.com/login/oauth/authorize" in url:
-            assert kwargs["params"]["client_id"] == "tabi-client-id"
-            assert kwargs["params"]["state"] == "tabi-state"
-            return FakeResponse(
-                status=302,
-                headers={"Location": "https://site.example.com/oauth/callback?code=tabi-code"},
-                text="",
-            )
-        return FakeResponse(status=404, payload={"success": False, "message": "not found"})
+            assert kwargs["params"]["client_id"] == "site-client-id"
+            assert kwargs["params"]["state"] == "state-1"
+        return default_routes(method, url, kwargs)
 
     install_session(monkeypatch, routes)
-    with oauth.GithubOAuthClient(
-        make_account(github_protocol="tabi", github_client_id=""), HttpConfig()
-    ) as client_obj:
+    with oauth.GithubOAuthClient(make_account(github_client_id=""), HttpConfig()) as client_obj:
         result = client_obj.test_cookie()
 
     assert result.kind == client.SUCCESS
@@ -160,6 +170,20 @@ def test_tabi_cookie_check_posts_state_and_loads_client_id(monkeypatch):
         "/api/status",
         "/login/oauth/authorize",
     ]
+
+
+def test_missing_client_id_on_site_status_is_reported(monkeypatch):
+    def routes(method, url, kwargs):
+        if urlparse(url).path == "/api/status":
+            return FakeResponse(payload={"success": True, "data": {"github_oauth": True}})
+        return default_routes(method, url, kwargs)
+
+    install_session(monkeypatch, routes)
+    with oauth.GithubOAuthClient(make_account(github_client_id=""), HttpConfig()) as client_obj:
+        result = client_obj.test_cookie()
+
+    assert result.kind == client.FAILED
+    assert "github_client_id" in result.message
 
 
 def test_success_callback_without_checked_in_is_already_done(monkeypatch):
