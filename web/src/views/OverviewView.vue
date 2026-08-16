@@ -3,7 +3,7 @@ web/src/views/OverviewView.vue
 页面：配置总览
 职责：
 - 顶部统计卡：账号总数 / 启用数 / 代理池开关 / 邮件通知开关
-- 账号管理表格：多选、启停开关、打码 Cookie、手动隧道、编辑/删除
+- 账号管理表格：搜索、多选、启停开关、打码 Cookie、手动隧道、编辑/删除
 - 新增/编辑账号弹窗；批量启用/停用/删除（带确认）
 数据来源：GET /api/config（经 config store）、PUT /api/config（保存）
 -->
@@ -78,7 +78,16 @@ web/src/views/OverviewView.vue
       </template>
 
       <template #header-extra>
-        <n-space :size="8">
+        <n-space :size="8" align="center" class="account-header-actions">
+          <n-input
+            v-model:value="accountSearch"
+            size="small"
+            clearable
+            placeholder="搜索账号名称、站点 URL 或手动隧道"
+            class="account-search"
+          >
+            <template #prefix><n-icon><search-outline /></n-icon></template>
+          </n-input>
           <n-button size="small" :disabled="!selectedKeys.length" :loading="saving" @click="batchToggle(true)">
             批量启用
           </n-button>
@@ -111,7 +120,7 @@ web/src/views/OverviewView.vue
           <n-empty
             v-if="!configStore.loading"
             class="table-empty"
-            description="暂无签到账号，点击右上角「新增账号」开始添加"
+            :description="accountEmptyDescription"
           />
         </template>
       </n-data-table>
@@ -131,14 +140,14 @@ web/src/views/OverviewView.vue
 </template>
 
 <script setup lang="ts">
-import { computed, h, reactive, ref } from 'vue'
+import { computed, h, reactive, ref, watch } from 'vue'
 import {
-  NGrid, NGridItem, NCard, NIcon, NButton, NSpace, NDataTable, NTag, NSwitch, NEmpty,
+  NGrid, NGridItem, NCard, NIcon, NButton, NSpace, NDataTable, NTag, NSwitch, NEmpty, NInput,
   useDialog, useMessage, type DataTableColumns, type PaginationProps
 } from 'naive-ui'
 import {
   PeopleOutline, CheckmarkCircleOutline, LayersOutline, MailOutline, AddOutline,
-  EyeOutline, CreateOutline, TrashOutline, PlanetOutline
+  EyeOutline, CreateOutline, TrashOutline, PlanetOutline, SearchOutline
 } from '@vicons/ionicons5'
 import AccountModal from '@/components/AccountModal.vue'
 import SiteModal from '@/components/SiteModal.vue'
@@ -202,7 +211,21 @@ const statCards = computed(() => [
   }
 ])
 
-const tableData = computed<AccountRow[]>(() => accounts.value.map((a, i) => ({ ...a, _index: i })))
+const accountSearch = ref('')
+const tableData = computed<AccountRow[]>(() => {
+  const keyword = accountSearch.value.trim().toLowerCase()
+  return accounts.value
+    .map((a, i) => ({ ...a, _index: i }))
+    .filter((row) => {
+      if (!keyword) return true
+      return [row.name, row.url, row.proxy, row.checkin_path, row.browser_path].some(
+        (value) => value?.toLowerCase().includes(keyword) ?? false
+      )
+    })
+})
+const accountEmptyDescription = computed(() =>
+  accountSearch.value.trim() ? '没有找到匹配的签到账号' : '暂无签到账号，点击右上角「新增账号」开始添加'
+)
 const siteTableData = computed<SiteRow[]>(() => sites.value.map((s, i) => ({ ...s, _index: i })))
 
 const selectedKeys = ref<number[]>([])
@@ -245,12 +268,20 @@ async function handleRevealCookie(password: string) {
 // 分页必须用响应式对象 + 显式 onUpdatePageSize 写回，
 // 否则 Naive UI 的每页条数选择器（10/20/50）切换后状态不会更新
 const pagination = reactive<PaginationProps>({
+  page: 1,
   pageSize: 10,
   showSizePicker: true,
   pageSizes: [10, 20, 50],
+  onUpdatePage: (page: number) => {
+    pagination.page = page
+  },
   onUpdatePageSize: (size: number) => {
     pagination.pageSize = size
+    pagination.page = 1
   }
+})
+watch(accountSearch, () => {
+  pagination.page = 1
 })
 const sitePagination = reactive<PaginationProps>({
   pageSize: 10,
@@ -571,6 +602,14 @@ async function persistAccounts(successTip?: string) {
 
 .accounts-card {
   background: #fff;
+}
+
+.account-header-actions {
+  max-width: 100%;
+}
+
+.account-search {
+  width: 240px;
 }
 
 .sites-card {
