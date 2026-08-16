@@ -2,18 +2,18 @@
 web/src/views/CookieTestsView.vue
 页面：Cookie 可用性测试
 职责：
-- NewAPI Cookie 与 GitHub Cookie 使用两个独立 Tab 和独立请求状态
+- 站点 Cookie 与 GitHub OAuth 使用两个独立 Tab 和独立请求状态
 - 只检测当前登录方式下的启用账号
 - 只做凭据可用性检查，不执行真正签到
 -->
 <template>
   <div class="page-container cookie-tests-page">
     <n-alert type="warning" :bordered="false" class="intro-alert">
-      NewAPI Cookie 与 GitHub Cookie 分开检测，结果不会互相覆盖。检测在服务端使用已保存的敏感凭据，浏览器不会接触 Cookie 明文。
+      站点 Cookie 与 GitHub OAuth 分开检测，结果不会互相覆盖。检测在服务端使用已保存的敏感凭据，浏览器不会接触 Cookie 明文。
     </n-alert>
 
     <n-tabs v-model:value="activeMode" type="line" animated>
-      <n-tab-pane name="newapi_cookie" tab="NewAPI Cookie">
+      <n-tab-pane name="newapi_cookie" tab="站点 Cookie">
         <div class="tab-summary">
           <n-space :size="8" align="center">
             <n-tag size="small" type="info" :bordered="false">可检测 {{ newapiAccounts.length }} 个启用账号</n-tag>
@@ -34,7 +34,7 @@ web/src/views/CookieTestsView.vue
         />
       </n-tab-pane>
 
-      <n-tab-pane name="github_cookie" tab="GitHub Cookie">
+      <n-tab-pane name="github_cookie" tab="GitHub OAuth">
         <div class="tab-summary">
           <n-space :size="8" align="center">
             <n-tag size="small" type="info" :bordered="false">可检测 {{ githubAccounts.length }} 个启用账号</n-tag>
@@ -98,9 +98,9 @@ async function runNewAPITest(accountNames: string[]) {
   try {
     const response = await testNewAPICookies(accountNames)
     newapiResponse.value = response
-    message.success(summaryMessage('NewAPI Cookie', response))
+    message.success(summaryMessage('站点 Cookie', response))
   } catch (error) {
-    message.error(extractErrorMessage(error, 'NewAPI Cookie 检测失败'))
+    message.error(extractErrorMessage(error, '站点 Cookie 检测失败'))
   } finally {
     newapiLoading.value = false
   }
@@ -111,9 +111,9 @@ async function runGithubTest(accountNames: string[]) {
   try {
     const response = await testGithubCookies(accountNames)
     githubResponse.value = response
-    message.success(summaryMessage('GitHub Cookie', response))
+    message.success(summaryMessage('GitHub OAuth', response))
   } catch (error) {
-    message.error(extractErrorMessage(error, 'GitHub Cookie 检测失败'))
+    message.error(extractErrorMessage(error, 'GitHub OAuth 检测失败'))
   } finally {
     githubLoading.value = false
   }

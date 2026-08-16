@@ -10,11 +10,13 @@ web/src/types/index.ts
 // ===== 配置对象类型（与 config.example.json 结构一致）=====
 
 export type LoginMethod = 'newapi_cookie' | 'github_cookie'
+export type GithubProtocol = 'agent' | 'tabi'
 
 export interface Account {
   name: string
   url: string
   login_method: LoginMethod
+  github_protocol: GithubProtocol
   cookie: string
   github_user_session: string
   github_client_id: string

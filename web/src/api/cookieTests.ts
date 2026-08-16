@@ -1,6 +1,6 @@
 /*
 web/src/api/cookieTests.ts
-Cookie 可用性测试接口封装：NewAPI Cookie 与 GitHub Cookie 使用独立接口。
+Cookie 可用性测试接口封装：站点 Cookie 与 GitHub OAuth 使用独立接口。
 */
 import http from './http'
 import type { CookieTestResponse } from '@/types'

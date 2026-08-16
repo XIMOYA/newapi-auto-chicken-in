@@ -706,7 +706,8 @@ class Runner:
 
         with GithubOAuthClient(account, self.cfg.http, cf) as client:
             log.debug(
-                f"GitHub OAuth impersonate={client.impersonate}, "
+                f"GitHub OAuth 协议={account.github_protocol}, "
+                f"impersonate={client.impersonate}, "
                 + ("缓存 UA" if cf is not None and cf.user_agent else "默认 UA")
                 + (f", cookie 条数={len(cf.cookies)}" if cf is not None else "")
             )

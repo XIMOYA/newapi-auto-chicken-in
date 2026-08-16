@@ -201,6 +201,68 @@ func TestCheckGithubCookieInvalidRedirect(t *testing.T) {
 	}
 }
 
+func TestCheckGithubCookieTabiUsesPostStateAndStatusClientID(t *testing.T) {
+	var stateCalls atomic.Int32
+	var statusCalls atomic.Int32
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case cookieTestTabiOAuthStatePath:
+			stateCalls.Add(1)
+			if r.Method != http.MethodPost {
+				t.Fatalf("TaBi state method = %s", r.Method)
+			}
+			if got := r.Header.Get("Content-Type"); got != "application/json" {
+				t.Fatalf("TaBi state content type = %q", got)
+			}
+			var payload map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode TaBi state payload: %v", err)
+			}
+			if payload["provider"] != "github" || payload["intent"] != "login" {
+				t.Fatalf("TaBi state payload = %#v", payload)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "data": "tabi-state"})
+		case cookieTestStatusPath:
+			statusCalls.Add(1)
+			if r.Method != http.MethodGet {
+				t.Fatalf("status method = %s", r.Method)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data":    map[string]any{"github_client_id": "tabi-client-id"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer site.Close()
+
+	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("client_id") != "tabi-client-id" {
+			t.Fatalf("client_id = %q", r.URL.Query().Get("client_id"))
+		}
+		if r.URL.Query().Get("state") != "tabi-state" {
+			t.Fatalf("state = %q", r.URL.Query().Get("state"))
+		}
+		w.Header().Set("Location", "https://example.test/oauth/callback?code=tabi-code")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer authorize.Close()
+
+	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
+		Name:              "github-tabi",
+		URL:               site.URL,
+		GithubProtocol:    GithubProtocolTabi,
+		GithubUserSession: "github-session",
+	}, authorize.URL)
+	if result.State != cookieTestStateValid {
+		t.Fatalf("state = %q, message = %q", result.State, result.Message)
+	}
+	if stateCalls.Load() != 1 || statusCalls.Load() != 1 {
+		t.Fatalf("TaBi calls = state:%d status:%d", stateCalls.Load(), statusCalls.Load())
+	}
+}
+
 func TestCookieTestEndpointsKeepModesSeparate(t *testing.T) {
 	srv := newTestServer(t)
 	token := loginToken(t, srv)

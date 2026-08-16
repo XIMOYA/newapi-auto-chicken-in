@@ -218,10 +218,12 @@ const tableData = computed<AccountRow[]>(() => {
     .map((a, i) => ({ ...a, _index: i }))
     .filter((row) => {
       if (!keyword) return true
-      const loginLabel = row.login_method === 'github_cookie' ? 'github cookie' : 'newapi cookie'
+      const loginLabel = row.login_method === 'github_cookie'
+        ? `github oauth ${row.github_protocol || 'agent'}`
+        : 'site cookie'
       const credentialState = row.login_method === 'github_cookie'
-        ? (row.github_user_session ? 'github cookie 已设置' : 'github cookie 未设置')
-        : (row.cookie ? 'newapi cookie 已设置' : 'newapi cookie 未设置')
+        ? (row.github_user_session ? 'github oauth 已设置' : 'github oauth 未设置')
+        : (row.cookie ? 'site cookie 已设置' : 'site cookie 未设置')
       return [row.name, row.url, row.proxy, row.checkin_path, row.browser_path, loginLabel, credentialState].some(
         (value) => value?.toLowerCase().includes(keyword) ?? false
       )
@@ -257,7 +259,7 @@ async function handleRevealCookie(password: string) {
     const target = (cfg.accounts ?? []).find((a) => a.name === cookieRevealTarget.value)
     const value = target?.[cookieRevealField.value]
     if (!target || typeof value !== 'string' || !value) {
-      message.error(`未找到该账号的${cookieRevealField.value === 'cookie' ? 'NewAPI' : 'GitHub'} Cookie`)
+      message.error(`未找到该账号的${cookieRevealField.value === 'cookie' ? '站点' : 'GitHub'} Cookie`)
       passwordConfirmVisible.value = false
       return
     }
@@ -387,7 +389,7 @@ function confirmSiteDelete(row: SiteRow) {
 function viewCookie(row: AccountRow, field: 'cookie' | 'github_user_session') {
   const value = row[field]
   if (value === '' || value == null) {
-    message.info(`账号「${row.name}」未设置${field === 'cookie' ? 'NewAPI' : 'GitHub'} Cookie`)
+    message.info(`账号「${row.name}」未设置${field === 'cookie' ? '站点' : 'GitHub'} Cookie`)
     return
   }
   // 高敏操作：先弹密码确认，通过后再拉明文展示
@@ -418,7 +420,9 @@ const columns: DataTableColumns<AccountRow> = [
     key: 'login_method',
     width: 150,
     render: (row) => h(NTag, { size: 'small', type: row.login_method === 'github_cookie' ? 'warning' : 'info' }, {
-      default: () => row.login_method === 'github_cookie' ? 'GitHub Cookie' : 'NewAPI Cookie'
+      default: () => row.login_method === 'github_cookie'
+        ? `GitHub OAuth · ${row.github_protocol === 'tabi' ? 'TaBi 协议' : 'Agent 协议'}`
+        : '站点 Cookie'
     })
   },
   {
@@ -446,7 +450,7 @@ const columns: DataTableColumns<AccountRow> = [
     render: (row) => {
       const field = row.login_method === 'github_cookie' ? 'github_user_session' : 'cookie'
       const value = row[field]
-      const label = row.login_method === 'github_cookie' ? 'GitHub Cookie' : 'NewAPI Cookie'
+      const label = row.login_method === 'github_cookie' ? 'GitHub Cookie' : '站点 Cookie'
       const text = value === '***' ? `${label}（已设置）` : value ? `${label}已设置` : '未设置'
       return h('div', { class: 'cookie-cell' }, [
         h('span', { class: value ? 'cookie-masked' : 'muted' }, text),

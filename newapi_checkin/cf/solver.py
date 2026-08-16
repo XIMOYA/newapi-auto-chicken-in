@@ -17,7 +17,14 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from .. import client as api
 from .. import logger as log
 from ..ai import prompts
-from ..config import LOGIN_METHOD_GITHUB_COOKIE, SELF_PATH, SHOTS_DIR, Account, Config
+from ..config import (
+    GITHUB_PROTOCOL_TABI,
+    LOGIN_METHOD_GITHUB_COOKIE,
+    SELF_PATH,
+    SHOTS_DIR,
+    Account,
+    Config,
+)
 from ..utils import now
 from . import detect
 from .driver_base import (
@@ -91,10 +98,14 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
         if driver.set_extra_http_headers({"New-Api-User": str(account.user_id)}):
             log.debug(f"浏览器入口已设置 New-Api-User={account.user_id}")
 
-    browser_url = (
-        account.api("/api/oauth/state?mode=login")
-        if is_github else account.browser_url
-    )
+    if is_github and account.github_protocol == GITHUB_PROTOCOL_TABI:
+        # TaBi 的 state 接口只接受 POST，浏览器先进入公开登录页完成过盾。
+        browser_url = account.api("/sign-in")
+    else:
+        browser_url = (
+            account.api("/api/oauth/state?mode=login")
+            if is_github else account.browser_url
+        )
     state = driver.goto(browser_url)
     log.debug(f"浏览器入口: {browser_url}")
     log.debug(f"首屏状态: {state.brief()}")

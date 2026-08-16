@@ -72,7 +72,7 @@
 
 规则：
 - 后端把 `"***"` 占位符还原为旧值（深合并）
-- 校验：`accounts` 必须有 `name` / `url`；`login_method` 只能是 `newapi_cookie` 或 `github_cookie`，缺省按 `newapi_cookie` 处理；两种 Cookie 均可为空（实际运行时只检查当前登录方式对应字段）；`sites` 必须有 `name` / `url`；URL 需 http(s) 开头
+- 校验：`accounts` 必须有 `name` / `url`；`login_method` 只能是 `newapi_cookie` 或 `github_cookie`，缺省按 `newapi_cookie` 处理；`github_protocol` 只能是 `agent` 或 `tabi`，缺省按 `agent` 处理；两种 Cookie 均可为空（实际运行时只检查当前登录方式对应字段）；`sites` 必须有 `name` / `url`；URL 需 http(s) 开头
 - 校验通过才落库
 
 响应（200）：`{ "ok": true, "updated_at": "2026-08-12T10:00:00Z" }`
@@ -130,9 +130,9 @@
 
 ## 9. Cookie 可用性测试（JWT）
 
-NewAPI Cookie 与 GitHub Cookie 必须通过两个独立接口检测。前端只提交账号名称，后端从数据库读取明文凭据；响应不会返回 Cookie、token、OAuth state 或 code。
+站点 Cookie 与 GitHub OAuth 必须通过两个独立接口检测。前端只提交账号名称，后端从数据库读取明文凭据；响应不会返回 Cookie、token、OAuth state 或 code。
 
-### NewAPI Cookie
+### 站点 Cookie
 
 `POST /api/cookie-tests/newapi`
 
@@ -143,11 +143,16 @@ NewAPI Cookie 与 GitHub Cookie 必须通过两个独立接口检测。前端只
 
 只检测 `login_method=newapi_cookie` 且启用的账号。`account_names` 为空数组时检测该类型的全部启用账号。普通 Cookie 请求 `/api/user/self`；包含 `new_api_refresh=` 时先执行 refresh，再用新凭据验证 self。
 
-### GitHub Cookie
+### GitHub OAuth
 
 `POST /api/cookie-tests/github`
 
-请求体格式与 NewAPI Cookie 相同，但只检测 `login_method=github_cookie` 且启用的账号。检测流程严格复用 AgentRoutercheckin：GET 站点 `/api/oauth/state?mode=login` → GET GitHub authorize → 从 302 取 OAuth code，并在取得 code 后结束，**不会调用站点 OAuth callback，也不会执行签到**。Client ID 使用账号显式配置值，未配置时使用参考项目默认值。
+请求体格式与站点 Cookie 相同，但只检测 `login_method=github_cookie` 且启用的账号。检测不会调用站点 OAuth callback，也不会执行签到，仅验证 GitHub Cookie 是否能完成 OAuth 授权：
+
+- `github_protocol=agent`（缺省值）：GET 站点 `/api/oauth/state?mode=login` → GET GitHub authorize → 从 302 取 OAuth code。
+- `github_protocol=tabi`：POST 站点 `/api/oauth/state`，请求体 `{"provider":"github","intent":"login"}` → GET `/api/status` 获取 `data.github_client_id`（账号显式配置值优先）→ GET GitHub authorize → 从 302 取 OAuth code。
+
+两种协议均在取得 code 后结束，响应不会返回 code。Agent 协议默认 Client ID 沿用参考项目；TaBi 协议默认从站点状态接口动态获取。
 
 响应（200）：
 ```json
@@ -181,14 +186,15 @@ NewAPI Cookie 与 GitHub Cookie 必须通过两个独立接口检测。前端只
   "name": "站点A",
   "url": "https://xxx.com",
   "login_method": "newapi_cookie",
+  "github_protocol": "agent",
   "cookie": "",
   "github_user_session": "",
   "github_client_id": ""
 }
 ```
 
-- `newapi_cookie`：使用 `cookie`，沿用现有 NewAPI Cookie + 浏览器/AI 过盾链路。
-- `github_cookie`：使用 `github_user_session`，按 GitHub OAuth state/authorize/callback 链路签到；站点质询仍复用浏览器/AI 过盾。
+- `newapi_cookie`：使用 `cookie`，沿用现有站点 Cookie + 浏览器/AI 过盾链路。
+- `github_cookie`：使用 `github_user_session`；`github_protocol=agent` 复用 Agent 协议，`github_protocol=tabi` 复用 TaBi 协议，站点质询仍复用浏览器/AI 过盾。
 - 可用性检查分开执行：`python main.py --cookie-test newapi_cookie` 或 `python main.py --cookie-test github_cookie`；检查命令不会执行真正签到回调。
 
 ## 配置对象默认结构（后端初始化时内置）

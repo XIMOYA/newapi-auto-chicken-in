@@ -21,6 +21,9 @@ const MaskPlaceholder = "***"
 const (
 	LoginMethodNewAPICookie = "newapi_cookie"
 	LoginMethodGitHubCookie = "github_cookie"
+
+	GithubProtocolAgent = "agent"
+	GithubProtocolTabi  = "tabi"
 )
 
 // currentConfigVersion 用于一次性迁移旧默认值。旧配置没有该字段，视为 0。
@@ -57,6 +60,7 @@ type Account struct {
 	Cookie            string  `json:"cookie"`
 	GithubUserSession string  `json:"github_user_session"`
 	GithubClientID    string  `json:"github_client_id"`
+	GithubProtocol    string  `json:"github_protocol"`
 	UserID            *int64  `json:"user_id"`
 	Proxy             *string `json:"proxy"`
 	CheckinPath       *string `json:"checkin_path"`
@@ -412,6 +416,15 @@ func ValidateConfig(cfg *Config) error {
 		if method != LoginMethodNewAPICookie && method != LoginMethodGitHubCookie {
 			return fmt.Errorf("accounts[%d].login_method 只能是 %s 或 %s", i,
 				LoginMethodNewAPICookie, LoginMethodGitHubCookie)
+		}
+		protocol := strings.ToLower(strings.TrimSpace(a.GithubProtocol))
+		if protocol == "" {
+			protocol = GithubProtocolAgent
+			cfg.Accounts[i].GithubProtocol = protocol
+		}
+		if protocol != GithubProtocolAgent && protocol != GithubProtocolTabi {
+			return fmt.Errorf("accounts[%d].github_protocol 只能是 %s 或 %s", i,
+				GithubProtocolAgent, GithubProtocolTabi)
 		}
 
 	}

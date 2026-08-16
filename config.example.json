@@ -83,6 +83,7 @@
       "name": "站点A",
       "url": "https://xxx.com",
       "login_method": "newapi_cookie",
+      "github_protocol": "agent",
       "cookie": "session=在浏览器里复制完整 Cookie",
       "github_user_session": "",
       "github_client_id": "",

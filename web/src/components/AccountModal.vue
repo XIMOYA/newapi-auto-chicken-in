@@ -38,7 +38,10 @@ web/src/components/AccountModal.vue
       <n-form-item label="登录方式" path="login_method">
         <n-select v-model:value="form.login_method" :options="loginMethodOptions" />
       </n-form-item>
-      <n-form-item v-if="form.login_method === 'newapi_cookie'" label="NewAPI Cookie" path="cookie">
+      <n-form-item v-if="form.login_method === 'github_cookie'" label="GitHub 协议" path="github_protocol">
+        <n-select v-model:value="form.github_protocol" :options="githubProtocolOptions" />
+      </n-form-item>
+      <n-form-item v-if="form.login_method === 'newapi_cookie'" label="站点 Cookie" path="cookie">
         <div class="cookie-field">
           <masked-input
             v-model="form.cookie"
@@ -46,7 +49,7 @@ web/src/components/AccountModal.vue
             type="textarea"
             :autosize="{ minRows: 2, maxRows: 6 }"
             placeholder="粘贴站点完整 Cookie（如 session=...）"
-            :custom-tip="isEdit ? 'NewAPI Cookie 已设置（接口不回传明文），留空保持不变，输入新值可修改' : '可稍后补充；该登录方式运行时需要有效 Cookie'"
+            :custom-tip="isEdit ? '站点 Cookie 已设置（接口不回传明文），留空保持不变，输入新值可修改' : '可稍后补充；该登录方式运行时需要有效 Cookie'"
           />
           <n-button
             v-if="isEdit && isMaskedCookie"
@@ -126,7 +129,7 @@ import CookieRevealModal from './CookieRevealModal.vue'
 import { verifyPassword } from '@/api/auth'
 import { exportConfig } from '@/api/export'
 import { extractErrorMessage } from '@/utils/error'
-import type { Account, LoginMethod, Site } from '@/types'
+import type { Account, GithubProtocol, LoginMethod, Site } from '@/types'
 
 const props = defineProps<{
   show: boolean
@@ -145,8 +148,12 @@ const emit = defineEmits<{
 const isEdit = computed(() => props.account !== null)
 
 const loginMethodOptions = [
-  { label: 'NewAPI Cookie 登录（默认）', value: 'newapi_cookie' as LoginMethod },
-  { label: 'GitHub Cookie 登录', value: 'github_cookie' as LoginMethod }
+  { label: '站点 Cookie', value: 'newapi_cookie' as LoginMethod },
+  { label: 'GitHub OAuth', value: 'github_cookie' as LoginMethod }
+]
+const githubProtocolOptions = [
+  { label: 'Agent 协议', value: 'agent' as GithubProtocol },
+  { label: 'TaBi 协议', value: 'tabi' as GithubProtocol }
 ]
 
 // 站点预设下拉选项
@@ -201,6 +208,7 @@ interface AccountForm {
   name: string
   url: string
   login_method: LoginMethod
+  github_protocol: GithubProtocol
   cookie: string
   github_user_session: string
   github_client_id: string
@@ -216,6 +224,7 @@ const form = reactive<AccountForm>({
   name: '',
   url: '',
   login_method: 'newapi_cookie',
+  github_protocol: 'agent',
   cookie: '',
   github_user_session: '',
   github_client_id: '',
@@ -234,6 +243,7 @@ watch(
       form.name = props.account.name
       form.url = props.account.url
       form.login_method = props.account.login_method || 'newapi_cookie'
+      form.github_protocol = props.account.github_protocol || 'agent'
       form.cookie = props.account.cookie // 可能是 "***"
       form.github_user_session = props.account.github_user_session || ''
       form.github_client_id = props.account.github_client_id || ''
@@ -247,6 +257,7 @@ watch(
       form.name = ''
       form.url = ''
       form.login_method = 'newapi_cookie'
+      form.github_protocol = 'agent'
       form.cookie = ''
       form.github_user_session = ''
       form.github_client_id = ''
@@ -298,7 +309,7 @@ async function handleRevealCookie(password: string) {
     const target = (cfg.accounts ?? []).find((a) => a.name === props.account?.name)
     const value = target?.[revealField.value]
     if (!target || typeof value !== 'string' || !value) {
-      message.error(`未找到该账号的${revealField.value === 'cookie' ? 'NewAPI' : 'GitHub'} Cookie`)
+      message.error(`未找到该账号的${revealField.value === 'cookie' ? '站点' : 'GitHub'} Cookie`)
       passwordConfirmVisible.value = false
       return
     }
@@ -361,6 +372,7 @@ function handleSubmit() {
       name: form.name.trim(),
       url: form.url.trim(),
       login_method: form.login_method,
+      github_protocol: form.github_protocol,
       cookie: finalCookie,
       github_user_session: finalGithubUserSession,
       github_client_id: form.github_client_id.trim(),

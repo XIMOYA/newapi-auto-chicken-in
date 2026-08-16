@@ -10,6 +10,7 @@ NewAPI 签到配置管理平台 · Cookie 可用性检测
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -30,13 +31,15 @@ const (
 	cookieTestStateAbnormal = "abnormal"
 	cookieTestStateSkipped  = "skipped"
 
-	cookieTestSelfPath        = "/api/user/self"
-	cookieTestRefreshPath     = "/api/user/auth/refresh"
-	cookieTestOAuthStatePath  = "/api/oauth/state?mode=login"
-	cookieTestGithubAuthorize = "https://github.com/login/oauth/authorize"
-	cookieTestRefreshTokenKey = "new_api_refresh="
-	cookieTestDefaultClientID = "Ov23lidtiR4LeVZvVRNL"
-	cookieTestDefaultUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
+	cookieTestSelfPath           = "/api/user/self"
+	cookieTestRefreshPath        = "/api/user/auth/refresh"
+	cookieTestOAuthStatePath     = "/api/oauth/state?mode=login"
+	cookieTestTabiOAuthStatePath = "/api/oauth/state"
+	cookieTestStatusPath         = "/api/status"
+	cookieTestGithubAuthorize    = "https://github.com/login/oauth/authorize"
+	cookieTestRefreshTokenKey    = "new_api_refresh="
+	cookieTestDefaultClientID    = "Ov23lidtiR4LeVZvVRNL"
+	cookieTestDefaultUA          = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
 )
 
 var cookieTestAuthMarkers = []string{
@@ -493,11 +496,29 @@ func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, 
 		return cookieTestResult(account, cookieTestStateAbnormal, "HTTP 客户端配置失败: "+err.Error(), nil)
 	}
 
-	stateReq, err := http.NewRequestWithContext(ctx, http.MethodGet, base+cookieTestOAuthStatePath, nil)
+	statePath := cookieTestOAuthStatePath
+	method := http.MethodGet
+	var stateReqBody io.Reader
+	if strings.EqualFold(strings.TrimSpace(account.GithubProtocol), GithubProtocolTabi) {
+		statePath = cookieTestTabiOAuthStatePath
+		method = http.MethodPost
+		payload, marshalErr := json.Marshal(map[string]string{
+			"provider": "github",
+			"intent":   "login",
+		})
+		if marshalErr != nil {
+			return cookieTestResult(account, cookieTestStateAbnormal, "构造 TaBi OAuth state 请求失败: "+marshalErr.Error(), nil)
+		}
+		stateReqBody = bytes.NewReader(payload)
+	}
+	stateReq, err := http.NewRequestWithContext(ctx, method, base+statePath, stateReqBody)
 	if err != nil {
 		return cookieTestResult(account, cookieTestStateAbnormal, "构造 OAuth state 请求失败: "+err.Error(), nil)
 	}
 	setCookieTestCommonHeaders(stateReq, base, "")
+	if method == http.MethodPost {
+		stateReq.Header.Set("Content-Type", "application/json")
+	}
 	stateResp, err := client.Do(stateReq)
 	if err != nil {
 		return cookieTestResult(account, cookieTestStateAbnormal, "OAuth state 网络错误: "+shortCookieTestError(err), nil)
@@ -517,6 +538,32 @@ func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, 
 	}
 	query := u.Query()
 	clientID := strings.TrimSpace(account.GithubClientID)
+	if clientID == "" && strings.EqualFold(strings.TrimSpace(account.GithubProtocol), GithubProtocolTabi) {
+		statusReq, statusErr := http.NewRequestWithContext(ctx, http.MethodGet, base+cookieTestStatusPath, nil)
+		if statusErr != nil {
+			return cookieTestResult(account, cookieTestStateAbnormal, "构造站点状态请求失败: "+statusErr.Error(), nil)
+		}
+		setCookieTestCommonHeaders(statusReq, base, "")
+		statusResp, doErr := client.Do(statusReq)
+		if doErr != nil {
+			return cookieTestResult(account, cookieTestStateAbnormal, "站点状态网络错误: "+shortCookieTestError(doErr), nil)
+		}
+		statusBody, readErr := readCookieTestBody(statusResp)
+		if readErr != nil {
+			return cookieTestResult(account, cookieTestStateAbnormal, "读取站点状态失败: "+readErr.Error(), nil)
+		}
+		statusData, ok := cookieTestJSONMap(statusBody)
+		if !ok || statusResp.StatusCode >= 400 {
+			return cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("站点状态 HTTP %d 非法响应", statusResp.StatusCode), nil)
+		}
+		payload, ok := statusData["data"].(map[string]any)
+		if ok {
+			clientID = strings.TrimSpace(cookieTestString(payload["github_client_id"]))
+		}
+		if clientID == "" {
+			return cookieTestResult(account, cookieTestStateAbnormal, "站点状态未返回 github_client_id", nil)
+		}
+	}
 	if clientID == "" {
 		clientID = cookieTestDefaultClientID
 	}

@@ -16,12 +16,18 @@ from curl_cffi import requests as cffi
 from . import client as api
 from .cf import detect
 from .cf.session_store import CFSession
-from .config import Account, HttpConfig
+from .config import (
+    GITHUB_PROTOCOL_TABI,
+    Account,
+    HttpConfig,
+)
 from .utils import sanitize_header_value
 
 GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 GITHUB_AUTHORIZE_PATH = "/login/oauth/authorize"
 OAUTH_STATE_PATH = "/api/oauth/state?mode=login"
+TABI_OAUTH_STATE_PATH = "/api/oauth/state"
+STATUS_PATH = "/api/status"
 OAUTH_CALLBACK_PATH = "/api/oauth/github"
 
 BROWSER_UA = (
@@ -155,9 +161,8 @@ class GithubOAuthClient:
         )
         return step
 
-    def fetch_state(self) -> OAuthStep:
-        step = self._site_request("GET", OAUTH_STATE_PATH)
-        step = self._decode_json(step, "OAuth state 接口")
+    def _finish_state_step(self, step: OAuthStep, label: str) -> OAuthStep:
+        step = self._decode_json(step, label)
         if step.result.kind != api.SUCCESS:
             if step.result.kind == api.FAILED:
                 message = step.result.message or "取 OAuth state 失败"
@@ -173,10 +178,47 @@ class GithubOAuthClient:
                 api.FAILED,
                 message="取 OAuth state 成功但返回为空",
                 status=step.result.status,
-                path=OAUTH_STATE_PATH,
+                path=step.result.path,
             )
             return step
         step.data = {"state": state}
+        return step
+
+    def fetch_state(self) -> OAuthStep:
+        if self.account.github_protocol == GITHUB_PROTOCOL_TABI:
+            step = self._site_request(
+                "POST",
+                TABI_OAUTH_STATE_PATH,
+                json={"provider": "github", "intent": "login"},
+                headers={"Content-Type": "application/json"},
+            )
+            return self._finish_state_step(step, "TaBi OAuth state 接口")
+        step = self._site_request("GET", OAUTH_STATE_PATH)
+        return self._finish_state_step(step, "OAuth state 接口")
+
+    def fetch_github_client_id(self) -> OAuthStep:
+        """TaBi 协议优先使用账号配置，否则从站点状态读取 OAuth Client ID。"""
+        configured = str(self.account.github_client_id or "").strip()
+        if configured:
+            return OAuthStep(
+                api.ApiResult(api.SUCCESS, message="使用账号配置的 GitHub Client ID"),
+                data={"client_id": configured},
+            )
+        step = self._site_request("GET", STATUS_PATH)
+        step = self._decode_json(step, "站点状态接口")
+        if step.result.kind != api.SUCCESS:
+            return step
+        payload = step.data.get("data") if isinstance(step.data, dict) else None
+        client_id = str(payload.get("github_client_id") or "").strip() if isinstance(payload, dict) else ""
+        if not client_id:
+            step.result = api.ApiResult(
+                api.FAILED,
+                message="站点状态未返回 github_client_id",
+                status=step.result.status,
+                path=STATUS_PATH,
+            )
+            return step
+        step.data = {"client_id": client_id}
         return step
 
     def _github_cookie_header(self) -> str:
@@ -187,12 +229,18 @@ class GithubOAuthClient:
             "logged_in": "yes",
         })
 
-    def fetch_github_code(self, state: str) -> OAuthStep:
+    def fetch_github_code(self, state: str, client_id: Optional[str] = None) -> OAuthStep:
+        if self.account.github_protocol == GITHUB_PROTOCOL_TABI and not client_id:
+            client_step = self.fetch_github_client_id()
+            if not client_step.result.ok:
+                return client_step
+            client_id = str((client_step.data or {}).get("client_id") or "").strip()
+        client_id = client_id or self.account.effective_github_client_id
         try:
             response = self._session.get(
                 GITHUB_AUTHORIZE_URL,
                 params={
-                    "client_id": self.account.effective_github_client_id,
+                    "client_id": client_id,
                     "scope": "user:email",
                     "state": state,
                 },

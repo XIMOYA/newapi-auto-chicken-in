@@ -278,6 +278,7 @@ func EnsureDefaultConfig(db *sql.DB) error {
 //   - proxy_pool.save_limit  旧默认 100 -> 0（不限制，上游有多少可用就存多少）
 //   - proxy_pool.ip_swap_limit 旧默认 5 -> 10
 //   - accounts[].login_method 缺失 -> newapi_cookie
+//   - accounts[].github_protocol 缺失 -> agent
 //
 // 只在配置版本低于当前版本时运行，跑完就写入版本号；之后用户在界面上
 // 改成什么都不会再被覆盖。旧库里代理池字段等于旧默认值时才动，用户显式改成别的
@@ -303,6 +304,10 @@ func MigrateConfig(db *sql.DB) error {
 		if strings.TrimSpace(cfg.Accounts[i].LoginMethod) == "" {
 			cfg.Accounts[i].LoginMethod = LoginMethodNewAPICookie
 			changed = append(changed, fmt.Sprintf("accounts[%d].login_method -> %s", i, LoginMethodNewAPICookie))
+		}
+		if strings.TrimSpace(cfg.Accounts[i].GithubProtocol) == "" {
+			cfg.Accounts[i].GithubProtocol = GithubProtocolAgent
+			changed = append(changed, fmt.Sprintf("accounts[%d].github_protocol -> %s", i, GithubProtocolAgent))
 		}
 	}
 	cfg.ConfigVersion = currentConfigVersion
