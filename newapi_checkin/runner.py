@@ -502,14 +502,16 @@ class Runner:
         """跑完一个账号。失败按可恢复性分流：
 
         1. 网络层失败：只要代理池还能给出新 IP，就无限换 IP 立即重试，不计入
-           defaults.retry，也不受 ip_swap_limit 影响；换不到新 IP 就跳过。
+           defaults.retry，也不受 ip_swap_limit 影响；成功换 IP 的耗时不计入账号时间盒，
+           换不到新 IP 就跳过。
         2. 源站业务失败/WAF 硬封禁：额外换最多 5 次 IP，每次等待 5 秒；
-           仍是同类问题就跳过。
+           换 IP 和等待耗时仍计入账号时间盒，仍是同类问题就跳过。
         3. 盾类失败（Cloudflare/Turnstile）：换 IP + 重开浏览器，按账号总时间盒
-           重试；这是独立于网络异常的恢复路径。
+           重试；这是独立于网络异常的恢复路径，换 IP 和退避耗时都计入时间盒。
         4. 认证、未知或其他不可恢复结果：直接跳过，不浪费重试次数。
         """
         deadline = time.monotonic() + ACCOUNT_DEADLINE_SECONDS
+        # 网络异常成功换 IP 的耗时会加回 deadline；源站/WAF/盾类换 IP及退避仍计入。
         # 网络换 IP 不限次数；源站/WAF 只允许额外换五次；两类都记入真实累计数。
         swapped_total = 0
         source_swaps = 0
@@ -520,7 +522,12 @@ class Runner:
 
             # 1) 网络层失败：只要拿得到新 IP 就无限换，换不到就直接跳过。
             if row.status == api.NETWORK_ERROR:
-                if self._swap_pooled_proxy(account):
+                swap_started = time.monotonic()
+                swapped = self._swap_pooled_proxy(account)
+                if swapped:
+                    # 代理连接失败时，等待池子切换出口属于恢复网络本身，不能
+                    # 抢占后续盾类重试的账号时间盒；WAF 分支不走这里，仍照常计时。
+                    deadline += max(0.0, time.monotonic() - swap_started)
                     swapped_total += 1
                     log.warn(f"网络异常，已换 IP 立即重试（不计入重试次数，"
                              f"本账号累计已换 {swapped_total} 个 IP）")

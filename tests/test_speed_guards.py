@@ -265,6 +265,65 @@ class TestNetworkErrorSwapsIP:
         assert runner._run_account(account).status == api.SUCCESS
         assert slept == []          # 全程没有退避
 
+    def test_network_swap_time_is_excluded_from_account_deadline(self, tmp_path, monkeypatch):
+        """网络异常换 IP 的耗时不应抢占后续盾类重试的时间盒。"""
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        runner._pool = _EndlessPool()
+        account = runner.cfg.accounts[0]
+        clock = _FakeClock()
+        monkeypatch.setattr(runner_mod.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(runner_mod, "ACCOUNT_DEADLINE_SECONDS", 1)
+        monkeypatch.setattr(runner_mod, "SHIELD_RETRY_BACKOFF_MAX", 0)
+        monkeypatch.setattr(runner_mod.time, "sleep", lambda _seconds: None)
+
+        results = [api.NETWORK_ERROR, api.CF_BLOCKED, api.SUCCESS]
+        calls = []
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: (calls.append(1), _row(acct.name, results.pop(0)))[1],
+        )
+        swaps = []
+
+        def slow_network_swap(_account):
+            swaps.append(1)
+            if len(swaps) == 1:
+                clock.now += 2
+            return True
+
+        monkeypatch.setattr(runner, "_swap_pooled_proxy", slow_network_swap)
+
+        assert runner._run_account(account).status == api.SUCCESS
+        assert len(calls) == 3
+        assert len(swaps) == 2
+
+    def test_waf_swap_time_still_counts_against_account_deadline(self, tmp_path, monkeypatch):
+        """WAF 换 IP 的耗时仍应计入账号时间盒。"""
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        runner._pool = _EndlessPool()
+        account = runner.cfg.accounts[0]
+        clock = _FakeClock()
+        monkeypatch.setattr(runner_mod.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(runner_mod, "ACCOUNT_DEADLINE_SECONDS", 1)
+        monkeypatch.setattr(runner_mod, "SHIELD_RETRY_BACKOFF_MAX", 0)
+        monkeypatch.setattr(runner_mod.time, "sleep", lambda _seconds: None)
+
+        results = [api.WAF_BLOCKED, api.CF_BLOCKED, api.SUCCESS]
+        calls = []
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: (calls.append(1), _row(acct.name, results.pop(0)))[1],
+        )
+
+        def slow_waf_swap(_account):
+            clock.now += 2
+            return True
+
+        monkeypatch.setattr(runner, "_swap_pooled_proxy", slow_waf_swap)
+
+        row = runner._run_account(account)
+        assert row.status == api.CF_BLOCKED
+        assert len(calls) == 2
+
     def test_network_without_new_ip_is_skipped(self, tmp_path, monkeypatch):
         """网络异常但没有新的代理可换时直接跳过，不在原 IP 上重试。"""
         runner, account = self._runner(tmp_path, monkeypatch, retry=1, ip_swap_limit=1,
@@ -367,6 +426,14 @@ class TestNetworkErrorSwapsIP:
         row = runner._run_account(account)
         assert row.status == "skipped"
         assert len(calls) == 1
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
 
 
 class _EndlessPool:
