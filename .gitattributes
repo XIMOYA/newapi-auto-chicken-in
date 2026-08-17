@@ -1,0 +1,16 @@
+# 仓库里入库的构建产物是二进制。本机 core.autocrlf=true，若不显式声明
+# 二进制，git 有机会对它们做行尾转换，checkout 出来就是坏文件。
+server/newapi-config-server binary
+server/newapi-config-server-linux-amd64 binary
+*.exe binary
+*.png binary
+*.zip binary
+
+# 源码统一按 LF 入库，checkout 时交给各平台自己处理
+*.py text eol=lf
+*.go text eol=lf
+*.ts text eol=lf
+*.vue text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
