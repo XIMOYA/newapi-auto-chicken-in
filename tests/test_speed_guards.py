@@ -453,22 +453,26 @@ class _EndlessPool:
 
 class TestBrowserConcurrency:
     def test_browser_workers_never_exceed_account_workers(self, tmp_path, monkeypatch):
+        """账号并发被压到比浏览器上限还低时，浏览器不该超过账号 worker 数。"""
+        monkeypatch.setattr(runner_mod, "DEFAULT_ACCOUNT_PARALLELISM", 2)
         runner = _make_runner(tmp_path, monkeypatch, parallelism=2, browser_parallelism=8)
         assert runner._browser_workers() == 2
 
     def test_explicit_browser_parallel_is_ignored(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, parallelism=8, browser_parallelism=1)
-        assert runner._browser_workers() == 2
+        assert runner._browser_workers() == runner_mod.FIXED_BROWSER_PARALLELISM
 
-    def test_fixed_browser_workers_stay_at_two(self, tmp_path, monkeypatch):
+    def test_fixed_browser_workers_stay_at_three(self, tmp_path, monkeypatch):
+        """3 个上限来自公开库 runner 的 4 vCPU：过 Turnstile 吃 CPU，
+        开到 4 个会互相抢核，反而让实例撞上 browser.timeout。"""
         runner = _make_runner(tmp_path, monkeypatch, parallelism=8)
-        assert runner._browser_workers() == 2
-        assert runner_mod.FIXED_BROWSER_PARALLELISM == 2
+        assert runner._browser_workers() == 3
+        assert runner_mod.FIXED_BROWSER_PARALLELISM == 3
 
     def test_browser_workers_do_not_depend_on_cpu_count(self, tmp_path, monkeypatch):
-        """浏览器并发固定为 2，不随 CPU 核数变化。"""
+        """浏览器并发固定为 3，不随 CPU 核数变化。"""
         runner = _make_runner(tmp_path, monkeypatch, parallelism=16)
-        assert runner._browser_workers() == 2
+        assert runner._browser_workers() == 3
 
     def test_gate_limits_concurrent_solves(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
@@ -504,7 +508,7 @@ class TestFixedParallelism:
         monkeypatch.setattr(runner, "_run_account",
                             lambda account: _row(account.name, api.SUCCESS))
         assert runner.run() == 0
-        assert runner.options.parallelism == 4
+        assert runner.options.parallelism == 6
 
     def test_unspecified_is_promoted_to_fixed_default(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch, accounts=3, parallelism=1)
@@ -512,7 +516,9 @@ class TestFixedParallelism:
                             lambda account: _row(account.name, api.SUCCESS))
         assert runner.run() == 0
         assert runner.options.parallelism == runner_mod.DEFAULT_ACCOUNT_PARALLELISM
-        assert runner_mod.DEFAULT_ACCOUNT_PARALLELISM == 4
+        assert runner_mod.DEFAULT_ACCOUNT_PARALLELISM == 6
+        # 账号并发要高于浏览器并发，才能让不进浏览器的账号快速流过
+        assert runner_mod.DEFAULT_ACCOUNT_PARALLELISM > runner_mod.FIXED_BROWSER_PARALLELISM
 
 
 class TestExitIpProbe:

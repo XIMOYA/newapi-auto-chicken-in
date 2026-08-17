@@ -121,12 +121,13 @@ jobs:
           print(f"config.json 已写入（来源 {sys.argv[1]}，校验通过）")
           PY
 
-      - name: 开始签到（headless 真无头 + 固定 4 账号并发 + 2 浏览器并发）
+      - name: 开始签到（headless 真无头 + 固定 6 账号并发 + 3 浏览器并发）
         # 两级并发管的不是一回事：
-        #   账号级并发固定为 4，HTTP 快路径主要等待网络，保证整轮吞吐稳定；
-        #   浏览器实例固定为 2，不再按 runner 的 CPU 核数动态计算，避免排队时
-        #   在不同运行环境之间出现并发抖动。
-        run: python main.py --headless --parallel 4 --browser-parallel 2 -v ${{ inputs.dry_run && '--dry-run' || '' }}
+        #   账号级并发固定为 6，HTTP 快路径主要等待网络，保证整轮吞吐稳定；
+        #   浏览器实例固定为 3，不再按 runner 的 CPU 核数动态计算，避免排队时
+        #   在不同运行环境之间出现并发抖动。公开库 runner 是 4 vCPU/16GB，
+        #   过 Turnstile 吃 CPU，开到 4 个反而会互相抢核拖慢每个实例。
+        run: python main.py --headless --parallel 6 --browser-parallel 3 -v ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: 上传排障截图与页面快照（仅失败时）
         if: failure()

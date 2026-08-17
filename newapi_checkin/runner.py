@@ -46,13 +46,16 @@ _SKIP_ON_FAILURE = (
 # 这些结果说明请求本身通了，换策略也不会变，直接结束
 _SETTLED = (api.SUCCESS, api.ALREADY_DONE, api.AUTH_FAILED, api.FAILED)
 
-# 自动签到固定账号级并发：HTTP 快路径主要等待网络，统一保持 4 个账号并发。
-# --parallel / 调度配置仍保留兼容字段，但实际运行不再按调用方或 CPU 动态调整。
-DEFAULT_ACCOUNT_PARALLELISM = 4
+# 自动签到固定账号级并发：HTTP 快路径主要等待网络，统一保持 6 个账号并发。
+# 比浏览器并发高，是为了让「已签到 / 凭据失效」这类不进浏览器的账号快速流过，
+# 不被卡在盾类账号后面排队。--parallel / 调度配置仍保留兼容字段，实际不生效。
+DEFAULT_ACCOUNT_PARALLELISM = 6
 # 账号级并发的历史硬上限（保留兼容，实际运行固定使用 DEFAULT_ACCOUNT_PARALLELISM）。
 MAX_ACCOUNT_PARALLELISM = 16
-# 浏览器实例固定并发：最多同时开 2 个 Camoufox，不再按 CPU 核数推导。
-FIXED_BROWSER_PARALLELISM = 2
+# 浏览器实例固定并发：最多同时开 3 个 Camoufox，不再按 CPU 核数推导。
+# 上限卡在 3 是因为 GitHub 公开库 runner 只有 4 vCPU，而过 Turnstile 交互质询
+# 是 CPU 密集的；开到 4 个会互相抢核，让本来能过的实例撞上 browser.timeout。
+FIXED_BROWSER_PARALLELISM = 3
 MAX_BROWSER_PARALLELISM = FIXED_BROWSER_PARALLELISM
 # 单账号的总时长上限（秒）。盾类失败是「不限次数重试到成功」，必须有一个
 # 时间盒兜底，否则一个卡住的账号会占死一个并发位，把整轮拖到 Actions 超时。
@@ -76,7 +79,7 @@ class RunOptions:
     cookie_test: Optional[str] = None  # 仅检查指定登录方式的 Cookie，不执行签到
     parallelism: int = 1          # 兼容调用方字段；自动签到实际固定为 6，人工模式为 1
     parallelism_explicit: bool = False   # 兼容字段；固定并发模式下不改变实际账号并发
-    browser_parallelism: int = 0         # 兼容调用方字段；浏览器实际固定为 2（人工模式为 1）
+    browser_parallelism: int = 0         # 兼容调用方字段；浏览器实际固定为 3（人工模式为 1）
 
 
 class Runner:
@@ -274,7 +277,7 @@ class Runner:
     # ------------------------------------------------------------------ #
 
     def _parallelism(self) -> int:
-        """自动签到固定 4 个账号并发；人工模式仍强制串行。"""
+        """自动签到固定 6 个账号并发；人工模式仍强制串行。"""
         if self.options.manual:
             return 1
         return DEFAULT_ACCOUNT_PARALLELISM
@@ -322,7 +325,7 @@ class Runner:
             log.warn("没有启用的账号（检查 accounts[].enabled）")
             return 2
 
-        # 自动签到固定 4 个账号并发；人工模式强制串行 1。
+        # 自动签到固定 6 个账号并发；人工模式强制串行 1。
         self._set_parallelism(1 if self.options.manual else DEFAULT_ACCOUNT_PARALLELISM)
 
         # 代理池：启用后就必须走代理，拿不到代理的账号会被跳过而不是直连

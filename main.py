@@ -9,8 +9,8 @@
     python main.py --manual           人工兜底：等你手动过盾后保存 profile
     python main.py --no-ai            关掉 AI 辅助
     python main.py --no-browser       只走 HTTP 快路径，不启浏览器
-    python main.py --parallel 4       账号级并行度（自动签到固定 4，人工模式 1）
-    python main.py --browser-parallel 2   浏览器实例并发上限（自动签到固定 2）
+    python main.py --parallel 6       账号级并行度（自动签到固定 6，人工模式 1）
+    python main.py --browser-parallel 3   浏览器实例并发上限（自动签到固定 3）
     python main.py -v                 详细日志
 
 退出码：0 全部成功 / 1 有失败 / 2 配置错误 / 130 被中断
@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="禁用浏览器过盾，只走 HTTP 快路径")
     parser.add_argument(
         "--parallel", type=int, choices=range(1, 17), default=None, metavar="N",
-        help="兼容参数；自动签到固定 4 个账号并发，人工模式固定 1 个",
+        help="兼容参数；自动签到固定 6 个账号并发，人工模式固定 1 个",
     )
     parser.add_argument(
         "--browser-parallel", type=int, choices=range(1, 9), default=None, metavar="N",
@@ -166,7 +166,7 @@ def main(argv=None) -> int:
         # github_cookie 是旧写法，登录方式已并入 tabiai，这里归一化后再交给 Runner
         cookie_test=("tabiai" if args.cookie_test == "github_cookie" else args.cookie_test),
         parallelism=1 if args.manual else (args.parallel or 1),
-        # 参数保留兼容；Runner 自动签到统一固定 4 个账号并发。
+        # 参数保留兼容；Runner 自动签到统一固定 6 个账号并发。
         parallelism_explicit=args.parallel is not None and not args.manual,
         browser_parallelism=args.browser_parallel or 0,
     )

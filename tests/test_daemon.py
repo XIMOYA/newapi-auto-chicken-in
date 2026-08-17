@@ -3,6 +3,7 @@ from time import monotonic, sleep
 from types import SimpleNamespace
 
 from newapi_checkin import daemon as daemon_module
+from newapi_checkin import runner as runner_mod
 from newapi_checkin.config import build_config
 from newapi_checkin.daemon import DaemonClient, DaemonServer
 
@@ -289,7 +290,9 @@ def test_daemon_uses_fixed_parallelism_and_serializes_manual(monkeypatch):
 
     assert server._run_checkin(None, manual=False)["ok"] is True
     assert server._run_checkin(None, manual=True)["ok"] is True
-    assert captured == [4, 1]
+    # 定时/立即签到走固定账号并发；人工模式只有一台浏览器，强制串行
+    assert captured == [runner_mod.DEFAULT_ACCOUNT_PARALLELISM, 1]
+    assert captured == [6, 1]
 
 
 def test_daemon_runs_auto_sync_before_runner(monkeypatch):

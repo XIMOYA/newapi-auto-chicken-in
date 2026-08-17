@@ -394,7 +394,7 @@ class DaemonServer:
                 # 定时/立即签到不能弹浏览器窗口；"virtual"(Xvfb) 与 true 本来就是
                 # 无头模式，只有用户显式配置了真 headful(false) 才需要改写成无头。
                 cfg.browser.headless = True
-            # 手动验证只有一台浏览器，强制串行；定时/立即签到固定 4 个账号并发。
+            # 手动验证只有一台浏览器，强制串行；定时/立即签到固定 6 个账号并发。
             options = RunOptions(
                 account_names=account_names,
                 headful=manual,

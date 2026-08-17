@@ -49,8 +49,8 @@ def test_runner_parallelism_is_fixed_for_automated_runs(tmp_path, monkeypatch):
     monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
     runner = runner_mod.Runner(cfg, runner_mod.RunOptions(parallelism=99, use_ai=False, use_browser=False))
 
-    assert runner._parallelism() == 4
-    assert runner_mod.DEFAULT_ACCOUNT_PARALLELISM == 4
+    assert runner._parallelism() == 6
+    assert runner_mod.DEFAULT_ACCOUNT_PARALLELISM == 6
 
 
 def test_source_ip_backoff_only_blocks_that_account(tmp_path, monkeypatch):
