@@ -95,6 +95,9 @@ class Runner:
         self._state_lock = threading.RLock()
         self._browser_attempts: dict[str, int] = {}
         self._browser_gate: Optional[threading.Semaphore] = None
+        # 排队等浏览器槽位的耗时。并行签到时每个账号 worker 记自己的，
+        # 由重试主循环取走并加回时间盒：等全局资源不该算这个账号的过盾时间。
+        self._gate_waits = threading.local()
         # Turnstile 取 token 有频率限制，必须跨账号串行 + 间隔
         self._turnstile_lock = threading.Lock()
         self._last_turnstile_at: float = 0.0
@@ -521,6 +524,16 @@ class Runner:
         log.warn(f"跳过账号：{detail}")
         return log.SummaryRow(account.name, "skipped", row.strategy, detail, row.quota)
 
+    def _give_up_on_deadline(self, row: log.SummaryRow, shield_rounds: int) -> log.SummaryRow:
+        """时间盒耗尽：关掉该账号的全部重试，带着当前结果收工。
+
+        排队等浏览器的耗时已经在主循环里加回过 deadline，所以走到这里说明
+        真正花在尝试上的时间确实满了，不是被别的账号排队挤掉的。
+        """
+        log.err(f"已用满 {ACCOUNT_DEADLINE_SECONDS}s 时间盒（不含排队等浏览器），"
+                f"共尝试 {shield_rounds + 1} 轮，停止该账号的全部重试")
+        return row
+
     def _run_account_with_retries(self, account: Account, record) -> log.SummaryRow:
         """跑完一个账号。失败按可恢复性分流：
 
@@ -529,9 +542,13 @@ class Runner:
            换不到新 IP 就跳过。
         2. 源站业务失败/WAF 硬封禁：额外换最多 5 次 IP，每次等待 5 秒；
            换 IP 和等待耗时仍计入账号时间盒，仍是同类问题就跳过。
-        3. 盾类失败（Cloudflare/Turnstile）：换 IP + 重开浏览器，按账号总时间盒
-           重试；这是独立于网络异常的恢复路径，换 IP 和退避耗时都计入时间盒。
+        3. 盾类失败（Cloudflare/Turnstile）：换 IP + 重开浏览器，次数不限；换不到新 IP
+           时沿用当前出口继续试，唯一的收口是账号时间盒。
         4. 认证、未知或其他不可恢复结果：直接跳过，不浪费重试次数。
+
+        时间盒是所有重试的统一上限：一旦耗尽，本账号不再做任何重试，带着当前
+        结果收工。排队等浏览器槽位的耗时会加回时间盒 —— 那是等全局资源，
+        不属于这个账号自己的过盾时间。
         """
         deadline = time.monotonic() + ACCOUNT_DEADLINE_SECONDS
         # 网络异常成功换 IP 的耗时会加回 deadline；源站/WAF/盾类换 IP及退避仍计入。
@@ -540,11 +557,20 @@ class Runner:
         source_swaps = 0
         row: Optional[log.SummaryRow] = None
         shield_rounds = 0
+        self._take_gate_wait()  # 清掉上一个账号可能残留的读数
         while True:
             row = self._attempt(account, record)
+            # 排队等浏览器槽位不算这个账号的过盾耗时，先把它加回来再判时间盒
+            queued = self._take_gate_wait()
+            if queued > 0:
+                deadline += queued
+                log.debug(f"排队等浏览器 {queued:.1f}s，已加回时间盒（不计入）")
+            exhausted = time.monotonic() >= deadline
 
             # 1) 网络层失败：只要拿得到新 IP 就无限换，换不到就直接跳过。
             if row.status == api.NETWORK_ERROR:
+                if exhausted:
+                    return self._give_up_on_deadline(row, shield_rounds)
                 swap_started = time.monotonic()
                 swapped = self._swap_pooled_proxy(account)
                 if swapped:
@@ -562,6 +588,8 @@ class Runner:
             # 2) 源站业务失败/WAF 硬封禁：最多额外换五次 IP，每次等待 5 秒，
             #    仍是同类问题就跳过。sleep 只阻塞当前账号 worker，不持有全局锁。
             if row.status in _SOURCE_IP_RETRYABLE:
+                if exhausted:
+                    return self._give_up_on_deadline(row, shield_rounds)
                 if source_swaps < SOURCE_IP_SWAP_LIMIT and self._swap_pooled_proxy(account):
                     source_swaps += 1
                     swapped_total += 1
@@ -579,26 +607,23 @@ class Runner:
                     else "源站/WAF 问题且没有可用的新 IP",
                 )
 
-            # 3) 盾类失败：换 IP + 重开浏览器，一直试到成功或时间盒用尽
+            # 3) 盾类失败：换 IP + 重开浏览器，次数不限，只由时间盒收口
             if row.status in _SHIELD_RETRYABLE and self._should_retry(row):
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    log.err(f"盾类重试已用满 {ACCOUNT_DEADLINE_SECONDS}s 时间盒，"
-                            f"共尝试 {shield_rounds + 1} 轮，放弃该账号")
-                    return row
+                    return self._give_up_on_deadline(row, shield_rounds)
                 shield_rounds += 1
+                # 换不到新 IP 也继续：Turnstile 未必是 IP 问题，重开浏览器本身
+                # 就有机会拿到 token，没理由因为池子空了就白扔一个账号
                 swapped = self._swap_pooled_proxy(account)
-                if not swapped:
-                    return self._skip_after_failure(
-                        account, row, "盾类问题且没有可用的新 IP，无法继续恢复"
-                    )
-                swapped_total += 1
+                if swapped:
+                    swapped_total += 1
                 backoff = min(SHIELD_RETRY_BACKOFF_MAX, 5 * shield_rounds)
                 backoff = min(backoff, max(0.0, left - 1))
                 label = log.STATUS_LABEL.get(row.status, row.status)
                 log.warn(f"{label}：第 {shield_rounds} 轮重试"
                          + (f"（已换出口 IP，本账号累计已换 {swapped_total} 个）" if swapped
-                            else "（无新 IP 可换，沿用当前 IP）")
+                            else "（无新 IP 可换，沿用当前 IP 重开浏览器）")
                          + f"，退避 {backoff:.0f}s，剩余时间盒 {left:.0f}s")
                 if backoff > 0:
                     time.sleep(backoff)
@@ -821,7 +846,21 @@ class Runner:
             waited = time.monotonic() - started
             if waited > 1.0:
                 log.debug(f"等待浏览器并发配额 {waited:.1f}s")
+            self._add_gate_wait(waited)
             return _call_bound()
+
+    def _add_gate_wait(self, seconds: float) -> None:
+        """累计本线程排队等浏览器的耗时，等主循环来取。"""
+        if seconds <= 0:
+            return
+        current = getattr(self._gate_waits, "total", 0.0)
+        self._gate_waits.total = current + seconds
+
+    def _take_gate_wait(self) -> float:
+        """取走并清零本轮排队耗时；调用方负责把它加回时间盒。"""
+        total = getattr(self._gate_waits, "total", 0.0)
+        self._gate_waits.total = 0.0
+        return max(0.0, total)
 
     def _solve(self, account: Account, record, ip: Optional[str],
                blocked: api.ApiResult) -> log.SummaryRow:
