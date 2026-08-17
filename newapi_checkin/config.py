@@ -58,8 +58,36 @@ CHECKIN_PATH_CANDIDATES = (
 SELF_PATH = "/api/user/self"
 
 LOGIN_METHOD_NEWAPI_COOKIE = "newapi_cookie"
-LOGIN_METHOD_GITHUB_COOKIE = "github_cookie"
-LOGIN_METHODS = (LOGIN_METHOD_NEWAPI_COOKIE, LOGIN_METHOD_GITHUB_COOKIE)
+# TaBiAI（New API 分支）：凭据是 new_api_refresh cookie，先 refresh 换短期 access token，
+# 业务接口只认 Bearer；签到还需要真实浏览器提供的 Turnstile token。
+LOGIN_METHOD_TABIAI = "tabiai"
+LOGIN_METHODS = (LOGIN_METHOD_NEWAPI_COOKIE, LOGIN_METHOD_TABIAI)
+
+# 已废弃的 GitHub OAuth 登录方式，仅用于识别旧配置并自动迁移到 tabiai
+LEGACY_LOGIN_METHOD_GITHUB_COOKIE = "github_cookie"
+
+# TaBiAI 端点（依据 docs/签到原理.md 实测）
+TABIAI_REFRESH_PATH = "/api/user/auth/refresh"
+TABIAI_CHECKIN_PATH = "/api/user/checkin"
+TABIAI_REFRESH_COOKIE_NAME = "new_api_refresh"
+
+# login_method 的历史写法归一化表。配置文件与环境变量两条入口共用，
+# 避免只在一处认旧值、另一处静默退回默认值。
+LOGIN_METHOD_ALIASES = {
+    "newapi": LOGIN_METHOD_NEWAPI_COOKIE,
+    "cookie": LOGIN_METHOD_NEWAPI_COOKIE,
+    "newapi-cookie": LOGIN_METHOD_NEWAPI_COOKIE,
+    LOGIN_METHOD_NEWAPI_COOKIE: LOGIN_METHOD_NEWAPI_COOKIE,
+    # GitHub OAuth 已不是登录方式：旧值平滑映射到 tabiai，不报错、不丢配置
+    LEGACY_LOGIN_METHOD_GITHUB_COOKIE: LOGIN_METHOD_TABIAI,
+    "github": LOGIN_METHOD_TABIAI,
+    "github-cookie": LOGIN_METHOD_TABIAI,
+    "github_user_session": LOGIN_METHOD_TABIAI,
+    "tabi": LOGIN_METHOD_TABIAI,
+    "tabiai": LOGIN_METHOD_TABIAI,
+    "tabitoken": LOGIN_METHOD_TABIAI,
+    "tabi-ai": LOGIN_METHOD_TABIAI,
+}
 
 
 
@@ -178,6 +206,8 @@ class ConfigSyncConfig:
     response_field: str = ""
     timeout: int = 20
     auto_before_checkin: bool = True
+    # TaBiAI 凭据轮转后的回写端点；留空则按 url 同源推导 /api/accounts/{name}/refresh-cookie
+    writeback_url: str = ""
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ConfigSyncConfig":
@@ -207,6 +237,7 @@ class ConfigSyncConfig:
             response_field=str(raw.get("response_field") or "").strip(),
             timeout=timeout,
             auto_before_checkin=_as_bool(raw.get("auto_before_checkin"), True),
+            writeback_url=str(raw.get("writeback_url") or "").strip(),
         )
 
     def to_dict(self) -> dict:
@@ -222,6 +253,7 @@ class ConfigSyncConfig:
             "response_field": self.response_field,
             "timeout": self.timeout,
             "auto_before_checkin": self.auto_before_checkin,
+            "writeback_url": self.writeback_url,
         }
 
 
@@ -231,6 +263,7 @@ class Account:
     url: str
     cookie: str = ""
     login_method: str = LOGIN_METHOD_NEWAPI_COOKIE
+    # 旧 GitHub OAuth 时代的字段：签到链路已不再使用，仅为让老配置能原样加载而保留
     github_user_session: str = ""
     github_client_id: str = ""
     user_id: Optional[int] = None
@@ -240,12 +273,12 @@ class Account:
     enabled: bool = True
 
     @property
-    def uses_github_cookie(self) -> bool:
-        return self.login_method == LOGIN_METHOD_GITHUB_COOKIE
+    def uses_tabiai(self) -> bool:
+        return self.login_method == LOGIN_METHOD_TABIAI
 
     @property
     def credential_label(self) -> str:
-        return "GitHub Cookie" if self.uses_github_cookie else "站点 Cookie"
+        return "TaBiAI 凭据" if self.uses_tabiai else "站点 Cookie"
 
     @property
     def base_url(self) -> str:
@@ -274,6 +307,44 @@ class Account:
 
 
 @dataclass
+class TabiAIConfig:
+    """TaBiAI 签到专属设置：Turnstile token 只能从真实浏览器里取。
+
+    实测站点对 Turnstile 有频率限制：同一环境 20 分钟内反复 reset 拿不到新 token，
+    所以多账号必须串行 + token_interval_minutes 间隔，不能并发抢。
+    """
+
+    enabled: bool = False
+    # 接管已开着的 Chrome（--remote-debugging-port），而不是 launch 一个新的：
+    # 全新启动的浏览器环境过不了 Turnstile，实测只有真实用户浏览器能出 token
+    cdp_url: str = "http://127.0.0.1:9222"
+    token_timeout: int = 120
+    token_interval_minutes: int = 21
+    keep_page: bool = False
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "TabiAIConfig":
+        raw = raw if isinstance(raw, dict) else {}
+        return cls(
+            enabled=_as_bool(raw.get("enabled"), False),
+            cdp_url=str(raw.get("cdp_url") or "http://127.0.0.1:9222").strip()
+            or "http://127.0.0.1:9222",
+            token_timeout=max(10, min(600, _as_int(raw.get("token_timeout"), 120))),
+            token_interval_minutes=max(0, min(120, _as_int(raw.get("token_interval_minutes"), 21))),
+            keep_page=_as_bool(raw.get("keep_page"), False),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "cdp_url": self.cdp_url,
+            "token_timeout": self.token_timeout,
+            "token_interval_minutes": self.token_interval_minutes,
+            "keep_page": self.keep_page,
+        }
+
+
+@dataclass
 class NotifyConfig:
     email: EmailNotifyConfig = field(default_factory=EmailNotifyConfig)
 
@@ -295,6 +366,7 @@ class Config:
     security: SecurityConfig = field(default_factory=SecurityConfig)
     config_sync: ConfigSyncConfig = field(default_factory=ConfigSyncConfig)
     proxy_pool: ProxyPoolConfig = field(default_factory=ProxyPoolConfig)
+    tabiai: TabiAIConfig = field(default_factory=TabiAIConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     accounts: list = field(default_factory=list)
     source: Optional[Path] = None
@@ -413,21 +485,14 @@ def _build_accounts(raw_list: Any, problems: list) -> list:
         raw_method = item.get("login_method", item.get("login_type", item.get("auth_type")))
         method_text = str(raw_method or "").strip().lower()
         if not method_text:
-            # 显式保留旧站点 Cookie 的默认行为；只有明显是参考项目格式的账号
-            # 才自动推断为 GitHub Cookie，避免空账号被误切换登录链路。
+            # 默认仍是站点 Cookie；只有明显是旧 GitHub OAuth 格式的账号（只有 user_session
+            # 没有 cookie）才推断为 TaBiAI —— 它们本就是 TaBiAI 站点，迁移后需要签发一次凭据。
             method_text = (
-                LOGIN_METHOD_GITHUB_COOKIE
+                LOGIN_METHOD_TABIAI
                 if github_user_session and not cookie
                 else LOGIN_METHOD_NEWAPI_COOKIE
             )
-        aliases = {
-            "newapi": LOGIN_METHOD_NEWAPI_COOKIE,
-            "cookie": LOGIN_METHOD_NEWAPI_COOKIE,
-            "newapi-cookie": LOGIN_METHOD_NEWAPI_COOKIE,
-            "github": LOGIN_METHOD_GITHUB_COOKIE,
-            "github-cookie": LOGIN_METHOD_GITHUB_COOKIE,
-            "github_user_session": LOGIN_METHOD_GITHUB_COOKIE,
-        }
+        aliases = LOGIN_METHOD_ALIASES
         method_text = aliases.get(method_text, method_text)
         if method_text not in LOGIN_METHODS:
             problems.append(
@@ -504,6 +569,7 @@ def _apply_env(cfg: Config) -> list:
         method_value = os.environ.get(method_env)
         if method_value:
             method = method_value.strip().lower()
+            method = LOGIN_METHOD_ALIASES.get(method, method)
             if method in LOGIN_METHODS:
                 acct.login_method = method
                 notes.append(f"{method_env} -> {acct.name}.login_method")
@@ -563,6 +629,7 @@ def build_config(raw: dict, source: Optional[Path] = None) -> Config:
     )
     config_sync = ConfigSyncConfig.from_raw(raw.get("config_sync"))
     proxy_pool = ProxyPoolConfig.from_raw(raw.get("proxy_pool"))
+    tabiai = TabiAIConfig.from_raw(raw.get("tabiai"))
     notify = NotifyConfig.from_raw(raw.get("notify"))
 
     accounts = _build_accounts(raw.get("accounts"), problems)
@@ -572,7 +639,7 @@ def build_config(raw: dict, source: Optional[Path] = None) -> Config:
     cfg = Config(
         ai=ai, browser=browser, http=http, defaults=defaults,
         security=security, config_sync=config_sync, proxy_pool=proxy_pool,
-        notify=notify, accounts=accounts, source=source,
+        tabiai=tabiai, notify=notify, accounts=accounts, source=source,
     )
     _apply_env(cfg)
 

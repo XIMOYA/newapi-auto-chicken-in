@@ -1,7 +1,7 @@
 <!--
 web/src/components/CookieTestPanel.vue
 单个 Cookie 类型的可用性测试面板。
-站点 Cookie 与 GitHub OAuth 由父页面分别挂载本组件，各自维护选择与结果。
+站点 Cookie 与 TaBiAI 凭据由父页面分别挂载本组件，各自维护选择与结果。
 -->
 <template>
   <n-card :bordered="false" class="cookie-test-panel">
@@ -105,9 +105,9 @@ const settled = computed(() => props.settled ?? 0)
 const total = computed(() => props.total ?? props.accounts.length)
 
 const selectedKeys = ref<string[]>([])
-const modeLabel = computed(() => props.mode === 'github_cookie' ? 'GitHub OAuth' : '站点 Cookie')
-const hint = computed(() => props.mode === 'github_cookie'
-  ? '只执行站点 OAuth state（POST /api/oauth/state）与 GitHub authorize：Client ID 取账号配置，未填则读站点 /api/status。检测走服务器代理池，遇到代理/CDN 拦截会自动换出口无限重试，只有站点或凭据本身给出结论才会停止；不会调用 OAuth 回调或执行签到。'
+const modeLabel = computed(() => props.mode === 'tabiai' ? 'TaBiAI 凭据' : '站点 Cookie')
+const hint = computed(() => props.mode === 'tabiai'
+  ? '只拿 new_api_refresh 去 POST /api/user/auth/refresh，看还能不能换出 access token；不执行签到，不消耗 Turnstile 配额。凭据每次 refresh 都会轮转，检测拿到新代次会立刻写回账号配置。检测走服务器代理池，遇到代理/CDN 拦截会自动换出口无限重试，只有站点或凭据本身给出结论才会停止。'
   : '直接验证 /api/user/self；检测到 new_api_refresh 时会先刷新凭据再验证。检测走服务器代理池，遇到代理/CDN 拦截会自动换出口无限重试，只有站点或凭据本身给出结论才会停止；不会执行签到。')
 const resultByName = computed(() => new Map(props.results.map((result) => [result.name, result])))
 const rows = computed<CookieTestRow[]>(() => props.accounts.map((account) => ({
@@ -161,9 +161,10 @@ function statusType(state: CookieTestState | undefined): TagProps['type'] {
   }
 }
 
+// 两种模式的凭据都落在 cookie 字段上（tabiai 存 new_api_refresh 的值），
+// 后端检测也只看这一个字段，所以这里不再按模式分流
 function credentialState(row: CookieTestRow) {
-  const value = props.mode === 'github_cookie' ? row.github_user_session : row.cookie
-  return value ? '已设置' : '未设置'
+  return row.cookie ? '已设置' : '未设置'
 }
 
 const columns: DataTableColumns<CookieTestRow> = [

@@ -10,7 +10,6 @@ NewAPI 签到配置管理平台 · Cookie 可用性检测
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -82,6 +81,9 @@ type CookieTestResult struct {
 	retryable bool `json:"-"`
 	// degradeNote 内部备注：账号代理降级到代理池后，附加在 message 前的提示
 	degradeNote string `json:"-"`
+	// rotatedCookie 内部字段：TaBiAI 的 refresh 会轮转凭据，这里带出新一代值供调用方落盘。
+	// 绝不能序列化给前端 —— 它就是凭据本身。
+	rotatedCookie string `json:"-"`
 }
 
 // CookieTestSummary 一轮检测的状态汇总。
@@ -127,7 +129,7 @@ func selectCookieTestTargets(cfg *Config, mode string, names []string) ([]Accoun
 	if cfg == nil {
 		return nil, fmt.Errorf("配置不能为空")
 	}
-	if mode != LoginMethodNewAPICookie && mode != LoginMethodGitHubCookie {
+	if mode != LoginMethodNewAPICookie && mode != LoginMethodTabiAI {
 		return nil, fmt.Errorf("不支持的 Cookie 测试类型: %s", mode)
 	}
 
@@ -193,8 +195,8 @@ func runCookieTestPass(ctx context.Context, cfg *Config, mode string,
 }
 
 func cookieTestModeLabel(mode string) string {
-	if mode == LoginMethodGitHubCookie {
-		return "github_cookie"
+	if mode == LoginMethodTabiAI {
+		return "tabiai"
 	}
 	return "newapi_cookie"
 }
@@ -203,11 +205,12 @@ func checkCookieAccount(ctx context.Context, httpCfg HTTPConfig, account Account
 	mode string, proxyAddr string) CookieTestResult {
 	started := time.Now()
 	var result CookieTestResult
-	if mode == LoginMethodGitHubCookie {
-		if strings.TrimSpace(account.GithubUserSession) == "" {
-			result = cookieTestResult(account, cookieTestStateSkipped, "缺少 GitHub Cookie（github_user_session）", nil)
+	if mode == LoginMethodTabiAI {
+		if strings.TrimSpace(account.Cookie) == "" {
+			result = cookieTestResult(account, cookieTestStateSkipped,
+				"缺少 TaBiAI 凭据（new_api_refresh），可用「签发 cookie」或从浏览器复制", nil)
 		} else {
-			result = checkGithubCookie(ctx, httpCfg, account, proxyAddr)
+			result = checkTabiAICookie(ctx, httpCfg, account, proxyAddr)
 		}
 	} else if strings.TrimSpace(account.Cookie) == "" {
 		result = cookieTestResult(account, cookieTestStateSkipped, "缺少站点 Cookie（cookie）", nil)
@@ -621,207 +624,132 @@ func classifyCookieTestSelf(account Account, status int, body []byte, fallbackID
 	return cookieTestResult(account, cookieTestStateValid, username, userID)
 }
 
-func checkGithubCookie(ctx context.Context, httpCfg HTTPConfig, account Account, proxyAddr string) CookieTestResult {
-	return checkGithubCookieWithAuthorizeURL(ctx, httpCfg, account, cookieTestGithubAuthorize, proxyAddr)
-}
-
-// checkGithubCookieWithAuthorizeURL 为测试注入 authorize 地址；生产路径使用 GitHub 官方地址。
-func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, account Account,
-	authorizeURL string, proxyAddr string) CookieTestResult {
+// checkTabiAICookie 验证 TaBiAI 的 new_api_refresh 凭据。
+//
+// 全程纯 HTTP：POST /api/user/auth/refresh 只需要 cookie，不碰 Turnstile、不需要浏览器与 AI。
+// refresh 成功即证明凭据有效，响应里已带 user 信息，因此不再多打一次 /api/user/self。
+//
+// 注意：站点实现了 refresh token rotation + 重放检测，这次请求**必然消耗一代 secret**并下发下一代。
+// 新值通过 result.rotatedCookie 带出，调用方必须落盘，否则下次用旧代会被判重放、整条会话被撤销。
+func checkTabiAICookie(ctx context.Context, httpCfg HTTPConfig, account Account, proxyAddr string) CookieTestResult {
 	base, err := cookieTestBaseURL(account.URL)
 	if err != nil {
 		return cookieTestResult(account, cookieTestStateAbnormal, "站点 URL 无效: "+err.Error(), nil)
 	}
-	client, err := newCookieTestHTTPClient(account, httpCfg, false, proxyAddr)
+	client, err := newCookieTestHTTPClient(account, httpCfg, true, proxyAddr)
 	if err != nil {
 		return cookieTestResult(account, cookieTestStateAbnormal, "HTTP 客户端配置失败: "+err.Error(), nil)
 	}
 
-	statePayload, marshalErr := json.Marshal(map[string]string{
-		"provider": "github",
-		"intent":   "login",
-	})
-	if marshalErr != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "构造 OAuth state 请求失败: "+marshalErr.Error(), nil)
-	}
-	stateReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		base+cookieTestOAuthStatePath, bytes.NewReader(statePayload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+cookieTestRefreshPath, nil)
 	if err != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "构造 OAuth state 请求失败: "+err.Error(), nil)
+		return cookieTestResult(account, cookieTestStateAbnormal, "构造 refresh 请求失败: "+err.Error(), nil)
 	}
-	setCookieTestCommonHeaders(stateReq, base, "")
-	stateReq.Header.Set("Content-Type", "application/json")
-	stateReq.Header.Set("Cache-Control", "no-store")
-	stateResp, err := client.Do(stateReq)
+	setCookieTestCommonHeaders(req, base, normalizeTabiAIRefreshCookie(account.Cookie))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
 	if err != nil {
-		return cookieTestProxyIssue(account, "OAuth state 网络错误: "+shortCookieTestError(err))
+		return cookieTestProxyIssue(account, "refresh 网络错误: "+shortCookieTestError(err))
 	}
-	stateHeader := stateResp.Header
-	stateBody, readErr := readCookieTestBody(stateResp)
+	header := resp.Header
+	body, readErr := readCookieTestBody(resp)
 	if readErr != nil {
-		return cookieTestProxyIssue(account, "读取 OAuth state 响应失败: "+readErr.Error())
+		return cookieTestProxyIssue(account, "读取 refresh 响应失败: "+readErr.Error())
 	}
-	if cookieTestLooksLikeChallenge(stateResp.StatusCode, stateHeader, stateBody) {
+	if cookieTestLooksLikeChallenge(resp.StatusCode, header, body) {
 		return cookieTestProxyIssue(account,
-			fmt.Sprintf("站点未放行当前出口（OAuth state HTTP %d，疑似 CDN/WAF 拦截）", stateResp.StatusCode))
-	}
-	state, stateResult := classifyCookieTestOAuthState(account, stateResp.StatusCode, stateBody)
-	if stateResult != nil {
-		return *stateResult
+			fmt.Sprintf("站点未放行当前出口（refresh HTTP %d，疑似 CDN/WAF 拦截）", resp.StatusCode))
 	}
 
-	u, err := url.Parse(authorizeURL)
-	if err != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "GitHub authorize 地址无效", nil)
+	result := classifyTabiAIRefresh(account, resp.StatusCode, body)
+	// 无论成功与否都把站点下发的新 cookie 带出去：只要服务端确实换了代次就必须落盘
+	if rotated := extractTabiAIRefreshCookie(header.Values("Set-Cookie")); rotated != "" {
+		result.rotatedCookie = rotated
 	}
-	query := u.Query()
-	clientID := strings.TrimSpace(account.GithubClientID)
-	if clientID == "" {
-		// 站点自己的 OAuth 应用 ID 由 /api/status 公开，不能套用别站的默认值
-		statusReq, statusErr := http.NewRequestWithContext(ctx, http.MethodGet, base+cookieTestStatusPath, nil)
-		if statusErr != nil {
-			return cookieTestResult(account, cookieTestStateAbnormal, "构造站点状态请求失败: "+statusErr.Error(), nil)
-		}
-		setCookieTestCommonHeaders(statusReq, base, "")
-		statusResp, doErr := client.Do(statusReq)
-		if doErr != nil {
-			return cookieTestProxyIssue(account, "站点状态网络错误: "+shortCookieTestError(doErr))
-		}
-		statusHeader := statusResp.Header
-		statusBody, readErr := readCookieTestBody(statusResp)
-		if readErr != nil {
-			return cookieTestProxyIssue(account, "读取站点状态失败: "+readErr.Error())
-		}
-		if cookieTestLooksLikeChallenge(statusResp.StatusCode, statusHeader, statusBody) {
-			return cookieTestProxyIssue(account,
-				fmt.Sprintf("站点未放行当前出口（/api/status HTTP %d，疑似 CDN/WAF 拦截）", statusResp.StatusCode))
-		}
-		statusData, ok := cookieTestJSONMap(statusBody)
-		if !ok || statusResp.StatusCode >= 400 {
-			return cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("站点状态 HTTP %d 非法响应", statusResp.StatusCode), nil)
-		}
-		if payload, ok := statusData["data"].(map[string]any); ok {
-			clientID = strings.TrimSpace(cookieTestString(payload["github_client_id"]))
-		}
-		if clientID == "" {
-			return cookieTestResult(account, cookieTestStateAbnormal, "站点状态未返回 github_client_id", nil)
-		}
-	}
-	query.Set("client_id", clientID)
-	query.Set("scope", "user:email")
-	query.Set("state", state)
-	u.RawQuery = query.Encode()
-
-	authorizeReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "构造 GitHub authorize 请求失败: "+err.Error(), nil)
-	}
-	authorizeReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	authorizeReq.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-	authorizeReq.Header.Set("User-Agent", cookieTestDefaultUA)
-	githubSession := sanitizeCookieTestHeader(account.GithubUserSession)
-	authorizeReq.Header.Set("Cookie", "user_session="+githubSession+
-		"; __Host-user_session_same_site="+githubSession+"; logged_in=yes")
-	authorizeReq.Header.Set("Referer", sanitizeCookieTestHeader(base+"/login"))
-
-	authorizeResp, err := client.Do(authorizeReq)
-	if err != nil {
-		return cookieTestProxyIssue(account, "GitHub authorize 网络错误: "+shortCookieTestError(err))
-	}
-	defer authorizeResp.Body.Close()
-	return classifyCookieTestGithubAuthorize(account, authorizeResp.StatusCode, authorizeResp.Header.Get("Location"))
+	return result
 }
 
-func classifyCookieTestOAuthState(account Account, status int, body []byte) (string, *CookieTestResult) {
+// classifyTabiAIRefresh 依据 refresh 响应判定凭据状态。
+// 站点错误码见签到原理文档：AUTH_SESSION_REVOKED 表示整条会话已废，AUTH_UNAUTHORIZED 表示当前代次失效。
+func classifyTabiAIRefresh(account Account, status int, body []byte) CookieTestResult {
 	data, hasJSON := cookieTestJSONMap(body)
 	if !hasJSON {
-		if status == http.StatusUnauthorized || status == http.StatusForbidden {
-			result := cookieTestResult(account, cookieTestStateInvalid, fmt.Sprintf("OAuth state HTTP %d", status), nil)
-			return "", &result
+		if status >= 500 {
+			return cookieTestProxyIssue(account, fmt.Sprintf("refresh HTTP %d 网关错误（非 JSON）", status))
 		}
-		// 非 JSON 一律视作链路被挡（CDN 错误页/挑战页），换出口重试
-		result := cookieTestProxyIssue(account, fmt.Sprintf("OAuth state HTTP %d 非 JSON 响应", status))
-		return "", &result
+		return cookieTestProxyIssue(account, fmt.Sprintf("refresh HTTP %d 非 JSON 响应", status))
 	}
+	code := strings.ToUpper(strings.TrimSpace(cookieTestString(data["code"])))
 	message := cookieTestMessage(data)
+
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		result := cookieTestResult(account, cookieTestStateInvalid, cookieTestMessageOr(message, fmt.Sprintf("OAuth state HTTP %d", status)), nil)
-		return "", &result
+		switch code {
+		case "AUTH_SESSION_REVOKED":
+			return cookieTestResult(account, cookieTestStateInvalid,
+				"会话已被撤销（旧代次重放或用户登出了其他会话），需要重新签发 new_api_refresh", nil)
+		case "AUTH_UNAUTHORIZED":
+			return cookieTestResult(account, cookieTestStateInvalid,
+				"凭据已失效：可能已过期，或被更新后的代次取代（请确认没有别处在用同一条会话）", nil)
+		}
+		return cookieTestResult(account, cookieTestStateInvalid,
+			cookieTestMessageOr(message, fmt.Sprintf("refresh HTTP %d", status)), nil)
 	}
 	if status >= 500 {
-		result := cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("OAuth state HTTP %d 服务器错误", status), nil)
-		return "", &result
+		return cookieTestProxyIssue(account, fmt.Sprintf("refresh HTTP %d 服务器错误", status))
 	}
 	if success, ok := data["success"].(bool); !ok || !success {
-		lower := strings.ToLower(message)
+		lower := strings.ToLower(message + " " + code)
 		state := cookieTestStateAbnormal
 		if cookieTestContainsAny(lower, cookieTestAuthMarkers) {
 			state = cookieTestStateInvalid
 		}
-		result := cookieTestResult(account, state, cookieTestMessageOr(message, "OAuth state 获取失败"), nil)
-		return "", &result
+		return cookieTestResult(account, state, cookieTestMessageOr(message, "refresh 失败"), nil)
 	}
-	state := cookieTestFlowToken(data["data"])
-	if state == "" {
-		result := cookieTestResult(account, cookieTestStateAbnormal, "OAuth state 成功但未返回 flow_token", nil)
-		return "", &result
+
+	payload, _ := data["data"].(map[string]any)
+	if payload == nil {
+		return cookieTestResult(account, cookieTestStateAbnormal, "refresh 成功但响应缺少 data", nil)
 	}
-	return state, nil
+	// 这两个辅助函数接收的是整个响应体（内部自己下钻 data.*），别传 payload
+	if cookieTestExtractAccessToken(data) == "" {
+		return cookieTestResult(account, cookieTestStateAbnormal, "refresh 成功但未返回 access_token", nil)
+	}
+	userID := cookieTestExtractUserID(data)
+	username := ""
+	if user, ok := payload["user"].(map[string]any); ok {
+		username = cookieTestString(user["username"])
+		if username == "" {
+			username = cookieTestString(user["display_name"])
+		}
+	}
+	if username == "" {
+		username = "TaBiAI 凭据有效"
+	}
+	return cookieTestResult(account, cookieTestStateValid, username, userID)
 }
 
-// cookieTestFlowToken 站点把 state 放在 data.flow_token；旧结构直接给字符串时也接受。
-func cookieTestFlowToken(value any) string {
-	if payload, ok := value.(map[string]any); ok {
-		for _, key := range []string{"flow_token", "state"} {
-			if token := strings.TrimSpace(cookieTestString(payload[key])); token != "" {
-				return token
-			}
-		}
+// normalizeTabiAIRefreshCookie 允许用户只填裸值 sid.secret，也允许填完整 new_api_refresh=...。
+func normalizeTabiAIRefreshCookie(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
 		return ""
 	}
-	return strings.TrimSpace(cookieTestString(value))
+	if strings.Contains(value, cookieTestRefreshTokenKey) {
+		return value
+	}
+	return cookieTestRefreshTokenKey + value
 }
 
-func classifyCookieTestGithubAuthorize(account Account, status int, location string) CookieTestResult {
-	redirect := status == http.StatusMovedPermanently || status == http.StatusFound ||
-		status == http.StatusSeeOther || status == http.StatusTemporaryRedirect ||
-		status == http.StatusPermanentRedirect
-	if location != "" {
-		if parsed, err := url.Parse(location); err == nil && strings.Contains(strings.ToLower(parsed.Path), "/login") {
-			return cookieTestResult(account, cookieTestStateInvalid, "GitHub 要求重新登录，user_session 已失效", nil)
+// extractTabiAIRefreshCookie 从 Set-Cookie 里取出新一代 new_api_refresh（含 name=value 形式）。
+func extractTabiAIRefreshCookie(setCookies []string) string {
+	for _, raw := range setCookies {
+		name, value := parseCookieTestSetCookie(raw)
+		if name == "new_api_refresh" && value != "" {
+			return name + "=" + value
 		}
 	}
-	if redirect {
-		parsed, err := url.Parse(location)
-		if err == nil {
-			if strings.Contains(strings.ToLower(parsed.Path), "/login") {
-				return cookieTestResult(account, cookieTestStateInvalid, "GitHub 要求重新登录，user_session 已失效", nil)
-			}
-			if code := parsed.Query().Get("code"); code != "" {
-				return cookieTestResult(account, cookieTestStateValid, "GitHub Cookie 有效（已取得 OAuth code，未执行签到）", nil)
-			}
-			if reason := parsed.Query().Get("error_description"); reason != "" {
-				return cookieTestResult(account, cookieTestStateInvalid, "GitHub 未返回 code: "+sanitizeCookieTestMessage(reason), nil)
-			}
-			if reason := parsed.Query().Get("error"); reason != "" {
-				return cookieTestResult(account, cookieTestStateInvalid, "GitHub 未返回 code: "+sanitizeCookieTestMessage(reason), nil)
-			}
-		}
-		return cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("GitHub 未返回授权 code（HTTP %d）", status), nil)
-	}
-	if status == http.StatusForbidden || status == http.StatusTooManyRequests {
-		// GitHub 在风控当前出口 IP（而不是否定 Cookie），换出口有意义
-		return cookieTestProxyIssue(account,
-			fmt.Sprintf("GitHub authorize HTTP %d，当前出口被 GitHub 限制", status))
-	}
-	if status == http.StatusUnauthorized {
-		return cookieTestResult(account, cookieTestStateInvalid, "GitHub authorize HTTP 401，user_session 已失效", nil)
-	}
-	if status >= 500 {
-		return cookieTestProxyIssue(account, fmt.Sprintf("GitHub authorize HTTP %d 服务器错误", status))
-	}
-	return cookieTestResult(account, cookieTestStateAbnormal,
-		fmt.Sprintf("GitHub 未返回授权重定向（HTTP %d），可能需要先在 GitHub 授权该 OAuth 应用", status), nil)
+	return ""
 }
 
 func parseCookieTestCookies(raw string) map[string]string {

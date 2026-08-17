@@ -35,13 +35,13 @@ func TestParseProxyLines_FiltersInvalid(t *testing.T) {
 
 func TestValidIP(t *testing.T) {
 	cases := map[string]bool{
-		"1.2.3.4":   true,
+		"1.2.3.4":         true,
 		"255.255.255.255": true,
-		"256.1.1.1": false,
-		"1.2.3":     false,
-		"1.2.3.4.5": false,
-		"abc":       false,
-		"":          false,
+		"256.1.1.1":       false,
+		"1.2.3":           false,
+		"1.2.3.4.5":       false,
+		"abc":             false,
+		"":                false,
 	}
 	for ip, want := range cases {
 		if validIP(ip) != want {

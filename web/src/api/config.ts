@@ -9,8 +9,11 @@ export function getConfig(): Promise<ConfigResponse> {
   return http.get<ConfigResponse>('/config').then((r) => r.data)
 }
 
-export function saveConfig(config: AppConfig): Promise<SaveConfigResult> {
-  return http.put<SaveConfigResult>('/config', { config }).then((r) => r.data)
+// revision 走乐观锁：服务端版本不一致时返回 409，避免用陈旧快照整份覆盖别人的改动
+export function saveConfig(config: AppConfig, revision?: number): Promise<SaveConfigResult> {
+  const body: { config: AppConfig; revision?: number } = { config }
+  if (typeof revision === 'number') body.revision = revision
+  return http.put<SaveConfigResult>('/config', body).then((r) => r.data)
 }
 
 export function getRawConfig(token: string): Promise<AppConfig> {

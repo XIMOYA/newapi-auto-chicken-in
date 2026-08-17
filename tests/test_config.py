@@ -82,7 +82,7 @@ class TestAccounts:
             "github_user_session": "session-value",
             "github_client_id": "client-id",
         }]).accounts[0]
-        assert account.uses_github_cookie is True
+        assert account.uses_tabiai is True
         assert account.github_user_session == "session-value"
         assert account.github_client_id == "client-id"
 
@@ -92,7 +92,7 @@ class TestAccounts:
             "url": "https://a.com",
             "user_session": "session-value",
         }]).accounts[0]
-        assert account.login_method == cfgmod.LOGIN_METHOD_GITHUB_COOKIE
+        assert account.login_method == cfgmod.LOGIN_METHOD_TABIAI
         assert account.github_user_session == "session-value"
 
     def test_explicit_newapi_method_wins_over_github_alias(self):
@@ -230,13 +230,14 @@ class TestEnvOverride:
         cfg = build(accounts=[{"name": "my site", "url": "https://a.com", "cookie": "old"}])
         assert cfg.accounts[0].cookie == "session=env"
 
-    def test_github_fields_and_method_from_env(self, monkeypatch):
+    def test_legacy_github_fields_and_method_from_env(self, monkeypatch):
         monkeypatch.setenv("CHECKIN_ACCOUNT_MY_SITE_GITHUB_USER_SESSION", "gh-env")
         monkeypatch.setenv("CHECKIN_ACCOUNT_MY_SITE_GITHUB_CLIENT_ID", "client-env")
         monkeypatch.setenv("CHECKIN_ACCOUNT_MY_SITE_LOGIN_METHOD", "github_cookie")
         cfg = build(accounts=[{"name": "my site", "url": "https://a.com"}])
         account = cfg.accounts[0]
-        assert account.login_method == "github_cookie"
+        # 环境变量里的旧写法必须和配置文件一样被归一化，不能静默退回默认值
+        assert account.login_method == cfgmod.LOGIN_METHOD_TABIAI
         assert account.github_user_session == "gh-env"
         assert account.github_client_id == "client-env"
 

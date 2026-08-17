@@ -58,7 +58,7 @@ func TestRunnerRetriesChallengeUntilSiteAnswers(t *testing.T) {
 	}))
 	defer site.Close()
 
-	runner := NewCookieTestRunner(nil) // 无代理池：每轮直连
+	runner := NewCookieTestRunner(nil, nil) // 无代理池：每轮直连
 	cfg := runnerConfig(site.URL, Account{Name: "retry", Cookie: "session=x"})
 	if err := runner.Start(cfg, LoginMethodNewAPICookie, nil); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -85,7 +85,7 @@ func TestRunnerDoesNotRetryOriginFailure(t *testing.T) {
 	}))
 	defer site.Close()
 
-	runner := NewCookieTestRunner(nil)
+	runner := NewCookieTestRunner(nil, nil)
 	cfg := runnerConfig(site.URL, Account{Name: "origin", Cookie: "session=dead"})
 	if err := runner.Start(cfg, LoginMethodNewAPICookie, nil); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -124,7 +124,7 @@ func TestRunnerDegradesOwnProxyToPoolAfterRepeatedFailures(t *testing.T) {
 
 	// 账号自带代理指向必然拒绝连接的端口；代理池为空，降级后走直连正好能连上 httptest
 	dead := "http://127.0.0.1:1"
-	runner := NewCookieTestRunner(nil)
+	runner := NewCookieTestRunner(nil, nil)
 	cfg := runnerConfig(site.URL, Account{Name: "own-proxy", Cookie: "session=x", Proxy: &dead})
 	if err := runner.Start(cfg, LoginMethodNewAPICookie, nil); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -152,7 +152,7 @@ func TestRunnerStopMarksUnfinishedAsSkipped(t *testing.T) {
 	}))
 	defer site.Close()
 
-	runner := NewCookieTestRunner(nil)
+	runner := NewCookieTestRunner(nil, nil)
 	cfg := runnerConfig(site.URL, Account{Name: "endless", Cookie: "session=x"})
 	if err := runner.Start(cfg, LoginMethodNewAPICookie, nil); err != nil {
 		t.Fatalf("Start: %v", err)

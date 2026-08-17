@@ -131,203 +131,152 @@ func TestCheckNewAPICookieAbnormalResponses(t *testing.T) {
 	}
 }
 
-func TestCheckGithubCookieGetsCodeWithoutCallback(t *testing.T) {
-	var callbackCalls atomic.Int32
+// tabiaiRefreshBody 站点 refresh 成功时的响应体（结构见 docs/签到原理.md 2.2）。
+func tabiaiRefreshBody(userID int, username string) map[string]any {
+	return map[string]any{
+		"success": true,
+		"data": map[string]any{
+			"access_token":      "eyJhbGciOiJIUzI1NiJ9.fake",
+			"access_expires_at": 1786976078,
+			"user":              map[string]any{"id": userID, "username": username},
+		},
+	}
+}
+
+func TestCheckTabiAICookieValidCarriesRotatedCookie(t *testing.T) {
+	var selfCalls atomic.Int32
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/oauth/github" {
-			callbackCalls.Add(1)
-			http.Error(w, "callback must not be called", http.StatusInternalServerError)
+		if r.URL.Path == cookieTestSelfPath {
+			// refresh 响应已带 user，检测不该再多打一次 self
+			selfCalls.Add(1)
+			http.Error(w, "self must not be called", http.StatusInternalServerError)
 			return
 		}
-		if r.URL.Path != cookieTestOAuthStatePath {
+		if r.URL.Path != cookieTestRefreshPath {
 			http.NotFound(w, r)
 			return
 		}
 		if r.Method != http.MethodPost {
-			t.Fatalf("OAuth state request = %s %s", r.Method, r.URL.String())
+			t.Fatalf("refresh method = %s", r.Method)
 		}
-		var payload map[string]string
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Fatalf("decode OAuth state payload: %v", err)
+		if got := r.Header.Get("Cookie"); got != "new_api_refresh=sid.gen1" {
+			t.Fatalf("refresh cookie = %q", got)
 		}
-		if payload["provider"] != "github" || payload["intent"] != "login" {
-			t.Fatalf("OAuth state payload = %#v", payload)
-		}
-		// 站点实测结构：state 在 data.flow_token
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"success": true,
-			"data":    map[string]any{"flow_token": "state-123", "expires_at": 1786906774},
-		})
+		// 轮转：下发下一代 secret
+		w.Header().Add("Set-Cookie",
+			"new_api_refresh=sid.gen2; Path=/api/user/auth; Max-Age=2591999; HttpOnly; SameSite=Strict")
+		_ = json.NewEncoder(w).Encode(tabiaiRefreshBody(8259, "LIKIQ"))
 	}))
 	defer site.Close()
 
-	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("client_id") != "configured-client-id" {
-			t.Fatalf("client_id = %q", r.URL.Query().Get("client_id"))
-		}
-		if r.URL.Query().Get("state") != "state-123" {
-			t.Fatalf("state = %q", r.URL.Query().Get("state"))
-		}
-		if r.URL.Query().Get("scope") != "user:email" {
-			t.Fatalf("scope = %q", r.URL.Query().Get("scope"))
-		}
-		if got := r.Header.Get("Cookie"); got != "user_session=github-session; __Host-user_session_same_site=github-session; logged_in=yes" {
-			t.Fatalf("cookie = %q", got)
-		}
-		w.Header().Set("Location", "https://example.test/oauth/callback?code=secret-code&state=state-123")
-		w.WriteHeader(http.StatusFound)
-	}))
-	defer authorize.Close()
-
-	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
-		Name:              "github",
-		URL:               site.URL,
-		GithubClientID:    "configured-client-id",
-		GithubUserSession: "github-session",
-	}, authorize.URL, "")
+	result := checkTabiAICookie(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
+		Name:   "tabiai",
+		URL:    site.URL,
+		Cookie: "new_api_refresh=sid.gen1",
+	}, "")
 	if result.State != cookieTestStateValid {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
-	if strings.Contains(result.Message, "secret-code") || callbackCalls.Load() != 0 {
-		t.Fatalf("GitHub code/callback leaked or callback called: message=%q calls=%d", result.Message, callbackCalls.Load())
+	if result.Message != "LIKIQ" {
+		t.Fatalf("应展示用户名: %q", result.Message)
+	}
+	if result.UserID == nil || *result.UserID != 8259 {
+		t.Fatalf("user_id = %v", result.UserID)
+	}
+	if result.rotatedCookie != "new_api_refresh=sid.gen2" {
+		t.Fatalf("未带出轮转后的新凭据: %q", result.rotatedCookie)
+	}
+	if selfCalls.Load() != 0 {
+		t.Fatalf("不应额外请求 self，实际 %d 次", selfCalls.Load())
 	}
 }
 
-func TestCheckGithubCookieStateWithoutFlowTokenIsAbnormal(t *testing.T) {
+func TestCheckTabiAICookieAcceptsBareValue(t *testing.T) {
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"success": true,
-			"data":    map[string]any{"expires_at": 1786906774},
-		})
+		// 用户只填裸 sid.secret 时也要补成合法 cookie 头
+		if got := r.Header.Get("Cookie"); got != "new_api_refresh=sid.bare" {
+			t.Fatalf("refresh cookie = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(tabiaiRefreshBody(1, "bare"))
 	}))
 	defer site.Close()
-	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("authorize 不应在 state 缺失时被调用")
-	}))
-	defer authorize.Close()
 
-	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
-		Name:              "github-no-token",
-		URL:               site.URL,
-		GithubClientID:    "configured-client-id",
-		GithubUserSession: "github-session",
-	}, authorize.URL, "")
-	if result.State != cookieTestStateAbnormal || !strings.Contains(result.Message, "flow_token") {
+	result := checkTabiAICookie(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
+		Name:   "bare",
+		URL:    site.URL,
+		Cookie: "sid.bare",
+	}, "")
+	if result.State != cookieTestStateValid {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
 }
 
-func TestCheckGithubCookieInvalidRedirect(t *testing.T) {
+func TestCheckTabiAICookieSessionRevokedIsInvalid(t *testing.T) {
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"success": true,
-			"data":    map[string]any{"flow_token": "state-123"},
-		})
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":"AUTH_SESSION_REVOKED","message":"Unauthorized","success":false}`))
 	}))
 	defer site.Close()
-	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Location", "https://github.com/login?return_to=%2Foauth")
-		w.WriteHeader(http.StatusFound)
-	}))
-	defer authorize.Close()
 
-	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
-		Name:              "github-invalid",
-		URL:               site.URL,
-		GithubClientID:    "configured-client-id",
-		GithubUserSession: "dead-session",
-	}, authorize.URL, "")
+	result := checkTabiAICookie(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
+		Name: "revoked", URL: site.URL, Cookie: "new_api_refresh=sid.old",
+	}, "")
 	if result.State != cookieTestStateInvalid {
+		t.Fatalf("state = %q", result.State)
+	}
+	if !strings.Contains(result.Message, "会话已被撤销") {
+		t.Fatalf("应指明会话被撤销: %q", result.Message)
+	}
+	if result.retryable {
+		t.Fatal("凭据问题不该换代理重试")
+	}
+}
+
+func TestCheckTabiAICookieUnauthorizedIsInvalid(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":"AUTH_UNAUTHORIZED","message":"access token 无效","success":false}`))
+	}))
+	defer site.Close()
+
+	result := checkTabiAICookie(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
+		Name: "expired", URL: site.URL, Cookie: "new_api_refresh=sid.x",
+	}, "")
+	if result.State != cookieTestStateInvalid || !strings.Contains(result.Message, "凭据已失效") {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
 }
 
-func TestCheckGithubCookieLoadsClientIDFromSiteStatus(t *testing.T) {
-	var stateCalls atomic.Int32
-	var statusCalls atomic.Int32
+func TestCheckTabiAICookieChallengeIsRetryable(t *testing.T) {
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case cookieTestOAuthStatePath:
-			stateCalls.Add(1)
-			if r.Method != http.MethodPost {
-				t.Fatalf("state method = %s", r.Method)
-			}
-			if got := r.Header.Get("Content-Type"); got != "application/json" {
-				t.Fatalf("state content type = %q", got)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"success": true,
-				"data":    map[string]any{"flow_token": "site-state"},
-			})
-		case cookieTestStatusPath:
-			statusCalls.Add(1)
-			if r.Method != http.MethodGet {
-				t.Fatalf("status method = %s", r.Method)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"success": true,
-				"data":    map[string]any{"github_client_id": "site-client-id"},
-			})
-		default:
-			http.NotFound(w, r)
-		}
+		w.Header().Set("Server", "cloudflare")
+		w.Header().Set("Cf-Ray", "ray")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("<html><title>Just a moment...</title>__cf_chl</html>"))
 	}))
 	defer site.Close()
 
-	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("client_id") != "site-client-id" {
-			t.Fatalf("client_id = %q", r.URL.Query().Get("client_id"))
-		}
-		if r.URL.Query().Get("state") != "site-state" {
-			t.Fatalf("state = %q", r.URL.Query().Get("state"))
-		}
-		w.Header().Set("Location", "https://example.test/oauth/callback?code=site-code")
-		w.WriteHeader(http.StatusFound)
-	}))
-	defer authorize.Close()
-
-	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
-		Name:              "github-status-client-id",
-		URL:               site.URL,
-		GithubUserSession: "github-session",
-	}, authorize.URL, "")
-	if result.State != cookieTestStateValid {
-		t.Fatalf("state = %q, message = %q", result.State, result.Message)
-	}
-	if stateCalls.Load() != 1 || statusCalls.Load() != 1 {
-		t.Fatalf("calls = state:%d status:%d", stateCalls.Load(), statusCalls.Load())
+	result := checkTabiAICookie(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
+		Name: "blocked", URL: site.URL, Cookie: "new_api_refresh=sid.x",
+	}, "")
+	if !result.retryable || result.State != cookieTestStateAbnormal {
+		t.Fatalf("CDN 拦截应判为可重试的链路问题: state=%q retryable=%v", result.State, result.retryable)
 	}
 }
 
-func TestCheckGithubCookieMissingClientIDIsAbnormal(t *testing.T) {
+func TestCheckTabiAICookieMissingAccessTokenIsAbnormal(t *testing.T) {
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case cookieTestOAuthStatePath:
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"success": true,
-				"data":    map[string]any{"flow_token": "site-state"},
-			})
-		case cookieTestStatusPath:
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"success": true,
-				"data":    map[string]any{"github_oauth": true},
-			})
-		default:
-			http.NotFound(w, r)
-		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data":    map[string]any{"user": map[string]any{"id": 1}},
+		})
 	}))
 	defer site.Close()
-	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("authorize 不应在缺少 client_id 时被调用")
-	}))
-	defer authorize.Close()
 
-	result := checkGithubCookieWithAuthorizeURL(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
-		Name:              "github-no-client-id",
-		URL:               site.URL,
-		GithubUserSession: "github-session",
-	}, authorize.URL, "")
-	if result.State != cookieTestStateAbnormal || !strings.Contains(result.Message, "github_client_id") {
+	result := checkTabiAICookie(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
+		Name: "no-token", URL: site.URL, Cookie: "new_api_refresh=sid.x",
+	}, "")
+	if result.State != cookieTestStateAbnormal || !strings.Contains(result.Message, "access_token") {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
 }
@@ -338,7 +287,7 @@ func TestCookieTestEndpointsKeepModesSeparate(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Accounts = []Account{
 		{Name: "newapi-account", URL: "http://127.0.0.1:1", LoginMethod: LoginMethodNewAPICookie, Enabled: true},
-		{Name: "github-account", URL: "http://127.0.0.1:1", LoginMethod: LoginMethodGitHubCookie, Enabled: true},
+		{Name: "tabiai-account", URL: "http://127.0.0.1:1", LoginMethod: LoginMethodTabiAI, Enabled: true},
 	}
 	if _, err := SaveConfig(srv.db, cfg); err != nil {
 		t.Fatalf("SaveConfig: %v", err)
@@ -351,7 +300,7 @@ func TestCookieTestEndpointsKeepModesSeparate(t *testing.T) {
 		name string
 	}{
 		{"/api/cookie-tests/newapi", LoginMethodNewAPICookie, "newapi-account"},
-		{"/api/cookie-tests/github", LoginMethodGitHubCookie, "github-account"},
+		{"/api/cookie-tests/tabiai", LoginMethodTabiAI, "tabiai-account"},
 	} {
 		start := doReq(t, srv, http.MethodPost, tc.path, token, map[string]any{"account_names": []string{}})
 		if start.Code != http.StatusOK {

@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"strings"
@@ -46,8 +47,10 @@ type CookieTestStatus struct {
 
 // CookieTestRunner 后台检测任务，仿 ProxyManager 的 running/progress 模式。
 type CookieTestRunner struct {
-	mu         sync.RWMutex
-	pm         *ProxyManager
+	mu sync.RWMutex
+	pm *ProxyManager
+	// db 用于把 TaBiAI 轮转出的新 refresh cookie 写回配置；为 nil 时只检测不落库（测试用）
+	db         *sql.DB
 	running    bool
 	stopped    bool
 	mode       string
@@ -59,8 +62,8 @@ type CookieTestRunner struct {
 	cancel     context.CancelFunc
 }
 
-func NewCookieTestRunner(pm *ProxyManager) *CookieTestRunner {
-	return &CookieTestRunner{pm: pm}
+func NewCookieTestRunner(pm *ProxyManager, db *sql.DB) *CookieTestRunner {
+	return &CookieTestRunner{pm: pm, db: db}
 }
 
 func (r *CookieTestRunner) IsRunning() bool {
@@ -197,6 +200,11 @@ func (r *CookieTestRunner) loop(ctx context.Context, cfg *Config, mode string, t
 			if hasOwnProxy(round[i]) && result.retryable {
 				ownProxyFails[index]++
 			}
+			// TaBiAI 的 refresh 一定会轮转凭据：站点下发了新代次就必须立刻落库，
+			// 否则下一次（签到或检测）用旧代会被判重放，整条会话会被撤销。
+			if result.rotatedCookie != "" {
+				r.persistRotatedCookie(round[i].Name, result.rotatedCookie, &result)
+			}
 			// 被取消时不写终态，交给收尾统一处理成 skipped
 			if ctx.Err() != nil && result.State == cookieTestStateSkipped {
 				r.updateRow(index, func(row *CookieTestResult) {
@@ -227,6 +235,26 @@ func (r *CookieTestRunner) loop(ctx context.Context, cfg *Config, mode string, t
 // hasOwnProxy 账号是否显式配置了自己的代理。
 func hasOwnProxy(account Account) bool {
 	return account.Proxy != nil && strings.TrimSpace(*account.Proxy) != ""
+}
+
+// persistRotatedCookie 把 refresh 轮转出的新凭据定点写回配置。
+// 写入按账号名精确更新且全局串行（见 updateAccountCookie），不整份覆盖，
+// 因此多个账号并发检测时不会互相踩掉对方的新值。
+func (r *CookieTestRunner) persistRotatedCookie(name, cookie string, result *CookieTestResult) {
+	if r.db == nil {
+		return
+	}
+	found, err := updateAccountCookie(r.db, name, cookie)
+	switch {
+	case err != nil:
+		log.Printf("[cookie-test] 账号 %q 的新 refresh cookie 落库失败: %v", name, err)
+		result.Message += "（警告：新凭据未能保存，下次检测可能失败，请重新签发）"
+	case !found:
+		log.Printf("[cookie-test] 账号 %q 已不在配置中，跳过写回新 refresh cookie", name)
+	default:
+		log.Printf("[cookie-test] 账号 %q 的 refresh cookie 已轮转并保存", name)
+		result.Message += "（凭据已轮转，新值已自动保存）"
+	}
 }
 
 // beginRound 轮次自增，并把本轮要跑的账号标成 running。

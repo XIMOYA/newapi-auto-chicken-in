@@ -78,6 +78,8 @@ class AccountSession:
     checkin_path: Optional[str] = None
     user_id: Optional[int] = None
     cf: Optional[CFSession] = None
+    # TaBiAI 的 new_api_refresh 会按代次轮转，必须逐轮持久化，否则下次用旧代会被判重放
+    refresh_cookie: Optional[str] = None
 
     def to_dict(self) -> dict:
         out: dict = {}
@@ -85,6 +87,8 @@ class AccountSession:
             out["checkin_path"] = self.checkin_path
         if self.user_id is not None:
             out["user_id"] = self.user_id
+        if self.refresh_cookie:
+            out["refresh_cookie"] = self.refresh_cookie
         if self.cf is not None:
             out["cf"] = self.cf.to_dict()
         return out
@@ -101,6 +105,7 @@ class AccountSession:
             checkin_path=raw.get("checkin_path") or None,
             user_id=uid,
             cf=CFSession.from_dict(cf_raw) if isinstance(cf_raw, dict) else None,
+            refresh_cookie=raw.get("refresh_cookie") or None,
         )
 
 
@@ -168,6 +173,23 @@ class SessionStore:
             if user_id is not None and record.user_id != user_id:
                 record.user_id = user_id
                 self._dirty = True
+
+    def remember_refresh_cookie(self, slug: str, cookie: str) -> None:
+        """记住 TaBiAI 轮转后的新凭据并**立即落盘**。
+
+        不走 flush_throttled：refresh 的旧代次一旦被判重放会撤销整条会话，
+        节流期间进程被杀就等于丢了一代，代价远大于一次多余的写盘。
+        """
+        value = (cookie or "").strip()
+        if not value:
+            return
+        with self._lock:
+            record = self.get(slug)
+            if record.refresh_cookie == value:
+                return
+            record.refresh_cookie = value
+            self._dirty = True
+        self.flush()
 
     def flush_throttled(self) -> bool:
         """节流落盘：距上次成功写盘不足 THROTTLE_SECONDS 就先攒着。

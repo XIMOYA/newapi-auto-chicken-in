@@ -115,6 +115,29 @@ def test_merge_remote_keeps_local_when_missing_and_applies_empty_arrays():
     assert merged["security"] == {"encryption_enabled": True}
 
 
+def test_merge_never_overwrites_local_tabiai_section():
+    """tabiai.cdp_url 指向本机 Chrome 调试端口，远端下发不能把它改坏。"""
+    local = {
+        "accounts": [],
+        "tabiai": {"enabled": True, "cdp_url": "http://127.0.0.1:9222"},
+    }
+    merged = _merge_payload(local, {
+        "accounts": [],
+        "tabiai": {"enabled": False, "cdp_url": "http://10.0.0.1:9222"},
+    })
+    assert merged["tabiai"] == {"enabled": True, "cdp_url": "http://127.0.0.1:9222"}
+
+
+def test_missing_tabiai_is_not_reported_as_missing_module():
+    """远端本来就不管 tabiai，不该每次同步都刷一条无意义告警。"""
+    from newapi_checkin.remote_sync import _missing_modules
+
+    local = {"accounts": [], "tabiai": {"enabled": True}, "proxy_pool": {"enabled": True}}
+    missing = _missing_modules(local, {"accounts": []})
+    assert "tabiai" not in missing
+    assert "proxy_pool" in missing
+
+
 def test_sync_sends_token_and_post_body(tmp_path, monkeypatch):
     path = tmp_path / "config.json"
     sync = {

@@ -17,6 +17,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -101,7 +102,8 @@ func createSchema(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS config (
 			id         INTEGER PRIMARY KEY CHECK (id = ` + fmt.Sprint(configRowID) + `),
 			data       TEXT NOT NULL,
-			updated_at TEXT NOT NULL
+			updated_at TEXT NOT NULL,
+			revision   INTEGER NOT NULL DEFAULT 0
 		)`,
 	}
 	for _, st := range stmts {
@@ -109,8 +111,39 @@ func createSchema(db *sql.DB) error {
 			return fmt.Errorf("建表失败: %w", err)
 		}
 	}
+	if err := migrateConfigRevisionColumn(db); err != nil {
+		return err
+	}
 	if err := createProxiesTable(db); err != nil {
 		return err
+	}
+	return nil
+}
+
+// migrateConfigRevisionColumn 老库补 config.revision 列（幂等）。
+// revision 是乐观锁版本号：updated_at 只有秒级精度，同一秒内的两次保存无法区分，
+// 因此并发控制必须用单调递增的整数而不是时间戳。
+func migrateConfigRevisionColumn(db *sql.DB) error {
+	cols, err := db.Query(`PRAGMA table_info(config)`)
+	if err != nil {
+		return nil // 查不到表信息时交由后续语句报错，不在这里阻断启动
+	}
+	hasRevision := false
+	for cols.Next() {
+		var cid int
+		var cname, ctype string
+		var notnull, pk int
+		var dflt any
+		if cols.Scan(&cid, &cname, &ctype, &notnull, &dflt, &pk) == nil && cname == "revision" {
+			hasRevision = true
+		}
+	}
+	cols.Close()
+	if hasRevision {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE config ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("迁移 config.revision 列失败: %w", err)
 	}
 	return nil
 }
@@ -304,6 +337,14 @@ func MigrateConfig(db *sql.DB) error {
 			cfg.Accounts[i].LoginMethod = LoginMethodNewAPICookie
 			changed = append(changed, fmt.Sprintf("accounts[%d].login_method -> %s", i, LoginMethodNewAPICookie))
 		}
+		// v3：GitHub OAuth 不再是登录方式。这类账号本就是 TaBiAI 站点，改判为 tabiai；
+		// 保留 github_user_session，用户可用「签发 cookie」小工具一键取回 new_api_refresh。
+		if strings.EqualFold(strings.TrimSpace(cfg.Accounts[i].LoginMethod), legacyLoginMethodGitHubCookie) {
+			cfg.Accounts[i].LoginMethod = LoginMethodTabiAI
+			changed = append(changed, fmt.Sprintf(
+				"accounts[%d].login_method %s -> %s（需要签发一次 new_api_refresh）",
+				i, legacyLoginMethodGitHubCookie, LoginMethodTabiAI))
+		}
 	}
 	cfg.ConfigVersion = currentConfigVersion
 	if _, err := SaveConfig(db, cfg); err != nil {
@@ -315,22 +356,57 @@ func MigrateConfig(db *sql.DB) error {
 	return nil
 }
 
+// SanitizeConfigSecrets 清理库里遗留的 "***" 字面量敏感字段（每次启动都跑，幂等）。
+//
+// 早期 UnmaskConfig 在账号改名后找不到旧值时会把占位符原样落库，结果界面继续显示
+// 「已设置」而签到实际拿 "***" 当凭据，属于静默数据损坏。这里把它们清空，让界面
+// 如实显示「未设置」，提醒用户重新填写。无需清理时不写库。
+//
+// 不放进 MigrateConfig 是因为后者有配置版本门槛，已升到当前版本的库不会再执行，
+// 而损坏数据与配置版本无关。
+func SanitizeConfigSecrets(db *sql.DB) error {
+	cfg, _, err := LoadConfig(db)
+	if err != nil {
+		return err
+	}
+	cleaned := SanitizeMaskLeftovers(&cfg)
+	if len(cleaned) == 0 {
+		return nil
+	}
+	if _, err := SaveConfig(db, cfg); err != nil {
+		return err
+	}
+	log.Printf("[config] 已清理遗留的占位符敏感字段（需要重新填写）: %s", strings.Join(cleaned, "、"))
+	return nil
+}
+
 // LoadConfig 读取当前配置与其更新时间（RFC3339 字符串）。
 func LoadConfig(db *sql.DB) (Config, string, error) {
+	cfg, updatedAt, _, err := LoadConfigWithRevision(db)
+	return cfg, updatedAt, err
+}
+
+// LoadConfigWithRevision 额外返回乐观锁版本号，供 PUT /api/config 做冲突检测。
+func LoadConfigWithRevision(db *sql.DB) (Config, string, int64, error) {
 	var data, updatedAt string
-	err := db.QueryRow(`SELECT data, updated_at FROM config WHERE id = ?`, configRowID).
-		Scan(&data, &updatedAt)
+	var revision int64
+	err := db.QueryRow(`SELECT data, updated_at, revision FROM config WHERE id = ?`, configRowID).
+		Scan(&data, &updatedAt, &revision)
 	if err != nil {
-		return Config{}, "", fmt.Errorf("读取配置: %w", err)
+		return Config{}, "", 0, fmt.Errorf("读取配置: %w", err)
 	}
 	var cfg Config
 	if err := json.Unmarshal([]byte(data), &cfg); err != nil {
-		return Config{}, "", fmt.Errorf("解析配置 JSON: %w", err)
+		return Config{}, "", 0, fmt.Errorf("解析配置 JSON: %w", err)
 	}
-	return cfg, updatedAt, nil
+	return cfg, updatedAt, revision, nil
 }
 
-// SaveConfig 以「完整替换」方式写入配置（单行 id=1），返回新的 updated_at。
+// ErrConfigRevisionConflict 期望版本与库中当前版本不一致：调用方应转 409 并让用户重新加载。
+var ErrConfigRevisionConflict = errors.New("配置已被他人修改")
+
+// SaveConfig 以「完整替换」方式无条件写入配置（单行 id=1），返回新的 updated_at。
+// 供迁移、导入与测试使用；来自 Web 的保存走 SaveConfigIfMatch 以获得并发保护。
 func SaveConfig(db *sql.DB, cfg Config) (string, error) {
 	data, err := json.Marshal(cfg)
 	if err != nil {
@@ -338,12 +414,39 @@ func SaveConfig(db *sql.DB, cfg Config) (string, error) {
 	}
 	updatedAt := time.Now().UTC().Format(time.RFC3339)
 	_, err = db.Exec(
-		`INSERT INTO config (id, data, updated_at) VALUES (?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`,
+		`INSERT INTO config (id, data, updated_at, revision) VALUES (?, ?, ?, 1)
+		 ON CONFLICT(id) DO UPDATE SET data = excluded.data,
+		   updated_at = excluded.updated_at, revision = config.revision + 1`,
 		configRowID, string(data), updatedAt,
 	)
 	if err != nil {
 		return "", fmt.Errorf("保存配置: %w", err)
 	}
 	return updatedAt, nil
+}
+
+// SaveConfigIfMatch 仅当库中 revision 等于 expected 时写入（乐观锁）。
+// 版本不匹配返回 ErrConfigRevisionConflict，调用方据此返回 409 并回传最新配置。
+func SaveConfigIfMatch(db *sql.DB, cfg Config, expected int64) (string, int64, error) {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return "", 0, fmt.Errorf("序列化配置: %w", err)
+	}
+	updatedAt := time.Now().UTC().Format(time.RFC3339)
+	res, err := db.Exec(
+		`UPDATE config SET data = ?, updated_at = ?, revision = revision + 1
+		 WHERE id = ? AND revision = ?`,
+		string(data), updatedAt, configRowID, expected,
+	)
+	if err != nil {
+		return "", 0, fmt.Errorf("保存配置: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return "", 0, fmt.Errorf("保存配置: %w", err)
+	}
+	if affected == 0 {
+		return "", 0, ErrConfigRevisionConflict
+	}
+	return updatedAt, expected + 1, nil
 }

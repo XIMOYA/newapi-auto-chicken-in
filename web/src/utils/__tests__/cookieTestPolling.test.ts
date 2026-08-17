@@ -16,7 +16,7 @@ function status(partial: Partial<CookieTestStatus> = {}): CookieTestStatus {
   return {
     running: false,
     stopped: false,
-    mode: 'github_cookie',
+    mode: 'tabiai',
     round: 0,
     started_at: '',
     checked_at: '',
@@ -29,7 +29,7 @@ function status(partial: Partial<CookieTestStatus> = {}): CookieTestStatus {
 }
 
 function snapshot(partial: Partial<CookieTestSnapshot> = {}): CookieTestSnapshot {
-  return { running: false, stopped: false, mode: 'github_cookie', round: 0, settled: 0, total: 0, ...partial }
+  return { running: false, stopped: false, mode: 'tabiai', round: 0, settled: 0, total: 0, ...partial }
 }
 
 describe('snapshotFromStatus', () => {
@@ -87,27 +87,27 @@ describe('justFinished', () => {
 
 describe('isBusyWithOtherMode', () => {
   it('无快照或未运行 -> 不占用', () => {
-    expect(isBusyWithOtherMode(null, 'github_cookie')).toBe(false)
-    expect(isBusyWithOtherMode(snapshot({ running: false }), 'github_cookie')).toBe(false)
+    expect(isBusyWithOtherMode(null, 'tabiai')).toBe(false)
+    expect(isBusyWithOtherMode(snapshot({ running: false }), 'tabiai')).toBe(false)
   })
 
   it('同模式在跑 -> 不算被别人占用', () => {
-    expect(isBusyWithOtherMode(snapshot({ running: true, mode: 'github_cookie' }), 'github_cookie')).toBe(false)
+    expect(isBusyWithOtherMode(snapshot({ running: true, mode: 'tabiai' }), 'tabiai')).toBe(false)
   })
 
   it('另一模式在跑 -> 占用', () => {
-    expect(isBusyWithOtherMode(snapshot({ running: true, mode: 'newapi_cookie' }), 'github_cookie')).toBe(true)
+    expect(isBusyWithOtherMode(snapshot({ running: true, mode: 'newapi_cookie' }), 'tabiai')).toBe(true)
   })
 
   it('运行中但 mode 为空 -> 不误判', () => {
-    expect(isBusyWithOtherMode(snapshot({ running: true, mode: '' }), 'github_cookie')).toBe(false)
+    expect(isBusyWithOtherMode(snapshot({ running: true, mode: '' }), 'tabiai')).toBe(false)
   })
 })
 
 describe('belongsToMode', () => {
   it('模式一致才归属本 Tab', () => {
-    expect(belongsToMode(snapshot({ mode: 'github_cookie' }), 'github_cookie')).toBe(true)
-    expect(belongsToMode(snapshot({ mode: 'newapi_cookie' }), 'github_cookie')).toBe(false)
-    expect(belongsToMode(null, 'github_cookie')).toBe(false)
+    expect(belongsToMode(snapshot({ mode: 'tabiai' }), 'tabiai')).toBe(true)
+    expect(belongsToMode(snapshot({ mode: 'newapi_cookie' }), 'tabiai')).toBe(false)
+    expect(belongsToMode(null, 'tabiai')).toBe(false)
   })
 })

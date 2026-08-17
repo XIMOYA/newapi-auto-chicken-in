@@ -2,9 +2,14 @@
 web/src/views/CookieTestsView.vue
 页面：Cookie 可用性测试
 职责：
-- 站点 Cookie 与 GitHub OAuth 使用两个独立 Tab；后端同一时刻只跑一个任务
+- 站点 Cookie 与 TaBiAI 凭据使用两个独立 Tab；后端同一时刻只跑一个任务
 - 检测在服务端后台执行，本页每 2s 轮询进度，可手动停止
 - 代理类失败由服务端换代理无限重试，只做凭据可用性检查，不执行真正签到
+数据来源：
+- POST /api/cookie-tests/newapi
+- POST /api/cookie-tests/tabiai
+- GET  /api/cookie-tests/status
+- POST /api/cookie-tests/stop
 -->
 <template>
   <div class="page-container cookie-tests-page">
@@ -43,31 +48,31 @@ web/src/views/CookieTestsView.vue
         />
       </n-tab-pane>
 
-      <n-tab-pane name="github_cookie" tab="GitHub OAuth">
+      <n-tab-pane name="tabiai" tab="TaBiAI 凭据">
         <div class="tab-summary">
           <n-space :size="8" align="center">
-            <n-tag size="small" type="info" :bordered="false">可检测 {{ githubAccounts.length }} 个启用账号</n-tag>
-            <template v-if="githubSummary">
-              <n-tag size="small" type="success" :bordered="false">有效 {{ githubSummary.valid }}</n-tag>
-              <n-tag size="small" type="error" :bordered="false">失效 {{ githubSummary.invalid }}</n-tag>
-              <n-tag size="small" type="warning" :bordered="false">异常 {{ githubSummary.abnormal }}</n-tag>
-              <n-tag v-if="githubSummary.skipped" size="small" :bordered="false">跳过 {{ githubSummary.skipped }}</n-tag>
-              <span v-if="githubCheckedAt" class="checked-at">上次检测：{{ formatTime(githubCheckedAt) }}</span>
+            <n-tag size="small" type="info" :bordered="false">可检测 {{ tabiaiAccounts.length }} 个启用账号</n-tag>
+            <template v-if="tabiaiSummary">
+              <n-tag size="small" type="success" :bordered="false">有效 {{ tabiaiSummary.valid }}</n-tag>
+              <n-tag size="small" type="error" :bordered="false">失效 {{ tabiaiSummary.invalid }}</n-tag>
+              <n-tag size="small" type="warning" :bordered="false">异常 {{ tabiaiSummary.abnormal }}</n-tag>
+              <n-tag v-if="tabiaiSummary.skipped" size="small" :bordered="false">跳过 {{ tabiaiSummary.skipped }}</n-tag>
+              <span v-if="tabiaiCheckedAt" class="checked-at">上次检测：{{ formatTime(tabiaiCheckedAt) }}</span>
             </template>
           </n-space>
         </div>
         <cookie-test-panel
-          mode="github_cookie"
-          :accounts="githubAccounts"
-          :results="githubResults"
-          :loading="starting === 'github_cookie'"
-          :running="runningMode === 'github_cookie'"
+          mode="tabiai"
+          :accounts="tabiaiAccounts"
+          :results="tabiaiResults"
+          :loading="starting === 'tabiai'"
+          :running="runningMode === 'tabiai'"
           :stopping="stopping"
-          :busy="busyWith('github_cookie')"
-          :round="runningMode === 'github_cookie' ? round : 0"
-          :settled="githubSettled"
-          :total="githubTotal"
-          @run="runGithubTest"
+          :busy="busyWith('tabiai')"
+          :round="runningMode === 'tabiai' ? round : 0"
+          :settled="tabiaiSettled"
+          :total="tabiaiTotal"
+          @run="runTabiAITest"
           @stop="handleStop"
         />
       </n-tab-pane>
@@ -81,8 +86,8 @@ import { NAlert, NSpace, NTabPane, NTabs, NTag, useMessage } from 'naive-ui'
 import CookieTestPanel from '@/components/CookieTestPanel.vue'
 import {
   getCookieTestStatus,
-  startGithubCookieTest,
   startNewAPICookieTest,
+  startTabiAICookieTest,
   stopCookieTest
 } from '@/api/cookieTests'
 import { useConfigStore } from '@/stores/config'
@@ -107,11 +112,11 @@ const stopping = ref(false)
 
 // 后端只有一个任务，这里按模式分别缓存最近一次结果，切 Tab 不会互相覆盖
 const newapiResults = ref<CookieTestResult[]>([])
-const githubResults = ref<CookieTestResult[]>([])
+const tabiaiResults = ref<CookieTestResult[]>([])
 const newapiSummary = ref<CookieTestSummary | null>(null)
-const githubSummary = ref<CookieTestSummary | null>(null)
+const tabiaiSummary = ref<CookieTestSummary | null>(null)
 const newapiCheckedAt = ref('')
-const githubCheckedAt = ref('')
+const tabiaiCheckedAt = ref('')
 
 const snapshot = ref<CookieTestSnapshot | null>(null)
 const round = ref(0)
@@ -119,16 +124,16 @@ let prevSnapshot: CookieTestSnapshot | null = null
 let timer: ReturnType<typeof setInterval> | null = null
 
 const accounts = computed<Account[]>(() => configStore.config?.accounts ?? [])
-const newapiAccounts = computed(() => accounts.value.filter((a) => a.enabled && a.login_method !== 'github_cookie'))
-const githubAccounts = computed(() => accounts.value.filter((a) => a.enabled && a.login_method === 'github_cookie'))
+const newapiAccounts = computed(() => accounts.value.filter((a) => a.enabled && a.login_method !== 'tabiai'))
+const tabiaiAccounts = computed(() => accounts.value.filter((a) => a.enabled && a.login_method === 'tabiai'))
 
 const runningMode = computed<CookieTestMode | ''>(() =>
   snapshot.value?.running ? (snapshot.value.mode as CookieTestMode) : ''
 )
 const newapiSettled = computed(() => settledOf('newapi_cookie', newapiSummary.value))
-const githubSettled = computed(() => settledOf('github_cookie', githubSummary.value))
+const tabiaiSettled = computed(() => settledOf('tabiai', tabiaiSummary.value))
 const newapiTotal = computed(() => newapiSummary.value?.total ?? newapiAccounts.value.length)
-const githubTotal = computed(() => githubSummary.value?.total ?? githubAccounts.value.length)
+const tabiaiTotal = computed(() => tabiaiSummary.value?.total ?? tabiaiAccounts.value.length)
 
 function settledOf(mode: CookieTestMode, summary: CookieTestSummary | null) {
   if (runningMode.value === mode && snapshot.value) return snapshot.value.settled
@@ -157,16 +162,16 @@ function applyStatus(status: CookieTestStatus) {
     newapiResults.value = status.results
     newapiSummary.value = status.summary
     if (status.checked_at) newapiCheckedAt.value = status.checked_at
-  } else if (belongsToMode(next, 'github_cookie')) {
-    githubResults.value = status.results
-    githubSummary.value = status.summary
-    if (status.checked_at) githubCheckedAt.value = status.checked_at
+  } else if (belongsToMode(next, 'tabiai')) {
+    tabiaiResults.value = status.results
+    tabiaiSummary.value = status.summary
+    if (status.checked_at) tabiaiCheckedAt.value = status.checked_at
   }
 
   if (justFinished(prevSnapshot, next)) {
     stopPolling()
     stopping.value = false
-    const label = next.mode === 'github_cookie' ? 'GitHub OAuth' : '站点 Cookie'
+    const label = next.mode === 'tabiai' ? 'TaBiAI 凭据' : '站点 Cookie'
     const { valid, invalid, abnormal, skipped } = status.summary
     const extra = skipped ? `，跳过 ${skipped}` : ''
     const prefix = next.stopped ? `${label}检测已停止` : `${label}检测完成`
@@ -200,8 +205,8 @@ function stopPolling() {
 async function start(mode: CookieTestMode, accountNames: string[]) {
   starting.value = mode
   try {
-    if (mode === 'github_cookie') {
-      await startGithubCookieTest(accountNames)
+    if (mode === 'tabiai') {
+      await startTabiAICookieTest(accountNames)
     } else {
       await startNewAPICookieTest(accountNames)
     }
@@ -220,8 +225,8 @@ function runNewAPITest(accountNames: string[]) {
   void start('newapi_cookie', accountNames)
 }
 
-function runGithubTest(accountNames: string[]) {
-  void start('github_cookie', accountNames)
+function runTabiAITest(accountNames: string[]) {
+  void start('tabiai', accountNames)
 }
 
 async function handleStop() {
@@ -240,7 +245,7 @@ onMounted(async () => {
   await pollOnce()
   if (snapshot.value?.running) {
     prevSnapshot = snapshot.value
-    if (snapshot.value.mode === 'github_cookie' || snapshot.value.mode === 'newapi_cookie') {
+    if (snapshot.value.mode === 'tabiai' || snapshot.value.mode === 'newapi_cookie') {
       activeMode.value = snapshot.value.mode
     }
     startPolling()

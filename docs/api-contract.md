@@ -46,20 +46,24 @@
 ```json
 {
   "config": { "...完整配置对象，敏感字段打码..." },
-  "updated_at": "2026-08-12T10:00:00Z"
+  "updated_at": "2026-08-12T10:00:00Z",
+  "revision": 12
 }
 ```
 
 打码规则：
-- `accounts[].cookie`：NewAPI 登录 Cookie，非空时返回 `"***"`（值不返回，编辑时原样保留）
-- `accounts[].github_user_session`：GitHub `user_session`，非空时返回 `"***"`（值不返回，编辑时原样保留）
+- `accounts[].cookie`：站点登录 Cookie，非空时返回 `"***"`（值不返回，编辑时原样保留）
+- `accounts[].github_user_session`：GitHub `user_session`，非空时返回 `"***"`（值不返回，编辑时原样保留）；现仅用于签发 `new_api_refresh`
 - `accounts[].github_client_id`：OAuth Client ID，非敏感，正常返回
 - `ai.api_key`：非空时返回 `"***"`
 - `notify.email.password`：非空时返回 `"***"`
 - `config_sync.token`：非空时返回 `"***"`
+- `proxy_pool.remote_token`：Actions 预取令牌，等同 API Key，非空时返回 `"***"`
+- `security.config_key`：配置加密密钥，非空时返回 `"***"`
 - `proxy_pool.sources`：正常返回（非敏感）
 
 > 前端提交时，`"***"` 会被后端识别为「未修改，保留原值」，不覆盖。
+> `revision` 是乐观锁版本号，保存时必须原样带回（见 §4）。
 
 ## 4. 保存配置（管理端）
 
@@ -67,16 +71,37 @@
 
 请求体：
 ```json
-{ "config": { "...完整配置对象..." } }
+{ "config": { "...完整配置对象..." }, "revision": 12 }
 ```
+
+并发保护（乐观锁）：
+- 带 `revision` 时，只有它与库中当前版本一致才写入，写入后版本 +1
+- 版本不一致返回 **409**，说明期间有别人保存过；响应体直接带上最新配置，前端可原地接管
+- 不带 `revision` 时保持早期的无条件覆盖行为，仅为兼容既有外部脚本；**Web 端一定带**
+  （历史上正是"整份覆盖 + 无版本校验"导致多人操作时 Cookie 被陈旧快照静默清空）
 
 规则：
 - 后端把 `"***"` 占位符还原为旧值（深合并）
-- 校验：`accounts` 必须有 `name` / `url`；`login_method` 只能是 `newapi_cookie` 或 `github_cookie`，缺省按 `newapi_cookie` 处理；两种 Cookie 均可为空（实际运行时只检查当前登录方式对应字段）；`sites` 必须有 `name` / `url`；URL 需 http(s) 开头
+- 占位符**无法还原**时返回 400 而不是把 `"***"` 字面量落库。典型场景是账号改名：
+  还原按 `accounts[].name` 匹配，改名后找不到旧值，此时必须重新填写对应 Cookie
+- 校验：`accounts` 必须有 `name` / `url`；`login_method` 只能是 `newapi_cookie` 或 `tabiai`（旧值 `github_cookie` 自动归一化为 `tabiai`），缺省按 `newapi_cookie` 处理；凭据字段均可为空（实际运行时只检查当前登录方式对应字段）；`sites` 必须有 `name` / `url`；URL 需 http(s) 开头
+- `accounts[].name` 与 `sites[].name` **不可重复**（name 是敏感字段还原与导入合并的匹配键）
 - 校验通过才落库
 
-响应（200）：`{ "ok": true, "updated_at": "2026-08-12T10:00:00Z" }`
+响应（200）：`{ "ok": true, "updated_at": "2026-08-12T10:00:00Z", "revision": 13 }`
 错误（400）：`{ "error": "具体校验错误信息" }`
+错误（409）：
+```json
+{
+  "error": "配置已被他人修改，请重新载入最新版本后再提交",
+  "revision": 15,
+  "updated_at": "2026-08-12T10:05:00Z",
+  "config": { "...当前最新配置，敏感字段打码..." }
+}
+```
+
+> 启动时会自动清理库中遗留的 `"***"` 字面量敏感字段（早期还原缺陷的产物）并记日志；
+> 受影响字段在界面上显示为「未设置」，需要重新填写 —— 它们本来就已经不是有效凭据了。
 
 ## 5. 拉取配置（Actions 用，明文）
 
@@ -130,7 +155,7 @@
 
 ## 9. Cookie 可用性测试（JWT）
 
-站点 Cookie 与 GitHub OAuth 使用两个独立的**启动**接口，共用一个后台任务与一套状态/停止接口。前端只提交账号名称，后端从数据库读取明文凭据；响应不会返回 Cookie、token、OAuth state 或 code。
+站点 Cookie 与 TaBiAI 凭据使用两个独立的**启动**接口，共用一个后台任务与一套状态/停止接口。前端只提交账号名称，后端从数据库读取明文凭据；响应不会返回 Cookie 或 token。
 
 执行模型：
 - 启动接口立即返回，检测在服务端后台按**轮次**执行；同一时刻只允许一个任务，冲突返回 409
@@ -140,8 +165,8 @@
 - 手动停止后，仍未定论的账号写成 `skipped`，`message` 为「已手动停止（共尝试 N 次，最后失败：…）」
 
 失败分类（决定是否重试）：
-- **代理类（重试）**：连接/超时/TLS 等传输层错误；代理自身 407/502/504；非 JSON 响应；403/429/503 且带 `cloudflare`/`cf-ray`/`cdn-cgi` 特征或挑战页文案；GitHub authorize 返回 403/429
-- **源站类（终态）**：站点用合法 JSON 明确拒绝凭据（401/403）；站点 URL 无效；`OAuth state 成功但未返回 flow_token`；`站点状态未返回 github_client_id`；GitHub 重定向到 `/login`；GitHub 返回 `error`；GitHub authorize 返回 200（需先在 GitHub 授权该应用）
+- **代理类（重试）**：连接/超时/TLS 等传输层错误；代理自身 407/502/504；非 JSON 响应；403/429/503 且带 `cloudflare`/`cf-ray`/`cdn-cgi` 特征或挑战页文案
+- **源站类（终态）**：站点用合法 JSON 明确拒绝凭据（401/403）；站点 URL 无效
 
 ### 启动：站点 Cookie
 
@@ -154,24 +179,31 @@
 
 只检测 `login_method=newapi_cookie` 且启用的账号。`account_names` 为空数组时检测该类型的全部启用账号。普通 Cookie 请求 `/api/user/self`；包含 `new_api_refresh=` 时先执行 refresh，再用新凭据验证 self。
 
-### 启动：GitHub OAuth
+### 启动：TaBiAI 凭据
 
-`POST /api/cookie-tests/github`
+`POST /api/cookie-tests/tabiai`
 
-请求体格式与站点 Cookie 相同，但只检测 `login_method=github_cookie` 且启用的账号。检测流程（按 New API `v1.0.0-rc.23` 实测确认）：
+请求体格式与站点 Cookie 相同，但只检测 `login_method=tabiai` 且启用的账号。检测只做一件事：拿 `accounts[].cookie` 里的 `new_api_refresh` 去 `POST /api/user/auth/refresh`，看还能不能换出 access token。**不执行签到，不消耗 Turnstile 配额。**
 
-1. POST 站点 `/api/oauth/state`，请求体 `{"provider":"github","intent":"login"}` → 从 `data.flow_token` 取 state
-2. Client ID 取 `accounts[].github_client_id`，为空时 GET 站点 `/api/status` 读 `data.github_client_id`
-3. GET GitHub `/login/oauth/authorize?client_id=&scope=user:email&state=` → 从 302 取 OAuth code
+凭据为空时该账号直接判 `skipped`，`message` 为「缺少 TaBiAI 凭据（new_api_refresh），可用「签发 cookie」或从浏览器复制」。
 
-取得 code 后即结束，**不会调用站点 OAuth callback，也不会执行签到**；响应不会返回 code、state 或 Cookie。
+站点错误码到结论的映射（依据 `docs/签到原理.md` 实测）：
+
+| HTTP | `code` | 结论 | 说明 |
+|---|---|---|---|
+| 200 | — | 有效 | 换到了 access token |
+| 401/403 | `AUTH_SESSION_REVOKED` | 失效 | 整条会话已被撤销（旧代次重放或用户在别处登出），必须重新签发 |
+| 401/403 | `AUTH_UNAUTHORIZED` | 失效 | 当前代次失效：已过期，或被更新后的代次取代 |
+| ≥500 / 非 JSON | — | 代理类 | 计入重试，不判终态 |
+
+**代次轮转**：refresh 每次成功都会通过 `Set-Cookie` 下发下一代凭据。检测过程无论成功与否，只要响应里带了新代次就会立刻写回 `accounts[].cookie`——旧代次超出宽限窗口后再用会被判重放，进而撤销整条会话，所以不允许"检测完就丢掉新值"。
 
 两个启动接口的响应（200）：
 ```json
-{ "ok": true, "mode": "github_cookie", "started": true }
+{ "ok": true, "mode": "tabiai", "started": true }
 ```
 错误（409）：`{ "error": "已有 Cookie 检测任务在进行中" }`
-错误（400）：`{ "error": "没有匹配 github_cookie 的启用账号" }`
+错误（400）：`{ "error": "没有匹配 tabiai 的启用账号" }`
 
 ### 进度与结果
 
@@ -233,8 +265,67 @@
 ```
 
 - `newapi_cookie`：使用 `cookie`，沿用现有站点 Cookie + 浏览器/AI 过盾链路。
-- `github_cookie`：使用 `github_user_session` 走 GitHub OAuth（POST state → authorize → callback）；`github_client_id` 留空时从站点 `/api/status` 读取；站点质询仍复用浏览器/AI 过盾。
-- 可用性检查分开执行：`python main.py --cookie-test newapi_cookie` 或 `python main.py --cookie-test github_cookie`；检查命令不会执行真正签到回调。
+- `tabiai`：`cookie` 里存 `new_api_refresh` 的值（`sid.secret`，可带或不带 `new_api_refresh=` 前缀）。签到链路是 refresh 换 access token → 查当月状态 → 带 Turnstile token 签到；**该值会被每次 refresh 轮转覆盖**，见下方「TaBiAI 凭据轮转」。
+- `github_user_session` / `github_client_id`：GitHub OAuth 已不再是登录方式，这两个字段退化为「签发 `new_api_refresh` 的原料」——`POST /api/tabiai/issue-cookie` 用它们走一次 OAuth 帮账号换出凭据。字段本身保留，老配置可原样加载。
+- 旧值 `github_cookie` 由数据库迁移（config v3）自动改判为 `tabiai`，配置文件与环境变量两条入口也都会归一化，不会报错。
+- 可用性检查分开执行：`python main.py --cookie-test newapi_cookie` 或 `python main.py --cookie-test tabiai`（旧写法 `--cookie-test github_cookie` 仍可用，等价于 `tabiai`）；检查命令只做 refresh，不执行签到、不消耗 Turnstile 配额。
+
+## TaBiAI 凭据轮转（重要）
+
+`new_api_refresh` 有**代次轮转 + 重放检测**：每次 `POST /api/user/auth/refresh` 成功都会通过 `Set-Cookie` 下发下一代 secret。旧代次超出宽限窗口后再使用，会先返回 `AUTH_UNAUTHORIZED`；被判定为重放时整条会话直接撤销（`AUTH_SESSION_REVOKED`），只能重新签发。
+
+因此三端都必须做到「拿到新代次就立刻持久化」：
+
+- **Go 平台**：Cookie 检测拿到 `Set-Cookie` 后立即定点写回 `accounts[].cookie`（无论本次检测判定成功还是失败）
+- **Python 客户端**：refresh 成功后立刻写 `data/sessions.json`（不走节流落盘），随后尽力回写平台
+- **回写端点**：`POST /api/accounts/{name}/refresh-cookie`（API Key 认证），见下节
+
+平台与本机代次不一致时，谁先用旧代次谁就会失败。所以本机签到成功后必须让平台也拿到新值，否则网页端的凭据检测会紧接着报「已失效」。
+
+### 回写凭据
+
+`POST /api/accounts/{name}/refresh-cookie`（**API Key** 认证，不是 JWT）
+
+请求体：`{ "cookie": "new_api_refresh=sid.secret" }`
+
+响应（200）：`{ "ok": true }`
+错误（400）：`{ "error": "cookie 不能为空" }` / `{ "error": "cookie 不能是占位符" }`
+错误（404）：`{ "error": "账号不存在: <名字>" }`
+
+Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_sync.writeback_url` 显式指定（支持 `{name}` 占位符）。回写失败不影响本次签到（本地 `sessions.json` 已存新值），但会打警告提示平台仍持有旧代次。
+
+### 签发凭据
+
+`POST /api/tabiai/issue-cookie`（JWT）
+
+请求体：`{ "account_name": "TaBiAI" }`
+
+用账号里保存的 `github_user_session` 走三步 OAuth，为该账号签发一条全新的 `new_api_refresh` 并写入 `accounts[].cookie`。
+
+响应（200）：`{ "ok": true, "account_name": "TaBiAI" }`
+错误（400）：`{ "error": "该账号未填写 GitHub user_session，无法自动签发；请填写后重试，或直接从浏览器复制 new_api_refresh" }` 或 OAuth 过程中的具体错误
+错误（404）：`{ "error": "账号不存在: <名字>" }`
+
+## Turnstile 与 tabiai 配置段（仅 Python 客户端）
+
+签到接口 `POST /api/user/checkin?turnstile=<token>` 强校验 Turnstile，且**业务失败也返回 HTTP 200**，判定必须读 body 的 `success`。实测只有用户日常在用的真实 Chrome 能出 token，脚本新启的浏览器环境（含 patchright 补过指纹的）会被拒。因此客户端通过 CDP 接管已开着的 Chrome：
+
+```json
+"tabiai": {
+  "enabled": false,
+  "cdp_url": "http://127.0.0.1:9222",
+  "token_timeout": 120,
+  "token_interval_minutes": 21,
+  "keep_page": false
+}
+```
+
+- `enabled`：关闭时不取 token，遇到需要签到的账号直接报 `turnstile_required` 并说明原因
+- `cdp_url`：先用 `chrome --remote-debugging-port=9222` 启动并保持登录状态；客户端只新开一个标签页，取完就关，不动用户其它窗口，断开连接也不会杀掉浏览器进程
+- `token_interval_minutes`：站点对同一环境有频率限制（实测约 20 分钟内反复 reset 拿不到新 token），多账号必须串行 + 间隔，默认 21 分钟
+- `keep_page`：排查问题时保留标签页
+
+该段属于**机器级设置**（`cdp_url` 指向本机端口），因此和 `security` / `config_sync` 一样不参与远程配置合并，远端下发不会覆盖本地值。
 
 ## 配置对象默认结构（后端初始化时内置）
 

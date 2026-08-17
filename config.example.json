@@ -15,7 +15,8 @@
     "body": null,
     "response_field": "",
     "timeout": 20,
-    "auto_before_checkin": true
+    "auto_before_checkin": true,
+    "writeback_url": ""
   },
   "proxy_pool": {
     "enabled": false,
@@ -66,6 +67,13 @@
     "impersonate": "chrome",
     "timeout": 20
   },
+  "tabiai": {
+    "enabled": false,
+    "cdp_url": "http://127.0.0.1:9222",
+    "token_timeout": 120,
+    "token_interval_minutes": 21,
+    "keep_page": false
+  },
   "defaults": {
     "retry": 2,
     "interval_seconds": [3, 8]
@@ -91,6 +99,19 @@
       "checkin_path": null,
       "browser_path": "/dashboard",
       "enabled": true
+    },
+    {
+      "name": "TaBiAI",
+      "url": "https://tabitoken.com",
+      "login_method": "tabiai",
+      "cookie": "new_api_refresh=在浏览器 Application-Cookies 里复制 new_api_refresh 的值",
+      "github_user_session": "",
+      "github_client_id": "",
+      "user_id": null,
+      "proxy": null,
+      "checkin_path": null,
+      "browser_path": "/profile",
+      "enabled": false
     }
   ]
 }

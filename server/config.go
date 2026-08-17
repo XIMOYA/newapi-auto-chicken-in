@@ -20,11 +20,17 @@ const MaskPlaceholder = "***"
 
 const (
 	LoginMethodNewAPICookie = "newapi_cookie"
-	LoginMethodGitHubCookie = "github_cookie"
+	// LoginMethodTabiAI TaBiAI（New API 分支）：凭据是 new_api_refresh cookie，
+	// 走 POST /api/user/auth/refresh 换短期 access token，业务接口只认 Bearer。
+	LoginMethodTabiAI = "tabiai"
+
+	// legacyLoginMethodGitHubCookie 已废弃的 GitHub OAuth 登录方式，仅用于识别旧配置并迁移。
+	legacyLoginMethodGitHubCookie = "github_cookie"
 )
 
 // currentConfigVersion 用于一次性迁移旧默认值。旧配置没有该字段，视为 0。
-const currentConfigVersion = 2
+// v3：登录方式 github_cookie 并入 tabiai（GitHub OAuth 不再是登录方式）
+const currentConfigVersion = 3
 
 // Config 完整配置对象 = 契约文档中的顶层结构。
 type Config struct {
@@ -51,10 +57,14 @@ type Site struct {
 
 // Account 签到账号：name/url 为必填；两种 Cookie 均可暂不设置，其余字段可选。
 type Account struct {
-	Name              string  `json:"name"`
-	URL               string  `json:"url"`
-	LoginMethod       string  `json:"login_method"`
-	Cookie            string  `json:"cookie"`
+	Name        string `json:"name"`
+	URL         string `json:"url"`
+	LoginMethod string `json:"login_method"`
+	// Cookie 站点凭据。newapi_cookie 为完整 Cookie 头；
+	// tabiai 为 new_api_refresh 值（sid.secret，每次 refresh 后会被轮转覆盖）
+	Cookie string `json:"cookie"`
+	// GithubUserSession / GithubClientID 不再是登录凭据，
+	// 仅供「签发 TaBiAI cookie」小工具走 GitHub OAuth 三步时使用
 	GithubUserSession string  `json:"github_user_session"`
 	GithubClientID    string  `json:"github_client_id"`
 	UserID            *int64  `json:"user_id"`
@@ -248,7 +258,8 @@ func DefaultConfig() Config {
 
 // MaskConfig 返回敏感字段被替换为 "***" 的深拷贝配置（仅用于 GET /api/config）。
 // 打码字段：accounts[].cookie、accounts[].github_user_session、ai.api_key、
-// notify.email.password、config_sync.token；非空才打码，空值原样保留。
+// notify.email.password、config_sync.token、proxy_pool.remote_token、
+// security.config_key；非空才打码，空值原样保留。
 func MaskConfig(cfg *Config) *Config {
 	m := cloneConfig(cfg)
 	for i := range m.Accounts {
@@ -268,14 +279,24 @@ func MaskConfig(cfg *Config) *Config {
 	if m.ConfigSync.Token != "" {
 		m.ConfigSync.Token = MaskPlaceholder
 	}
+	// 代理池远程令牌等同 API Key，配置加密密钥更不能明文下发浏览器
+	if m.ProxyPool.RemoteToken != "" {
+		m.ProxyPool.RemoteToken = MaskPlaceholder
+	}
+	if m.Security.ConfigKey != "" {
+		m.Security.ConfigKey = MaskPlaceholder
+	}
 	return m
 }
 
 // UnmaskConfig 把输入配置中的 "***" 占位符还原为库中旧值（深合并）。
 // 规则：仅敏感字段值为 "***" 时保留旧值；其余字段一律以输入为准（含清空、新增、删除账号）。
-// 账号 cookie 按「账号名」匹配旧配置还原，避免前端调整账号顺序时按下标还原导致错位；
-// 旧配置中不存在的账号名（改名/新增场景）占位符保持原样，不做猜测性还原。
-func UnmaskConfig(in, old *Config) *Config {
+// 账号 cookie 按「账号名」匹配旧配置还原，避免前端调整账号顺序时按下标还原导致错位。
+//
+// 占位符在旧配置里找不到对应账号（典型是账号被改名）时**不再把 "***" 字面量落库**：
+// 那样界面会继续显示「已设置」，而签到实际拿着 "***" 当凭据用，属于静默数据损坏。
+// 这里直接返回可读错误，让调用方以 400 告诉用户重新填写。
+func UnmaskConfig(in, old *Config) (*Config, error) {
 	out := cloneConfig(in)
 
 	oldCookieByName := make(map[string]string, len(old.Accounts))
@@ -287,15 +308,22 @@ func UnmaskConfig(in, old *Config) *Config {
 		}
 	}
 	for i := range out.Accounts {
+		name := out.Accounts[i].Name
 		if out.Accounts[i].Cookie == MaskPlaceholder {
-			if c, ok := oldCookieByName[out.Accounts[i].Name]; ok {
-				out.Accounts[i].Cookie = c
+			c, ok := oldCookieByName[name]
+			if !ok {
+				return nil, fmt.Errorf(
+					"accounts[%d].cookie 无法还原：旧配置中没有名为 %q 的账号（账号改名后需要重新填写站点 Cookie）", i, name)
 			}
+			out.Accounts[i].Cookie = c
 		}
 		if out.Accounts[i].GithubUserSession == MaskPlaceholder {
-			if c, ok := oldGithubSessionByName[out.Accounts[i].Name]; ok {
-				out.Accounts[i].GithubUserSession = c
+			c, ok := oldGithubSessionByName[name]
+			if !ok {
+				return nil, fmt.Errorf(
+					"accounts[%d].github_user_session 无法还原：旧配置中没有名为 %q 的账号（账号改名后需要重新填写 GitHub Cookie）", i, name)
 			}
+			out.Accounts[i].GithubUserSession = c
 		}
 		if strings.TrimSpace(out.Accounts[i].LoginMethod) == "" {
 			out.Accounts[i].LoginMethod = LoginMethodNewAPICookie
@@ -311,7 +339,54 @@ func UnmaskConfig(in, old *Config) *Config {
 	if out.ConfigSync.Token == MaskPlaceholder {
 		out.ConfigSync.Token = old.ConfigSync.Token
 	}
-	return out
+	if out.ProxyPool.RemoteToken == MaskPlaceholder {
+		out.ProxyPool.RemoteToken = old.ProxyPool.RemoteToken
+	}
+	if out.Security.ConfigKey == MaskPlaceholder {
+		out.Security.ConfigKey = old.Security.ConfigKey
+	}
+	return out, nil
+}
+
+// SanitizeMaskLeftovers 清理历史遗留的 "***" 字面量。
+// "***" 不可能是真实凭据；它落库只可能来自早期版本的还原缺陷。留着会让界面显示
+// 「已设置」而签到静默失败，因此清空并返回被清理的字段路径，供启动迁移记日志。
+func SanitizeMaskLeftovers(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var cleaned []string
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].Cookie == MaskPlaceholder {
+			cfg.Accounts[i].Cookie = ""
+			cleaned = append(cleaned, fmt.Sprintf("accounts[%d].cookie", i))
+		}
+		if cfg.Accounts[i].GithubUserSession == MaskPlaceholder {
+			cfg.Accounts[i].GithubUserSession = ""
+			cleaned = append(cleaned, fmt.Sprintf("accounts[%d].github_user_session", i))
+		}
+	}
+	if cfg.AI.APIKey == MaskPlaceholder {
+		cfg.AI.APIKey = ""
+		cleaned = append(cleaned, "ai.api_key")
+	}
+	if cfg.Notify.Email.Password == MaskPlaceholder {
+		cfg.Notify.Email.Password = ""
+		cleaned = append(cleaned, "notify.email.password")
+	}
+	if cfg.ConfigSync.Token == MaskPlaceholder {
+		cfg.ConfigSync.Token = ""
+		cleaned = append(cleaned, "config_sync.token")
+	}
+	if cfg.ProxyPool.RemoteToken == MaskPlaceholder {
+		cfg.ProxyPool.RemoteToken = ""
+		cleaned = append(cleaned, "proxy_pool.remote_token")
+	}
+	if cfg.Security.ConfigKey == MaskPlaceholder {
+		cfg.Security.ConfigKey = ""
+		cleaned = append(cleaned, "security.config_key")
+	}
+	return cleaned
 }
 
 // cloneConfig 深拷贝配置，避免打码/还原逻辑修改到传入对象的共享内存。
@@ -388,11 +463,13 @@ func cloneConfig(c *Config) *Config {
 // - accounts 每个账号必须提供 name / url；cookie 可为空
 // - url 必须以 http:// 或 https:// 开头
 // - sites 每个站点必须提供 name / url
+// - accounts / sites 的 name 不可重复（name 是敏感字段还原与合并的匹配键）
 // 返回第一个错误信息（供 400 响应使用）。
 func ValidateConfig(cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config 不能为空")
 	}
+	accountNames := make(map[string]int, len(cfg.Accounts))
 	for i, a := range cfg.Accounts {
 		if strings.TrimSpace(a.Name) == "" {
 			return fmt.Errorf("accounts[%d].name 不能为空", i)
@@ -409,11 +486,17 @@ func ValidateConfig(cfg *Config) error {
 			method = LoginMethodNewAPICookie
 			cfg.Accounts[i].LoginMethod = method
 		}
-		if method != LoginMethodNewAPICookie && method != LoginMethodGitHubCookie {
+		if method != LoginMethodNewAPICookie && method != LoginMethodTabiAI {
 			return fmt.Errorf("accounts[%d].login_method 只能是 %s 或 %s", i,
-				LoginMethodNewAPICookie, LoginMethodGitHubCookie)
+				LoginMethodNewAPICookie, LoginMethodTabiAI)
 		}
+		if prev, dup := accountNames[a.Name]; dup {
+			return fmt.Errorf("accounts[%d].name 与 accounts[%d] 重复：%q（账号名用于匹配已保存的 Cookie，必须唯一）",
+				i, prev, a.Name)
+		}
+		accountNames[a.Name] = i
 	}
+	siteNames := make(map[string]int, len(cfg.Sites))
 	for i, s := range cfg.Sites {
 		if strings.TrimSpace(s.Name) == "" {
 			return fmt.Errorf("sites[%d].name 不能为空", i)
@@ -425,6 +508,11 @@ func ValidateConfig(cfg *Config) error {
 		if !strings.HasPrefix(lowerURL, "http://") && !strings.HasPrefix(lowerURL, "https://") {
 			return fmt.Errorf("sites[%d].url 必须以 http:// 或 https:// 开头", i)
 		}
+		if prev, dup := siteNames[s.Name]; dup {
+			return fmt.Errorf("sites[%d].name 与 sites[%d] 重复：%q（站点名用于导入合并，必须唯一）",
+				i, prev, s.Name)
+		}
+		siteNames[s.Name] = i
 	}
 	return nil
 }

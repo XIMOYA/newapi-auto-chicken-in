@@ -291,18 +291,21 @@ func TestUnmaskConfigByNameNotIndex(t *testing.T) {
 		{Name: "B", URL: "https://b.com", Cookie: MaskPlaceholder},
 		{Name: "A", URL: "https://a.com", Cookie: MaskPlaceholder},
 	}
-	out := UnmaskConfig(&in, &old)
+	out, err := UnmaskConfig(&in, &old)
+	if err != nil {
+		t.Fatalf("UnmaskConfig: %v", err)
+	}
 	if out.Accounts[0].Cookie != "cookie-b" {
 		t.Errorf("B 的 cookie 未按名还原: %q", out.Accounts[0].Cookie)
 	}
 	if out.Accounts[1].Cookie != "cookie-a" {
 		t.Errorf("A 的 cookie 未按名还原: %q", out.Accounts[1].Cookie)
 	}
-	// 旧配置不存在的账号名（改名/新增）：占位符保持原样，不做猜测性还原
+	// 旧配置不存在的账号名（改名场景）：必须报错，而不是把 "***" 字面量落库 ——
+	// 那会让界面继续显示「已设置」而签到拿占位符当凭据用，属于静默数据损坏
 	in.Accounts = append(in.Accounts, Account{Name: "C", URL: "https://c.com", Cookie: MaskPlaceholder})
-	out = UnmaskConfig(&in, &old)
-	if out.Accounts[2].Cookie != MaskPlaceholder {
-		t.Errorf("旧配置不存在的账号占位符应保持原样: %q", out.Accounts[2].Cookie)
+	if _, err := UnmaskConfig(&in, &old); err == nil {
+		t.Error("旧配置不存在的账号占位符应报错")
 	}
 }
 

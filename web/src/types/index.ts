@@ -9,13 +9,20 @@ web/src/types/index.ts
 
 // ===== 配置对象类型（与 config.example.json 结构一致）=====
 
-export type LoginMethod = 'newapi_cookie' | 'github_cookie'
+/**
+ * 登录方式。
+ * 旧值 `github_cookie` 已由后端 config v3 迁移统一改判为 `tabiai`（GitHub OAuth 不再是登录方式），
+ * 前端不需要再识别旧值。
+ */
+export type LoginMethod = 'newapi_cookie' | 'tabiai'
 
 export interface Account {
   name: string
   url: string
   login_method: LoginMethod
+  /** 站点凭据：newapi_cookie 存完整 Cookie 头；tabiai 存 new_api_refresh 的值（每次 refresh 会被轮转覆盖） */
   cookie: string
+  /** 不再是登录凭据，仅作 POST /api/tabiai/issue-cookie 签发 new_api_refresh 的原料 */
   github_user_session: string
   github_client_id: string
   user_id: number | null
@@ -143,7 +150,7 @@ export interface ApiError {
 
 // ===== Cookie 可用性测试 =====
 
-export type CookieTestMode = 'newapi_cookie' | 'github_cookie'
+export type CookieTestMode = 'newapi_cookie' | 'tabiai'
 
 /** pending / running 是后台任务的中间态，只在轮询期间出现 */
 export type CookieTestState = 'valid' | 'invalid' | 'abnormal' | 'skipped' | 'pending' | 'running'
@@ -212,11 +219,14 @@ export interface HealthResult {
 export interface ConfigResponse {
   config: AppConfig
   updated_at: string
+  /** 乐观锁版本号：保存时必须带回，服务端据此拒绝陈旧快照 */
+  revision: number
 }
 
 export interface SaveConfigResult {
   ok: boolean
   updated_at: string
+  revision: number
 }
 
 // ===== API Key =====

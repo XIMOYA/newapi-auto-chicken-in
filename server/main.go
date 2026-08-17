@@ -103,6 +103,10 @@ func main() {
 	if err := MigrateConfig(db); err != nil {
 		log.Fatalf("升级旧配置失败: %v", err)
 	}
+	// 清理早期还原缺陷留下的 "***" 字面量凭据（幂等，无遗留时不写库）
+	if err := SanitizeConfigSecrets(db); err != nil {
+		log.Fatalf("清理占位符凭据失败: %v", err)
+	}
 
 	srv := NewServer(db, jwtSecret)
 	log.Printf("NewAPI 签到配置管理平台已启动，监听 %s（数据库: %s）", addr, dbPath)

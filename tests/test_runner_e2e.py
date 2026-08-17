@@ -186,16 +186,16 @@ class TestDryRun:
         assert not any(method == "POST" for method, _ in STATE["hits"])
 
 
-class TestGithubCookieMode:
-    def test_github_cookie_uses_github_session_and_dry_run(self, tmp_path, monkeypatch):
+class TestTabiAIMode:
+    def test_cookie_test_only_refreshes_and_persists_user_id(self, tmp_path, monkeypatch):
         from newapi_checkin import client as api
-        from newapi_checkin import github_oauth
+        from newapi_checkin import tabiai
 
         calls = []
 
-        class FakeGithubClient:
-            def __init__(self, account, http, cf=None):
-                calls.append(("init", account.login_method, account.github_user_session, cf))
+        class FakeTabiAIClient:
+            def __init__(self, account, http, cookie, cf=None, on_rotate=None):
+                calls.append(("init", account.login_method, cookie, cf))
                 self.impersonate = "chrome"
 
             def __enter__(self):
@@ -204,52 +204,77 @@ class TestGithubCookieMode:
             def __exit__(self, *_exc):
                 pass
 
-            def checkin(self, dry_run=False):
-                calls.append(("checkin", dry_run))
-                return api.ApiResult(api.SUCCESS, message="GitHub Cookie 可用", user_id=42)
+            def checkin(self, turnstile_provider=None, dry_run=False):
+                calls.append(("checkin", dry_run, turnstile_provider is None))
+                return api.ApiResult(api.SUCCESS, message="TaBiAI 凭据有效", user_id=42)
 
-        monkeypatch.setattr(github_oauth, "GithubOAuthClient", FakeGithubClient)
-
+        monkeypatch.setattr(tabiai, "TabiAIClient", FakeTabiAIClient)
         monkeypatch.setattr(runner_mod, "probe_exit_ip", lambda proxy=None, timeout=8: "127.0.0.1")
         monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
         cfg = cfgmod.build_config({
             "defaults": {"interval_seconds": [0, 0]},
             "accounts": [{
-                "name": "GitHub",
-                "url": "https://github.example.com",
-                "login_method": "github_cookie",
-                "github_user_session": "secret-session",
+                "name": "TaBiAI",
+                "url": "https://tabiai.example.com",
+                "login_method": "tabiai",
+                "cookie": "new_api_refresh=sid.secret",
             }],
         })
-        options = runner_mod.RunOptions(
-            use_browser=False,
-            use_ai=False,
-            cookie_test="github_cookie",
-        )
+        options = runner_mod.RunOptions(use_browser=False, use_ai=False, cookie_test="tabiai")
 
         runner = runner_mod.Runner(cfg, options)
         assert runner.run() == 0
         assert runner.summary.rows[0].status == api.SUCCESS
+        # 只验证凭据时不应准备 Turnstile provider（省掉浏览器和频率配额）
         assert calls == [
-            ("init", "github_cookie", "secret-session", None),
-            ("checkin", True),
+            ("init", "tabiai", "new_api_refresh=sid.secret", None),
+            ("checkin", True, True),
         ]
         session_data = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
         assert session_data[cfg.accounts[0].slug]["user_id"] == 42
 
-    def test_missing_github_cookie_is_skipped_without_network(self, tmp_path, monkeypatch):
+    def test_legacy_github_method_maps_to_tabiai(self):
+        cfg = cfgmod.build_config({
+            "accounts": [{
+                "name": "旧配置",
+                "url": "https://tabiai.example.com",
+                "login_method": "github_cookie",
+                "cookie": "new_api_refresh=sid.secret",
+            }],
+        })
+        assert cfg.accounts[0].login_method == cfgmod.LOGIN_METHOD_TABIAI
+
+    def test_missing_credential_is_skipped_without_network(self, tmp_path, monkeypatch):
         monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
         cfg = cfgmod.build_config({
             "accounts": [{
-                "name": "缺 GitHub Cookie",
-                "url": "https://github.example.com",
-                "login_method": "github_cookie",
+                "name": "缺凭据",
+                "url": "https://tabiai.example.com",
+                "login_method": "tabiai",
             }],
         })
         runner = runner_mod.Runner(cfg, runner_mod.RunOptions(use_browser=False, use_ai=False))
         assert runner.run() == 0
         assert runner.summary.rows[0].status == "skipped"
-        assert "GitHub Cookie" in runner.summary.rows[0].detail
+        assert "TaBiAI 凭据" in runner.summary.rows[0].detail
+
+    def test_stored_rotated_cookie_is_used_when_config_empty(self, tmp_path, monkeypatch):
+        """凭据轮转后配置里可能还是旧值，本地 store 的新代次必须能兜住。"""
+        from newapi_checkin.cf.session_store import SessionStore
+
+        sessions = tmp_path / "sessions.json"
+        monkeypatch.setattr(runner_mod, "SESSIONS_FILE", sessions)
+        cfg = cfgmod.build_config({
+            "accounts": [{
+                "name": "TaBiAI",
+                "url": "https://tabiai.example.com",
+                "login_method": "tabiai",
+            }],
+        })
+        store = SessionStore(sessions)
+        store.remember_refresh_cookie(cfg.accounts[0].slug, "new_api_refresh=sid.gen2")
+        runner = runner_mod.Runner(cfg, runner_mod.RunOptions(use_browser=False, use_ai=False))
+        assert runner._tabiai_cookie(cfg.accounts[0]) == "new_api_refresh=sid.gen2"
 
 
 class TestSessionCache:

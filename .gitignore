@@ -25,3 +25,6 @@ __pycache__/
 /web/dist/
 /web/*.local
 /web/*.log
+
+# NarraFork 工作目录（会话计划与附件，属于本地工具状态）
+/.narrafork/

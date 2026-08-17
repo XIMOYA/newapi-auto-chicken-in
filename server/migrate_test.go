@@ -77,7 +77,7 @@ func TestMigrateConfig_KeepsExplicitLoginMethod(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ConfigVersion = 1
 	cfg.Accounts = []Account{{
-		Name: "GitHub", URL: "https://a.com", LoginMethod: LoginMethodGitHubCookie,
+		Name: "GitHub", URL: "https://a.com", LoginMethod: LoginMethodTabiAI,
 		GithubUserSession: "session",
 	}}
 	writeCfg(t, srv, cfg)
@@ -89,7 +89,7 @@ func TestMigrateConfig_KeepsExplicitLoginMethod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if got.Accounts[0].LoginMethod != LoginMethodGitHubCookie {
+	if got.Accounts[0].LoginMethod != LoginMethodTabiAI {
 		t.Fatalf("显式登录方式被覆盖: %q", got.Accounts[0].LoginMethod)
 	}
 	if got.ConfigVersion != currentConfigVersion {

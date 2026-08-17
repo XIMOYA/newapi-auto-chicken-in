@@ -27,8 +27,10 @@ class RemoteSyncError(ValueError):
 
 # 远端永远不能覆盖的本地模块：同步设置和密钥必须由本地控制，
 # 否则覆盖后可能再也无法同步/解密。
-_LOCAL_CONTROLLED_KEYS = frozenset({"security", "config_sync"})
+_LOCAL_CONTROLLED_KEYS = frozenset({"security", "config_sync", "tabiai"})
 # 参与合并的业务模块（缺失告警用）。
+# tabiai 不在其中：cdp_url 指向本机 Chrome 的调试端口，属于机器级设置，
+# 远端平台不可能知道每台机器的端口，下发覆盖只会把能用的配置改坏。
 _SYNC_MODULES = ("accounts", "ai", "browser", "http", "defaults", "proxy_pool", "notify")
 
 
@@ -208,3 +210,56 @@ def sync_remote_config(
         }
     except (ConfigError, OSError, ValueError) as exc:
         return {"ok": False, "operation": "sync_config", "error": str(exc)}
+
+
+# --------------------------------------------------------------------------- #
+# TaBiAI 凭据回写
+# --------------------------------------------------------------------------- #
+
+
+def _writeback_endpoint(sync: ConfigSyncConfig, account_name: str) -> str:
+    """回写端点：显式配了 writeback_url 就用它，否则按拉取 URL 同源推导。"""
+    from urllib.parse import quote, urlsplit, urlunsplit
+
+    template = (sync.writeback_url or "").strip()
+    if template:
+        if "{name}" in template:
+            return template.replace("{name}", quote(account_name, safe=""))
+        return template.rstrip("/")
+    if not sync.url:
+        return ""
+    parts = urlsplit(sync.url)
+    if not parts.scheme or not parts.netloc:
+        return ""
+    path = f"/api/accounts/{quote(account_name, safe='')}/refresh-cookie"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def writeback_refresh_cookie(sync: ConfigSyncConfig, account_name: str,
+                             cookie: str) -> tuple[bool, str]:
+    """把轮转出的 new_api_refresh 回写到管理平台。
+
+    平台端拿旧代次去检测会直接被判失效，所以每轮转一次就同步一次。
+    这里失败不抛异常：本地 sessions.json 已经存了新值，签到本身不受影响。
+    """
+    if not sync.enabled:
+        return False, "未启用 config_sync"
+    endpoint = _writeback_endpoint(sync, account_name)
+    if not endpoint:
+        return False, "无法确定回写地址（配置 config_sync.writeback_url）"
+    if not str(cookie or "").strip():
+        return False, "凭据为空"
+    try:
+        response = cffi.request(
+            "POST", endpoint,
+            headers={**_headers(sync), "Content-Type": "application/json"},
+            json={"cookie": cookie},
+            timeout=sync.timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 - 网络库异常类型不固定
+        return False, f"{type(exc).__name__}: {exc}"[:160]
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status >= 400:
+        text = str(getattr(response, "text", "") or "")[:160]
+        return False, f"HTTP {status}: {text}"
+    return True, endpoint

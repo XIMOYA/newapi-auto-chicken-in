@@ -14,6 +14,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -45,7 +46,7 @@ func NewServer(db *sql.DB, jwtSecret string) *Server {
 		db:          db,
 		jwtSecret:   []byte(jwtSecret),
 		proxies:     proxies,
-		cookieTests: NewCookieTestRunner(proxies),
+		cookieTests: NewCookieTestRunner(proxies, db),
 		loginLim:    newLoginLimiter(),
 	}
 }
@@ -72,11 +73,15 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("PUT /api/password", s.requireJWT(s.handlePassword))
 	mux.HandleFunc("POST /api/auth/verify-password", s.requireJWT(s.handleVerifyPassword))
 
-	// Cookie 可用性测试：站点 Cookie 与 GitHub OAuth 严格分开，检测在后台跑、前端轮询。
+	// Cookie 可用性测试：站点 Cookie 与 TaBiAI 严格分开，检测在后台跑、前端轮询。
 	mux.HandleFunc("POST /api/cookie-tests/newapi", s.requireJWT(s.handleNewAPICookieTest))
-	mux.HandleFunc("POST /api/cookie-tests/github", s.requireJWT(s.handleGithubCookieTest))
+	mux.HandleFunc("POST /api/cookie-tests/tabiai", s.requireJWT(s.handleTabiAICookieTest))
 	mux.HandleFunc("GET /api/cookie-tests/status", s.requireJWT(s.handleCookieTestStatus))
 	mux.HandleFunc("POST /api/cookie-tests/stop", s.requireJWT(s.handleStopCookieTest))
+
+	// TaBiAI 凭据维护：签发（GitHub OAuth 三步换 new_api_refresh）与回写（Python 侧轮转后同步）
+	mux.HandleFunc("POST /api/tabiai/issue-cookie", s.requireJWT(s.handleIssueTabiAICookie))
+	mux.HandleFunc("POST /api/accounts/{name}/refresh-cookie", s.requireAPIKey(s.handleWriteBackRefreshCookie))
 
 	// 代理池管理
 	mux.HandleFunc("GET /api/proxies", s.requireJWT(s.handleListProxies))
@@ -168,9 +173,9 @@ func clientIP(r *http.Request) string {
 // ---------------------------------------------------------------------------
 // 辅助
 // ---------------------------------------------------------------------------
-// handleGetConfig GET /api/config（JWT）—— 返回打码后的配置与更新时间。
+// handleGetConfig GET /api/config（JWT）—— 返回打码后的配置、更新时间与乐观锁版本号。
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	cfg, updatedAt, err := LoadConfig(s.db)
+	cfg, updatedAt, revision, err := LoadConfigWithRevision(s.db)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 		return
@@ -178,13 +183,19 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"config":     MaskConfig(&cfg),
 		"updated_at": updatedAt,
+		"revision":   revision,
 	})
 }
 
 // handlePutConfig PUT /api/config（JWT）—— 还原 "***" 占位符、校验后落库。
+//
+// 并发保护：请求带 revision 时走乐观锁，版本不一致返回 409 并回传当前最新配置，
+// 避免多人/多标签页各自用陈旧快照整份覆盖（曾导致别人刚填的 Cookie 被静默清空）。
+// 不带 revision 时保持原有无条件覆盖行为，兼容既有外部脚本。
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Config *Config `json:"config"`
+		Config   *Config `json:"config"`
+		Revision *int64  `json:"revision"`
 	}
 	if err := readJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "请求体不是合法的 JSON")
@@ -195,25 +206,59 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	oldCfg, _, err := LoadConfig(s.db)
+	oldCfg, _, currentRevision, err := LoadConfigWithRevision(s.db)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 		return
 	}
-	merged := UnmaskConfig(req.Config, &oldCfg)
+	merged, err := UnmaskConfig(req.Config, &oldCfg)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := ValidateConfig(merged); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	updatedAt, err := SaveConfig(s.db, *merged)
-	if err != nil {
+	if req.Revision == nil {
+		log.Printf("[config] PUT /api/config 未携带 revision，按无条件覆盖处理（并发保护未生效）")
+		updatedAt, saveErr := SaveConfig(s.db, *merged)
+		if saveErr != nil {
+			writeError(w, http.StatusInternalServerError, "服务器内部错误")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"updated_at": updatedAt,
+			"revision":   currentRevision + 1,
+		})
+		return
+	}
+
+	updatedAt, newRevision, saveErr := SaveConfigIfMatch(s.db, *merged, *req.Revision)
+	if errors.Is(saveErr, ErrConfigRevisionConflict) {
+		latest, latestUpdatedAt, latestRevision, loadErr := LoadConfigWithRevision(s.db)
+		if loadErr != nil {
+			writeError(w, http.StatusInternalServerError, "服务器内部错误")
+			return
+		}
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":      "配置已被他人修改，请重新载入最新版本后再提交",
+			"revision":   latestRevision,
+			"updated_at": latestUpdatedAt,
+			"config":     MaskConfig(&latest),
+		})
+		return
+	}
+	if saveErr != nil {
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"updated_at": updatedAt,
+		"revision":   newRevision,
 	})
 }
 
@@ -420,9 +465,9 @@ func (s *Server) handleNewAPICookieTest(w http.ResponseWriter, r *http.Request) 
 	s.handleCookieTest(w, r, LoginMethodNewAPICookie)
 }
 
-// handleGithubCookieTest POST /api/cookie-tests/github（JWT）—— 启动 GitHub OAuth 检测任务。
-func (s *Server) handleGithubCookieTest(w http.ResponseWriter, r *http.Request) {
-	s.handleCookieTest(w, r, LoginMethodGitHubCookie)
+// handleTabiAICookieTest POST /api/cookie-tests/tabiai（JWT）—— 启动 TaBiAI 凭据检测任务。
+func (s *Server) handleTabiAICookieTest(w http.ResponseWriter, r *http.Request) {
+	s.handleCookieTest(w, r, LoginMethodTabiAI)
 }
 
 // handleCookieTest 启动后台检测任务并立即返回；结果由 GET /api/cookie-tests/status 轮询。

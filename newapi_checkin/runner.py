@@ -11,12 +11,12 @@ from . import client as api
 from . import logger as log
 from .cf.session_store import SessionStore
 from .config import (
-    LOGIN_METHOD_GITHUB_COOKIE,
+    LOGIN_METHOD_TABIAI,
     SESSIONS_FILE,
     Account,
     Config,
 )
-from .utils import jitter_sleep, probe_exit_ip
+from .utils import jitter_sleep, now, probe_exit_ip
 
 STRATEGY_LABEL = {
     "S0": "S0 缓存直连",
@@ -95,6 +95,9 @@ class Runner:
         self._state_lock = threading.RLock()
         self._browser_attempts: dict[str, int] = {}
         self._browser_gate: Optional[threading.Semaphore] = None
+        # Turnstile 取 token 有频率限制，必须跨账号串行 + 间隔
+        self._turnstile_lock = threading.Lock()
+        self._last_turnstile_at: float = 0.0
 
     # ------------------------------------------------------------------ #
     # 懒加载资源
@@ -473,11 +476,11 @@ class Runner:
             return self._checkin_account(account)
 
     def _checkin_account(self, account: Account) -> log.SummaryRow:
-        if account.login_method == LOGIN_METHOD_GITHUB_COOKIE:
-            if not account.github_user_session:
-                log.warn("缺少 GitHub Cookie，跳过（配置 github_user_session）")
+        if account.login_method == LOGIN_METHOD_TABIAI:
+            if not (account.cookie or self.store.get(account.slug).refresh_cookie):
+                log.warn("缺少 TaBiAI 凭据，跳过（配置 cookie=new_api_refresh=... 或用管理端签发）")
                 return log.SummaryRow(
-                    account.name, "skipped", "-", "缺少 GitHub Cookie（github_user_session）"
+                    account.name, "skipped", "-", "缺少 TaBiAI 凭据（new_api_refresh）"
                 )
         elif not account.cookie:
             log.warn("缺少 cookie（站点 Cookie），跳过（配置 accounts[].cookie）")
@@ -615,8 +618,8 @@ class Runner:
     def _attempt(self, account: Account, record) -> log.SummaryRow:
         ip = self.exit_ip(account.proxy)
 
-        if account.login_method == LOGIN_METHOD_GITHUB_COOKIE:
-            return self._attempt_github(account, record, ip)
+        if account.login_method == LOGIN_METHOD_TABIAI:
+            return self._attempt_tabiai(account, record, ip)
 
         # ---------------- S0 缓存直连 ----------------
         if record.cf is not None:
@@ -660,13 +663,13 @@ class Runner:
         self._take_browser_attempt(account)
         return self._solve(account, record, ip, result)
 
-    def _attempt_github(self, account: Account, record, ip: Optional[str]) -> log.SummaryRow:
-        """GitHub Cookie 账号：复用站点 CF 缓存，但 OAuth 回调由专用客户端完成。"""
+    def _attempt_tabiai(self, account: Account, record, ip: Optional[str]) -> log.SummaryRow:
+        """TaBiAI 账号：复用站点 CF 缓存，但换令牌与签到由 TabiAIClient 完成。"""
         if record.cf is not None:
             usable, reason = record.cf.check(ip, account.proxy)
-            log.debug(f"GitHub S0 缓存判定: {reason}")
+            log.debug(f"TaBiAI S0 缓存判定: {reason}")
             if usable:
-                result = self._github_api_call(account, record.cf)
+                result = self._tabiai_api_call(account, record.cf)
                 if result.kind in _SETTLED:
                     return self._row(account, result, "S0")
                 if result.kind == api.CF_BLOCKED:
@@ -677,15 +680,18 @@ class Runner:
                 self.store.clear_cf(account.slug)
                 record.cf = None
 
-        result = self._github_api_call(account, None)
+        result = self._tabiai_api_call(account, None)
         if result.kind in _SETTLED:
             return self._row(account, result, "S1")
         if result.kind == api.NETWORK_ERROR:
             return self._row(account, result, "S1")
+        # Turnstile 拿不到 token 时浏览器过盾也救不了（那是人机验证，不是 CF 盾）
+        if result.kind == api.TURNSTILE_REQUIRED:
+            return self._row(account, result, "S1", detail=result.message)
 
         verdict = result.verdict
         if result.kind == api.CF_BLOCKED:
-            log.warn(f"GitHub OAuth 站点命中 Cloudflare: {result.message}")
+            log.warn(f"TaBiAI 站点命中 Cloudflare: {result.message}")
             if verdict is not None and not verdict.recoverable:
                 result.kind = api.WAF_BLOCKED
                 return self._row(
@@ -693,7 +699,7 @@ class Runner:
                     detail=f"{verdict.label}：脚本无法绕过，需要换出口 IP 或联系站点放行",
                 )
         else:
-            log.warn(f"GitHub OAuth 响应异常，尝试用浏览器复核: {result.message}")
+            log.warn(f"TaBiAI 响应异常，尝试用浏览器复核: {result.message}")
 
         if not self.options.use_browser:
             return self._row(account, result, "S1", detail="已禁用浏览器过盾（--no-browser）")
@@ -701,20 +707,86 @@ class Runner:
         self._take_browser_attempt(account)
         return self._solve(account, record, ip, result)
 
-    def _github_api_call(self, account: Account, cf) -> api.ApiResult:
-        from .github_oauth import GithubOAuthClient
+    def _tabiai_api_call(self, account: Account, cf) -> api.ApiResult:
+        from .tabiai import TabiAIClient, normalize_refresh_cookie
 
-        with GithubOAuthClient(account, self.cfg.http, cf) as client:
+        cookie = self._tabiai_cookie(account)
+        if not cookie:
+            return api.ApiResult(
+                api.AUTH_FAILED,
+                message="缺少 TaBiAI 凭据（new_api_refresh），请在管理端签发或从浏览器复制",
+            )
+
+        def on_rotate(value: str) -> None:
+            # 站点换代次了：先落本地盘（当轮与后续本机运行都靠它），再尽力回写平台
+            self.store.remember_refresh_cookie(account.slug, value)
+            account.cookie = normalize_refresh_cookie(value)
+            self._writeback_refresh_cookie(account, value)
+
+        dry = bool(self.options.cookie_test or self.options.dry_run)
+        with TabiAIClient(account, self.cfg.http, cookie, cf, on_rotate=on_rotate) as client:
             log.debug(
-                f"GitHub OAuth impersonate={client.impersonate}, "
+                f"TaBiAI impersonate={client.impersonate}, "
                 + ("缓存 UA" if cf is not None and cf.user_agent else "默认 UA")
                 + (f", cookie 条数={len(cf.cookies)}" if cf is not None else "")
             )
-            result = client.checkin(dry_run=bool(self.options.cookie_test or self.options.dry_run))
+            provider = None if dry else self._turnstile_provider(account)
+            result = client.checkin(turnstile_provider=provider, dry_run=dry)
         if result.kind in _SETTLED and result.user_id:
             account.user_id = result.user_id
             self.store.remember(account.slug, user_id=result.user_id)
         return result
+
+    def _tabiai_cookie(self, account: Account) -> str:
+        """凭据优先级：配置（可能刚被管理端签发/回写）> 本地 store 的最新代次。"""
+        from .tabiai import normalize_refresh_cookie
+
+        configured = normalize_refresh_cookie(account.cookie)
+        if configured:
+            return configured
+        return normalize_refresh_cookie(self.store.get(account.slug).refresh_cookie or "")
+
+    def _writeback_refresh_cookie(self, account: Account, cookie: str) -> None:
+        """把轮转后的凭据同步回管理平台，避免网页端下次检测踩旧代。"""
+        from .remote_sync import writeback_refresh_cookie
+
+        ok, detail = writeback_refresh_cookie(self.cfg.config_sync, account.name, cookie)
+        if ok:
+            log.debug(f"新凭据已回写管理平台: {detail}")
+        else:
+            log.warn(f"新凭据未能回写管理平台（{detail}）：平台仍持有旧代次，"
+                     "网页端检测会失败，请重新签发或检查 config_sync.writeback_url")
+
+    def _turnstile_provider(self, account: Account):
+        """返回 () -> (token, error)；未启用 tabiai 浏览器时返回 None。"""
+        tabiai_cfg = getattr(self.cfg, "tabiai", None)
+        if tabiai_cfg is None or not tabiai_cfg.enabled:
+            return None
+
+        def provider():
+            from .cf.driver_cdp import fetch_turnstile_token
+
+            self._wait_turnstile_slot()
+            return fetch_turnstile_token(tabiai_cfg, account)
+
+        return provider
+
+    def _wait_turnstile_slot(self) -> None:
+        """Turnstile 有频率限制（实测 20 分钟内反复 reset 拿不到新 token），账号间强制间隔。"""
+        tabiai_cfg = getattr(self.cfg, "tabiai", None)
+        gap = max(0, int(getattr(tabiai_cfg, "token_interval_minutes", 0) or 0)) * 60
+        if gap <= 0:
+            return
+        with self._turnstile_lock:
+            last = self._last_turnstile_at
+            if last > 0:
+                wait = gap - (now() - last)
+                if wait > 0:
+                    log.info(f"Turnstile 频率限制：等待 {int(wait)} 秒后再取下一个 token")
+                    time.sleep(wait)
+            self._last_turnstile_at = now()
+
+
 
     # ------------------------------------------------------------------ #
     # 浏览器过盾（S2 / S3 / S4 / S5）
@@ -791,8 +863,8 @@ class Runner:
 
         # S2/S3：拿到 CF session，回到对应登录链路重发
         result = (
-            self._github_api_call(account, outcome.cf)
-            if account.login_method == LOGIN_METHOD_GITHUB_COOKIE
+            self._tabiai_api_call(account, outcome.cf)
+            if account.login_method == LOGIN_METHOD_TABIAI
             else self._api_call(account, outcome.cf)
         )
         return self._row(account, result, outcome.strategy)

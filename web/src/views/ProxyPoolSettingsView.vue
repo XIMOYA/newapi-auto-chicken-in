@@ -73,11 +73,12 @@ web/src/views/ProxyPoolSettingsView.vue
           <n-input v-model:value="form.remote_url" placeholder="https://你的域名/api/proxies/available（Actions 预取用）" />
         </n-form-item>
         <n-form-item label="Actions 预取 Token">
-          <n-input
-            v-model:value="form.remote_token"
+          <masked-input
+            v-model="form.remote_token"
+            :original-value="originalRemoteToken"
             type="password"
-            show-password-on="click"
             placeholder="与 config_sync 同一个 API Key"
+            custom-tip="已设置（接口不回传明文），留空保持不变，输入新值可修改"
           />
         </n-form-item>
       </n-form>
@@ -94,6 +95,7 @@ import {
 import { ServerOutline } from '@vicons/ionicons5'
 import ConfigCard from '@/components/ConfigCard.vue'
 import DynamicStringList from '@/components/DynamicStringList.vue'
+import MaskedInput from '@/components/MaskedInput.vue'
 import { useConfigStore } from '@/stores/config'
 import { useDirtyGuard } from '@/composables/useDirtyGuard'
 import { deepClone } from '@/utils/clone'
@@ -105,6 +107,8 @@ const message = useMessage()
 
 const saving = ref(false)
 const initialized = ref(false)
+// 服务端返回的原始 token（可能是 "***"），用于打码判断与「留空保持不变」
+const originalRemoteToken = ref('')
 
 // 脏检测：表单与已保存快照不一致时显示「未保存修改」，离开前弹确认
 const savedSnapshot = ref('')
@@ -142,6 +146,7 @@ function initForm(cfg: AppConfig) {
   form.auto_test = p.auto_test ?? true
   form.remote_url = p.remote_url ?? ''
   form.remote_token = p.remote_token ?? ''
+  originalRemoteToken.value = p.remote_token ?? ''
   form.remote_token_header = p.remote_token_header ?? 'Authorization'
   form.remote_token_prefix = p.remote_token_prefix ?? 'Bearer'
   savedSnapshot.value = JSON.stringify(form)
@@ -169,7 +174,9 @@ async function handleSave() {
     const next = deepClone(configStore.config)
     next.proxy_pool = {
       ...form,
-      sources: form.sources.map((s) => s.trim()).filter((s) => s !== '')
+      sources: form.sources.map((s) => s.trim()).filter((s) => s !== ''),
+      // 打码字段：留空表示不修改，回退为原始值（"***" 或原值）
+      remote_token: form.remote_token === '' ? originalRemoteToken.value : form.remote_token
     }
     await configStore.save(next)
     savedSnapshot.value = JSON.stringify(form)

@@ -166,7 +166,7 @@ func TestDefaultConfig(t *testing.T) {
 func TestMaskConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Accounts = []Account{{
-		Name: "A", URL: "https://a.com", LoginMethod: LoginMethodGitHubCookie,
+		Name: "A", URL: "https://a.com", LoginMethod: LoginMethodTabiAI,
 		Cookie: "secret-cookie", GithubUserSession: "github-secret", GithubClientID: "client-id",
 	}}
 	cfg.AI.APIKey = "sk-x"
@@ -182,7 +182,7 @@ func TestMaskConfig(t *testing.T) {
 	if m.Accounts[0].GithubUserSession != MaskPlaceholder {
 		t.Errorf("github_user_session 未打码: %q", m.Accounts[0].GithubUserSession)
 	}
-	if m.Accounts[0].GithubClientID != "client-id" || m.Accounts[0].LoginMethod != LoginMethodGitHubCookie {
+	if m.Accounts[0].GithubClientID != "client-id" || m.Accounts[0].LoginMethod != LoginMethodTabiAI {
 		t.Errorf("GitHub 非敏感字段被改动: %+v", m.Accounts[0])
 	}
 	if m.AI.APIKey != MaskPlaceholder {
@@ -223,7 +223,7 @@ func TestMaskConfigEmptyStaysEmpty(t *testing.T) {
 func TestUnmaskConfig(t *testing.T) {
 	old := DefaultConfig()
 	old.Accounts = []Account{{
-		Name: "A", URL: "https://a.com", LoginMethod: LoginMethodGitHubCookie,
+		Name: "A", URL: "https://a.com", LoginMethod: LoginMethodTabiAI,
 		Cookie: "old-cookie", GithubUserSession: "old-github-session", GithubClientID: "old-client-id",
 	}}
 	old.AI.APIKey = "old-key"
@@ -233,7 +233,7 @@ func TestUnmaskConfig(t *testing.T) {
 	in := DefaultConfig()
 	in.Accounts = []Account{
 		{
-			Name: "A", URL: "https://a.com", LoginMethod: LoginMethodGitHubCookie,
+			Name: "A", URL: "https://a.com", LoginMethod: LoginMethodTabiAI,
 			Cookie: MaskPlaceholder, GithubUserSession: MaskPlaceholder,
 		}, // "***" → 按账号名分别还原两类 Cookie
 		{Name: "B", URL: "https://b.com", Cookie: "new-cookie"}, // 新账号，非占位符
@@ -242,7 +242,10 @@ func TestUnmaskConfig(t *testing.T) {
 	in.Notify.Email.Password = "new-pass" // 非占位符，保留新值
 	in.ConfigSync.Token = MaskPlaceholder // 还原
 
-	out := UnmaskConfig(&in, &old)
+	out, err := UnmaskConfig(&in, &old)
+	if err != nil {
+		t.Fatalf("UnmaskConfig: %v", err)
+	}
 
 	if out.Accounts[0].Cookie != "old-cookie" {
 		t.Errorf("占位符 cookie 未还原: %q", out.Accounts[0].Cookie)
@@ -271,20 +274,99 @@ func TestUnmaskConfig(t *testing.T) {
 	}
 }
 
+func TestUnmaskConfigMasksProxyTokenAndConfigKey(t *testing.T) {
+	old := DefaultConfig()
+	old.ProxyPool.RemoteToken = "old-remote-token"
+	old.Security.ConfigKey = "old-config-key"
+
+	// 打码：两个字段都必须被替换，不能明文下发浏览器
+	masked := MaskConfig(&old)
+	if masked.ProxyPool.RemoteToken != MaskPlaceholder {
+		t.Errorf("proxy_pool.remote_token 未打码: %q", masked.ProxyPool.RemoteToken)
+	}
+	if masked.Security.ConfigKey != MaskPlaceholder {
+		t.Errorf("security.config_key 未打码: %q", masked.Security.ConfigKey)
+	}
+
+	// 还原：占位符原样提交回来时必须取回旧值
+	out, err := UnmaskConfig(masked, &old)
+	if err != nil {
+		t.Fatalf("UnmaskConfig: %v", err)
+	}
+	if out.ProxyPool.RemoteToken != "old-remote-token" {
+		t.Errorf("proxy_pool.remote_token 未还原: %q", out.ProxyPool.RemoteToken)
+	}
+	if out.Security.ConfigKey != "old-config-key" {
+		t.Errorf("security.config_key 未还原: %q", out.Security.ConfigKey)
+	}
+}
+
+func TestUnmaskConfigRejectsUnresolvablePlaceholder(t *testing.T) {
+	old := DefaultConfig()
+	old.Accounts = []Account{{Name: "A", URL: "https://a.com", Cookie: "old-cookie"}}
+	in := DefaultConfig()
+	// 账号改名：旧配置找不到新名字，占位符无法还原
+	in.Accounts = []Account{{Name: "A-新名字", URL: "https://a.com", Cookie: MaskPlaceholder}}
+
+	out, err := UnmaskConfig(&in, &old)
+	if err == nil {
+		t.Fatalf("改名后占位符应报错而不是落库，得到 %+v", out.Accounts[0])
+	}
+	if !strings.Contains(err.Error(), "无法还原") || !strings.Contains(err.Error(), "A-新名字") {
+		t.Errorf("错误信息应指明账号与原因: %v", err)
+	}
+}
+
+func TestSanitizeMaskLeftoversClearsLiteralPlaceholders(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Accounts = []Account{{
+		Name: "A", URL: "https://a.com",
+		Cookie: MaskPlaceholder, GithubUserSession: MaskPlaceholder,
+	}}
+	cfg.AI.APIKey = MaskPlaceholder
+	cfg.Notify.Email.Password = MaskPlaceholder
+	cfg.ConfigSync.Token = MaskPlaceholder
+	cfg.ProxyPool.RemoteToken = MaskPlaceholder
+	cfg.Security.ConfigKey = MaskPlaceholder
+
+	cleaned := SanitizeMaskLeftovers(&cfg)
+	if len(cleaned) != 7 {
+		t.Fatalf("应清理 7 个字段，实际 %d: %v", len(cleaned), cleaned)
+	}
+	if cfg.Accounts[0].Cookie != "" || cfg.Accounts[0].GithubUserSession != "" ||
+		cfg.AI.APIKey != "" || cfg.Notify.Email.Password != "" || cfg.ConfigSync.Token != "" ||
+		cfg.ProxyPool.RemoteToken != "" || cfg.Security.ConfigKey != "" {
+		t.Fatalf("占位符字段未被清空: %+v", cfg.Accounts[0])
+	}
+
+	// 正常配置不应被改动
+	clean := DefaultConfig()
+	clean.Accounts = []Account{{Name: "A", URL: "https://a.com", Cookie: "real"}}
+	if got := SanitizeMaskLeftovers(&clean); len(got) != 0 {
+		t.Fatalf("正常配置不应被清理: %v", got)
+	}
+	if clean.Accounts[0].Cookie != "real" {
+		t.Fatalf("真实凭据被误清: %q", clean.Accounts[0].Cookie)
+	}
+}
+
 func TestUnmaskConfigAccountIndexOutOfRange(t *testing.T) {
 	old := DefaultConfig()
 	old.Accounts = []Account{{Name: "A", URL: "https://a.com", Cookie: "old-cookie"}}
 	in := DefaultConfig()
 	in.Accounts = []Account{
 		{Name: "A", URL: "https://a.com", Cookie: MaskPlaceholder},
-		{Name: "B", URL: "https://b.com", Cookie: MaskPlaceholder}, // 旧配置无此索引
+		{Name: "B", URL: "https://b.com", Cookie: "brand-new-cookie"}, // 新账号必须自带明文
 	}
-	out := UnmaskConfig(&in, &old)
+	out, err := UnmaskConfig(&in, &old)
+	if err != nil {
+		t.Fatalf("UnmaskConfig: %v", err)
+	}
 	if out.Accounts[0].Cookie != "old-cookie" {
 		t.Errorf("占位符 cookie 未还原: %q", out.Accounts[0].Cookie)
 	}
-	if out.Accounts[1].Cookie != MaskPlaceholder {
-		t.Errorf("索引越界时占位符应保持原样，得到 %q", out.Accounts[1].Cookie)
+	if out.Accounts[1].Cookie != "brand-new-cookie" {
+		t.Errorf("新账号明文不应被改动: %q", out.Accounts[1].Cookie)
 	}
 }
 
@@ -302,7 +384,7 @@ func TestAccountLoginMethodDefaultsAndValidation(t *testing.T) {
 		t.Fatalf("缺省登录方式 = %q, want %q", cfg.Accounts[0].LoginMethod, LoginMethodNewAPICookie)
 	}
 
-	cfg.Accounts[0].LoginMethod = LoginMethodGitHubCookie
+	cfg.Accounts[0].LoginMethod = LoginMethodTabiAI
 	cfg.Accounts[0].GithubUserSession = "session"
 	if err := ValidateConfig(&cfg); err != nil {
 		t.Fatalf("GitHub 登录方式不应报错: %v", err)
@@ -351,6 +433,211 @@ func TestValidateConfig(t *testing.T) {
 				t.Errorf("错误信息 %q 应包含 %q", err.Error(), tc.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 并发保护：乐观锁与陈旧快照
+// ---------------------------------------------------------------------------
+
+// getConfigRevision 取一次 GET /api/config 的 revision，模拟前端载入页面。
+func getConfigRevision(t *testing.T, srv *Server, token string) (Config, int64) {
+	t.Helper()
+	resp := doReq(t, srv, http.MethodGet, "/api/config", token, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("GET /api/config = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Config   Config `json:"config"`
+		Revision int64  `json:"revision"`
+	}
+	decodeJSON(t, resp, &payload)
+	return payload.Config, payload.Revision
+}
+
+// TestPutConfigStaleSnapshotIsRejected 本次事故的直接回归用例。
+// 修复前：A 用陈旧快照提交会返回 200 并把 B 刚填的 Cookie 静默清空。
+func TestPutConfigStaleSnapshotIsRejected(t *testing.T) {
+	srv := newTestServer(t)
+	token := loginToken(t, srv)
+
+	// 初始：账号 X 存在但还没填 Cookie
+	base := DefaultConfig()
+	base.Accounts = []Account{{Name: "X", URL: "https://x.com", Cookie: "", Enabled: true}}
+	if _, err := SaveConfig(srv.db, base); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	// A 此刻载入页面，快照里 X.cookie 是空串
+	staleCfg, staleRevision := getConfigRevision(t, srv, token)
+	if staleCfg.Accounts[0].Cookie != "" {
+		t.Fatalf("前置条件不成立: %q", staleCfg.Accounts[0].Cookie)
+	}
+
+	// B 给 X 填上真实 Cookie 并保存成功
+	_, bRevision := getConfigRevision(t, srv, token)
+	bCfg := DefaultConfig()
+	bCfg.Accounts = []Account{{Name: "X", URL: "https://x.com", Cookie: "session=real-secret", Enabled: true}}
+	putB := doReq(t, srv, http.MethodPut, "/api/config", token,
+		map[string]any{"config": bCfg, "revision": bRevision})
+	if putB.Code != http.StatusOK {
+		t.Fatalf("B 保存失败 = %d, %s", putB.Code, putB.Body.String())
+	}
+
+	// A 拿旧快照做无关操作（切启用开关）后提交：必须被 409 拦下
+	staleCfg.Accounts[0].Enabled = false
+	putA := doReq(t, srv, http.MethodPut, "/api/config", token,
+		map[string]any{"config": staleCfg, "revision": staleRevision})
+	if putA.Code != http.StatusConflict {
+		t.Fatalf("陈旧快照应返回 409，实际 = %d, body = %s", putA.Code, putA.Body.String())
+	}
+
+	// B 的 Cookie 必须还在
+	final, _, err := LoadConfig(srv.db)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if final.Accounts[0].Cookie != "session=real-secret" {
+		t.Fatalf("B 的 Cookie 被吞掉了: %q", final.Accounts[0].Cookie)
+	}
+
+	// 409 响应体要带上最新 revision 与打码配置，供前端直接接管
+	var conflict struct {
+		Error    string `json:"error"`
+		Revision int64  `json:"revision"`
+		Config   Config `json:"config"`
+	}
+	decodeJSON(t, putA, &conflict)
+	if conflict.Revision <= staleRevision {
+		t.Errorf("409 应回传更新后的 revision: %d（陈旧 %d）", conflict.Revision, staleRevision)
+	}
+	if conflict.Config.Accounts[0].Cookie != MaskPlaceholder {
+		t.Errorf("409 回传的配置必须打码: %q", conflict.Config.Accounts[0].Cookie)
+	}
+	if conflict.Error == "" {
+		t.Error("409 应带可读错误信息")
+	}
+}
+
+func TestPutConfigRevisionMatchSucceedsAndAdvances(t *testing.T) {
+	srv := newTestServer(t)
+	token := loginToken(t, srv)
+
+	cfg, revision := getConfigRevision(t, srv, token)
+	cfg.Accounts = []Account{{Name: "A", URL: "https://a.com", Cookie: "c", Enabled: true}}
+	first := doReq(t, srv, http.MethodPut, "/api/config", token,
+		map[string]any{"config": cfg, "revision": revision})
+	if first.Code != http.StatusOK {
+		t.Fatalf("版本匹配应成功 = %d, %s", first.Code, first.Body.String())
+	}
+	var saved struct {
+		Revision int64 `json:"revision"`
+	}
+	decodeJSON(t, first, &saved)
+	if saved.Revision != revision+1 {
+		t.Fatalf("revision 应递增: %d -> %d", revision, saved.Revision)
+	}
+
+	// 同一个 revision 再提交一次必须冲突（防止重复提交覆盖）
+	second := doReq(t, srv, http.MethodPut, "/api/config", token,
+		map[string]any{"config": cfg, "revision": revision})
+	if second.Code != http.StatusConflict {
+		t.Fatalf("重复使用旧 revision 应返回 409，实际 %d", second.Code)
+	}
+}
+
+func TestPutConfigWithoutRevisionStaysCompatible(t *testing.T) {
+	srv := newTestServer(t)
+	token := loginToken(t, srv)
+
+	cfg := DefaultConfig()
+	cfg.Accounts = []Account{{Name: "A", URL: "https://a.com", Cookie: "c", Enabled: true}}
+	// 不带 revision：保留旧的无条件覆盖行为，兼容既有外部脚本
+	resp := doReq(t, srv, http.MethodPut, "/api/config", token, map[string]any{"config": cfg})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("不带 revision 应仍可保存 = %d, %s", resp.Code, resp.Body.String())
+	}
+	saved, _, err := LoadConfig(srv.db)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(saved.Accounts) != 1 || saved.Accounts[0].Cookie != "c" {
+		t.Fatalf("未按原样保存: %+v", saved.Accounts)
+	}
+}
+
+func TestPutConfigRejectsDuplicateAccountNames(t *testing.T) {
+	srv := newTestServer(t)
+	token := loginToken(t, srv)
+
+	cfg, revision := getConfigRevision(t, srv, token)
+	cfg.Accounts = []Account{
+		{Name: "同名", URL: "https://a.com", Cookie: "c1", Enabled: true},
+		{Name: "同名", URL: "https://b.com", Cookie: "c2", Enabled: true},
+	}
+	resp := doReq(t, srv, http.MethodPut, "/api/config", token,
+		map[string]any{"config": cfg, "revision": revision})
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("重名账号应被拒绝 = %d, %s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "重复") {
+		t.Errorf("错误信息应说明重复: %s", resp.Body.String())
+	}
+}
+
+func TestPutConfigRejectsRenamedMaskedCookie(t *testing.T) {
+	srv := newTestServer(t)
+	token := loginToken(t, srv)
+
+	base := DefaultConfig()
+	base.Accounts = []Account{{Name: "旧名", URL: "https://a.com", Cookie: "real-cookie", Enabled: true}}
+	if _, err := SaveConfig(srv.db, base); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	cfg, revision := getConfigRevision(t, srv, token)
+	if cfg.Accounts[0].Cookie != MaskPlaceholder {
+		t.Fatalf("前置条件不成立，应为打码态: %q", cfg.Accounts[0].Cookie)
+	}
+	cfg.Accounts[0].Name = "新名" // 改名 + 打码提交
+	resp := doReq(t, srv, http.MethodPut, "/api/config", token,
+		map[string]any{"config": cfg, "revision": revision})
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("改名 + 打码应返回 400，实际 = %d, %s", resp.Code, resp.Body.String())
+	}
+
+	// 关键：原账号的真实 Cookie 不能被破坏
+	saved, _, err := LoadConfig(srv.db)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if saved.Accounts[0].Name != "旧名" || saved.Accounts[0].Cookie != "real-cookie" {
+		t.Fatalf("拒绝保存后原数据应完好: %+v", saved.Accounts[0])
+	}
+}
+
+func TestSanitizeConfigSecretsClearsLeftoverOnStartup(t *testing.T) {
+	srv := newTestServer(t)
+
+	cfg := DefaultConfig()
+	cfg.Accounts = []Account{{Name: "A", URL: "https://a.com", Cookie: MaskPlaceholder, Enabled: true}}
+	if _, err := SaveConfig(srv.db, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	if err := SanitizeConfigSecrets(srv.db); err != nil {
+		t.Fatalf("SanitizeConfigSecrets: %v", err)
+	}
+	saved, _, err := LoadConfig(srv.db)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if saved.Accounts[0].Cookie != "" {
+		t.Fatalf("遗留占位符应被清空: %q", saved.Accounts[0].Cookie)
+	}
+
+	// 幂等：再跑一次不报错、不改动
+	if err := SanitizeConfigSecrets(srv.db); err != nil {
+		t.Fatalf("重复执行应幂等: %v", err)
 	}
 }
 

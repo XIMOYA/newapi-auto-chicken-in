@@ -42,8 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="只验证当前登录方式的凭据与连通性，不执行签到")
     parser.add_argument(
         "--cookie-test",
-        choices=("newapi_cookie", "github_cookie"),
-        help="只检查指定类型 Cookie 的可用性；两种登录方式需分别执行",
+        choices=("newapi_cookie", "tabiai", "github_cookie"),
+        help="只检查指定类型凭据的可用性；两种登录方式需分别执行"
+             "（github_cookie 为旧写法，等价于 tabiai）",
     )
     display_group = parser.add_mutually_exclusive_group()
     display_group.add_argument("--headful", action="store_true", help="强制有头浏览器")
@@ -162,7 +163,8 @@ def main(argv=None) -> int:
         use_ai=args.use_ai,
         use_browser=args.use_browser,
         verbose=args.verbose,
-        cookie_test=args.cookie_test,
+        # github_cookie 是旧写法，登录方式已并入 tabiai，这里归一化后再交给 Runner
+        cookie_test=("tabiai" if args.cookie_test == "github_cookie" else args.cookie_test),
         parallelism=1 if args.manual else (args.parallel or 1),
         # 参数保留兼容；Runner 自动签到统一固定 4 个账号并发。
         parallelism_explicit=args.parallel is not None and not args.manual,
