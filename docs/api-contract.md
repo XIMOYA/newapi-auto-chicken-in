@@ -130,9 +130,20 @@
 
 ## 9. Cookie 可用性测试（JWT）
 
-站点 Cookie 与 GitHub OAuth 必须通过两个独立接口检测。前端只提交账号名称，后端从数据库读取明文凭据；响应不会返回 Cookie、token、OAuth state 或 code。
+站点 Cookie 与 GitHub OAuth 使用两个独立的**启动**接口，共用一个后台任务与一套状态/停止接口。前端只提交账号名称，后端从数据库读取明文凭据；响应不会返回 Cookie、token、OAuth state 或 code。
 
-### 站点 Cookie
+执行模型：
+- 启动接口立即返回，检测在服务端后台按**轮次**执行；同一时刻只允许一个任务，冲突返回 409
+- 账号级并发 5；每轮给所有未定论账号各尝试一次，**代理类失败留到下一轮无限重试**，**只有源站类结论才判终态**
+- 出口来源：`accounts[].proxy` 优先；未配置时从服务器代理池（`proxies` 表 alive 记录）轮转取，不受 `proxy_pool.enabled` 影响；池子为空则该轮直连
+- 账号自带代理连续 2 轮失败后自动降级为代理池出口，`message` 会带「账号代理连续失败，已切换代理池」
+- 手动停止后，仍未定论的账号写成 `skipped`，`message` 为「已手动停止（共尝试 N 次，最后失败：…）」
+
+失败分类（决定是否重试）：
+- **代理类（重试）**：连接/超时/TLS 等传输层错误；代理自身 407/502/504；非 JSON 响应；403/429/503 且带 `cloudflare`/`cf-ray`/`cdn-cgi` 特征或挑战页文案；GitHub authorize 返回 403/429
+- **源站类（终态）**：站点用合法 JSON 明确拒绝凭据（401/403）；站点 URL 无效；`OAuth state 成功但未返回 flow_token`；`站点状态未返回 github_client_id`；GitHub 重定向到 `/login`；GitHub 返回 `error`；GitHub authorize 返回 200（需先在 GitHub 授权该应用）
+
+### 启动：站点 Cookie
 
 `POST /api/cookie-tests/newapi`
 
@@ -143,7 +154,7 @@
 
 只检测 `login_method=newapi_cookie` 且启用的账号。`account_names` 为空数组时检测该类型的全部启用账号。普通 Cookie 请求 `/api/user/self`；包含 `new_api_refresh=` 时先执行 refresh，再用新凭据验证 self。
 
-### GitHub OAuth
+### 启动：GitHub OAuth
 
 `POST /api/cookie-tests/github`
 
@@ -155,12 +166,29 @@
 
 取得 code 后即结束，**不会调用站点 OAuth callback，也不会执行签到**；响应不会返回 code、state 或 Cookie。
 
+两个启动接口的响应（200）：
+```json
+{ "ok": true, "mode": "github_cookie", "started": true }
+```
+错误（409）：`{ "error": "已有 Cookie 检测任务在进行中" }`
+错误（400）：`{ "error": "没有匹配 github_cookie 的启用账号" }`
+
+### 进度与结果
+
+`GET /api/cookie-tests/status`
+
 响应（200）：
 ```json
 {
+  "running": true,
+  "stopped": false,
   "mode": "newapi_cookie",
-  "checked_at": "2026-08-16T14:00:00Z",
-  "summary": { "total": 1, "valid": 1, "invalid": 0, "abnormal": 0, "skipped": 0 },
+  "round": 3,
+  "started_at": "2026-08-16T14:00:00Z",
+  "checked_at": "",
+  "duration_sec": 42,
+  "last_error": "",
+  "summary": { "total": 2, "valid": 1, "invalid": 0, "abnormal": 0, "skipped": 0 },
   "results": [
     {
       "name": "站点A",
@@ -168,13 +196,24 @@
       "state": "valid",
       "user_id": 123,
       "duration_ms": 321,
-      "message": "tester"
+      "message": "tester",
+      "attempts": 1,
+      "proxy": "1.2.3.4:8080"
     }
   ]
 }
 ```
 
-状态含义：`valid` 有效、`invalid` 凭据失效、`abnormal` 网络/服务器/响应异常、`skipped` 对应 Cookie 未配置或检测被取消。
+- `mode` 为空串表示服务启动后还没跑过任何检测
+- `checked_at` 仅在任务结束后有值；`round` 为当前轮次
+- `attempts` 为该账号已尝试次数，`proxy` 为最后一次使用的出口（空串=直连）
+- `summary` 只统计四类终态，`pending`/`running` 不计入但计入 `total`
+
+### 停止
+
+`POST /api/cookie-tests/stop` → `{ "ok": true }`（幂等，无任务在跑时也返回 ok）
+
+状态含义：`valid` 有效、`invalid` 凭据失效、`abnormal` 源站层面的异常响应、`skipped` 未配置对应 Cookie 或被手动停止、`pending` 排队中、`running` 本轮检测中。
 
 ---
 

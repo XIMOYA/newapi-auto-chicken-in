@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestCheckNewAPICookieDirectValid(t *testing.T) {
@@ -30,7 +31,7 @@ func TestCheckNewAPICookieDirectValid(t *testing.T) {
 		Name:   "direct",
 		URL:    server.URL,
 		Cookie: "session=good",
-	})
+	}, "")
 	if result.State != cookieTestStateValid {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
@@ -53,7 +54,7 @@ func TestCheckNewAPICookieUnauthorized(t *testing.T) {
 		Name:   "invalid",
 		URL:    server.URL,
 		Cookie: "session=dead",
-	})
+	}, "")
 	if result.State != cookieTestStateInvalid {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
@@ -101,7 +102,7 @@ func TestCheckNewAPICookieRefreshPreservesOriginalCookie(t *testing.T) {
 		Name:   "refresh",
 		URL:    server.URL,
 		Cookie: "new_api_refresh=refresh-token",
-	})
+	}, "")
 	if result.State != cookieTestStateValid {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
@@ -121,7 +122,7 @@ func TestCheckNewAPICookieAbnormalResponses(t *testing.T) {
 		Name:   "abnormal",
 		URL:    server.URL,
 		Cookie: "session=server-error",
-	})
+	}, "")
 	if result.State != cookieTestStateAbnormal {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
@@ -183,7 +184,7 @@ func TestCheckGithubCookieGetsCodeWithoutCallback(t *testing.T) {
 		URL:               site.URL,
 		GithubClientID:    "configured-client-id",
 		GithubUserSession: "github-session",
-	}, authorize.URL)
+	}, authorize.URL, "")
 	if result.State != cookieTestStateValid {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
@@ -210,7 +211,7 @@ func TestCheckGithubCookieStateWithoutFlowTokenIsAbnormal(t *testing.T) {
 		URL:               site.URL,
 		GithubClientID:    "configured-client-id",
 		GithubUserSession: "github-session",
-	}, authorize.URL)
+	}, authorize.URL, "")
 	if result.State != cookieTestStateAbnormal || !strings.Contains(result.Message, "flow_token") {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
@@ -235,7 +236,7 @@ func TestCheckGithubCookieInvalidRedirect(t *testing.T) {
 		URL:               site.URL,
 		GithubClientID:    "configured-client-id",
 		GithubUserSession: "dead-session",
-	}, authorize.URL)
+	}, authorize.URL, "")
 	if result.State != cookieTestStateInvalid {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
@@ -289,7 +290,7 @@ func TestCheckGithubCookieLoadsClientIDFromSiteStatus(t *testing.T) {
 		Name:              "github-status-client-id",
 		URL:               site.URL,
 		GithubUserSession: "github-session",
-	}, authorize.URL)
+	}, authorize.URL, "")
 	if result.State != cookieTestStateValid {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
@@ -325,7 +326,7 @@ func TestCheckGithubCookieMissingClientIDIsAbnormal(t *testing.T) {
 		Name:              "github-no-client-id",
 		URL:               site.URL,
 		GithubUserSession: "github-session",
-	}, authorize.URL)
+	}, authorize.URL, "")
 	if result.State != cookieTestStateAbnormal || !strings.Contains(result.Message, "github_client_id") {
 		t.Fatalf("state = %q, message = %q", result.State, result.Message)
 	}
@@ -343,24 +344,82 @@ func TestCookieTestEndpointsKeepModesSeparate(t *testing.T) {
 		t.Fatalf("SaveConfig: %v", err)
 	}
 
-	newapiResp := doReq(t, srv, http.MethodPost, "/api/cookie-tests/newapi", token, map[string]any{"account_names": []string{}})
-	if newapiResp.Code != http.StatusOK {
-		t.Fatalf("NewAPI endpoint status = %d, body = %s", newapiResp.Code, newapiResp.Body.String())
+	// 两个模式各跑一次：启动 -> 等任务落地 -> 取快照，断言结果集互不串台
+	for _, tc := range []struct {
+		path string
+		mode string
+		name string
+	}{
+		{"/api/cookie-tests/newapi", LoginMethodNewAPICookie, "newapi-account"},
+		{"/api/cookie-tests/github", LoginMethodGitHubCookie, "github-account"},
+	} {
+		start := doReq(t, srv, http.MethodPost, tc.path, token, map[string]any{"account_names": []string{}})
+		if start.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, body = %s", tc.path, start.Code, start.Body.String())
+		}
+		status := waitCookieTestDone(t, srv, token)
+		if status.Mode != tc.mode || len(status.Results) != 1 || status.Results[0].Name != tc.name {
+			t.Fatalf("%s 结果未隔离: %+v", tc.path, status)
+		}
 	}
-	var newapiResult CookieTestResponse
-	decodeJSON(t, newapiResp, &newapiResult)
-	if newapiResult.Mode != LoginMethodNewAPICookie || len(newapiResult.Results) != 1 || newapiResult.Results[0].Name != "newapi-account" {
-		t.Fatalf("NewAPI response not isolated: %+v", newapiResult)
+}
+
+// waitCookieTestDone 轮询状态接口直到任务结束（两个账号都指向不可用端口，很快定论）。
+func waitCookieTestDone(t *testing.T, srv *Server, token string) CookieTestStatus {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		resp := doReq(t, srv, http.MethodGet, "/api/cookie-tests/status", token, nil)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("status 接口 = %d, body = %s", resp.Code, resp.Body.String())
+		}
+		var snapshot CookieTestStatus
+		decodeJSON(t, resp, &snapshot)
+		if !snapshot.Running {
+			return snapshot
+		}
+		if time.Now().After(deadline) {
+			// 连接不可用端口本应秒级定论；超时说明重试没有收敛，主动停止避免测试悬挂
+			doReq(t, srv, http.MethodPost, "/api/cookie-tests/stop", token, nil)
+			t.Fatalf("等待检测结束超时: %+v", snapshot)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func TestCookieTestStartRejectsConcurrentRun(t *testing.T) {
+	srv := newTestServer(t)
+	token := loginToken(t, srv)
+	cfg := DefaultConfig()
+	// 指向不可路由地址，让首个任务停在代理类重试上，从而稳定处于 running
+	cfg.Accounts = []Account{
+		{Name: "slow", URL: "http://192.0.2.1:9", LoginMethod: LoginMethodNewAPICookie, Cookie: "session=x", Enabled: true},
+	}
+	cfg.HTTP.Timeout = 1
+	if _, err := SaveConfig(srv.db, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	defer srv.cookieTests.Stop()
+
+	first := doReq(t, srv, http.MethodPost, "/api/cookie-tests/newapi", token, map[string]any{})
+	if first.Code != http.StatusOK {
+		t.Fatalf("首次启动 = %d, body = %s", first.Code, first.Body.String())
+	}
+	second := doReq(t, srv, http.MethodPost, "/api/cookie-tests/newapi", token, map[string]any{})
+	if second.Code != http.StatusConflict {
+		t.Fatalf("并发启动应返回 409，实际 = %d, body = %s", second.Code, second.Body.String())
 	}
 
-	githubResp := doReq(t, srv, http.MethodPost, "/api/cookie-tests/github", token, map[string]any{"account_names": []string{}})
-	if githubResp.Code != http.StatusOK {
-		t.Fatalf("GitHub endpoint status = %d, body = %s", githubResp.Code, githubResp.Body.String())
+	stop := doReq(t, srv, http.MethodPost, "/api/cookie-tests/stop", token, nil)
+	if stop.Code != http.StatusOK {
+		t.Fatalf("stop = %d", stop.Code)
 	}
-	var githubResult CookieTestResponse
-	decodeJSON(t, githubResp, &githubResult)
-	if githubResult.Mode != LoginMethodGitHubCookie || len(githubResult.Results) != 1 || githubResult.Results[0].Name != "github-account" {
-		t.Fatalf("GitHub response not isolated: %+v", githubResult)
+	status := waitCookieTestDone(t, srv, token)
+	if !status.Stopped || status.Results[0].State != cookieTestStateSkipped {
+		t.Fatalf("停止后应写成 skipped: %+v", status.Results)
+	}
+	if !strings.Contains(status.Results[0].Message, "已手动停止") {
+		t.Fatalf("停止说明缺失: %q", status.Results[0].Message)
 	}
 }
 

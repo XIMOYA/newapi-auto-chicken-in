@@ -31,19 +31,22 @@ const serverVersion = "1.0.0"
 
 // Server 服务依赖：数据库连接、JWT 签名密钥、代理池管理器与登录限流器。
 type Server struct {
-	db        *sql.DB
-	jwtSecret []byte
-	proxies   *ProxyManager
-	loginLim  *loginLimiter
+	db          *sql.DB
+	jwtSecret   []byte
+	proxies     *ProxyManager
+	cookieTests *CookieTestRunner
+	loginLim    *loginLimiter
 }
 
 // NewServer 构造服务实例；jwtSecret 为 JWT 签名密钥（main 已校验长度）。
 func NewServer(db *sql.DB, jwtSecret string) *Server {
+	proxies := NewProxyManager(db)
 	return &Server{
-		db:        db,
-		jwtSecret: []byte(jwtSecret),
-		proxies:   NewProxyManager(db),
-		loginLim:  newLoginLimiter(),
+		db:          db,
+		jwtSecret:   []byte(jwtSecret),
+		proxies:     proxies,
+		cookieTests: NewCookieTestRunner(proxies),
+		loginLim:    newLoginLimiter(),
 	}
 }
 
@@ -69,9 +72,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("PUT /api/password", s.requireJWT(s.handlePassword))
 	mux.HandleFunc("POST /api/auth/verify-password", s.requireJWT(s.handleVerifyPassword))
 
-	// Cookie 可用性测试：NewAPI Cookie 与 GitHub Cookie 严格分开。
+	// Cookie 可用性测试：站点 Cookie 与 GitHub OAuth 严格分开，检测在后台跑、前端轮询。
 	mux.HandleFunc("POST /api/cookie-tests/newapi", s.requireJWT(s.handleNewAPICookieTest))
 	mux.HandleFunc("POST /api/cookie-tests/github", s.requireJWT(s.handleGithubCookieTest))
+	mux.HandleFunc("GET /api/cookie-tests/status", s.requireJWT(s.handleCookieTestStatus))
+	mux.HandleFunc("POST /api/cookie-tests/stop", s.requireJWT(s.handleStopCookieTest))
 
 	// 代理池管理
 	mux.HandleFunc("GET /api/proxies", s.requireJWT(s.handleListProxies))
@@ -410,16 +415,17 @@ func (s *Server) handleVerifyPassword(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// handleNewAPICookieTest POST /api/cookie-tests/newapi（JWT）—— 独立检测 NewAPI Cookie。
+// handleNewAPICookieTest POST /api/cookie-tests/newapi（JWT）—— 启动站点 Cookie 检测任务。
 func (s *Server) handleNewAPICookieTest(w http.ResponseWriter, r *http.Request) {
 	s.handleCookieTest(w, r, LoginMethodNewAPICookie)
 }
 
-// handleGithubCookieTest POST /api/cookie-tests/github（JWT）—— 独立检测 GitHub Cookie。
+// handleGithubCookieTest POST /api/cookie-tests/github（JWT）—— 启动 GitHub OAuth 检测任务。
 func (s *Server) handleGithubCookieTest(w http.ResponseWriter, r *http.Request) {
 	s.handleCookieTest(w, r, LoginMethodGitHubCookie)
 }
 
+// handleCookieTest 启动后台检测任务并立即返回；结果由 GET /api/cookie-tests/status 轮询。
 func (s *Server) handleCookieTest(w http.ResponseWriter, r *http.Request, mode string) {
 	var req struct {
 		AccountNames []string `json:"account_names"`
@@ -428,23 +434,31 @@ func (s *Server) handleCookieTest(w http.ResponseWriter, r *http.Request, mode s
 		writeError(w, http.StatusBadRequest, "请求体不是合法的 JSON")
 		return
 	}
+	if s.cookieTests.IsRunning() {
+		writeError(w, http.StatusConflict, "已有 Cookie 检测任务在进行中")
+		return
+	}
 	cfg, _, err := LoadConfig(s.db)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 		return
 	}
-	results, err := runCookieTests(r.Context(), &cfg, mode, req.AccountNames)
-	if err != nil {
+	if err := s.cookieTests.Start(&cfg, mode, req.AccountNames); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	response := CookieTestResponse{
-		Mode:      mode,
-		CheckedAt: time.Now().UTC().Format(time.RFC3339),
-		Summary:   summarizeCookieTestResults(results),
-		Results:   results,
-	}
-	writeJSON(w, http.StatusOK, response)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": mode, "started": true})
+}
+
+// handleCookieTestStatus GET /api/cookie-tests/status（JWT）—— 当前任务进度与实时结果。
+func (s *Server) handleCookieTestStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.cookieTests.Snapshot())
+}
+
+// handleStopCookieTest POST /api/cookie-tests/stop（JWT）—— 请求停止当前任务（幂等）。
+func (s *Server) handleStopCookieTest(w http.ResponseWriter, r *http.Request) {
+	s.cookieTests.Stop()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // handleRawConfig GET /api/config/raw（API Key）—— 直接返回完整明文配置对象（非包裹结构）。

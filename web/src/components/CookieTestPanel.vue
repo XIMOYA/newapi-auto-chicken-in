@@ -13,18 +13,32 @@ web/src/components/CookieTestPanel.vue
     </template>
     <template #header-extra>
       <n-space :size="8" align="center">
-        <n-tag v-if="selectedKeys.length" size="small" type="primary" :bordered="false">
+        <n-tag v-if="running" size="small" type="warning" :bordered="false">
+          第 {{ round }} 轮 · 已定论 {{ settled }}/{{ total }}
+        </n-tag>
+        <n-tag v-else-if="selectedKeys.length" size="small" type="primary" :bordered="false">
           已选 {{ selectedKeys.length }} 项
         </n-tag>
-        <n-button type="primary" size="small" :loading="loading" :disabled="!accounts.length" @click="handleRun">
+        <n-button v-if="running" type="error" size="small" :loading="stopping" @click="emit('stop')">
+          <template #icon><n-icon><stop-circle-outline /></n-icon></template>
+          停止检测
+        </n-button>
+        <n-button
+          v-else
+          type="primary"
+          size="small"
+          :loading="loading"
+          :disabled="!accounts.length || busy"
+          @click="handleRun"
+        >
           <template #icon><n-icon><refresh-outline /></n-icon></template>
           {{ selectedKeys.length ? `检测选中 ${selectedKeys.length} 个` : `检测全部 ${accounts.length} 个` }}
         </n-button>
       </n-space>
     </template>
 
-    <n-alert type="info" :bordered="false" class="panel-alert">
-      {{ hint }}
+    <n-alert :type="busy ? 'warning' : 'info'" :bordered="false" class="panel-alert">
+      {{ busy ? '另一类 Cookie 检测正在进行，请先等它结束或停止后再开始本类检测。' : hint }}
     </n-alert>
 
     <n-data-table
@@ -34,7 +48,7 @@ web/src/components/CookieTestPanel.vue
       :loading="loading"
       :row-key="rowKey"
       :bordered="false"
-      :scroll-x="900"
+      :scroll-x="1200"
       striped
       size="small"
     >
@@ -51,7 +65,7 @@ import {
   NAlert, NButton, NCard, NDataTable, NEmpty, NIcon, NSpace, NTag,
   type DataTableColumns, type TagProps
 } from 'naive-ui'
-import { CheckmarkCircleOutline, RefreshOutline } from '@vicons/ionicons5'
+import { CheckmarkCircleOutline, RefreshOutline, StopCircleOutline } from '@vicons/ionicons5'
 import type { Account, CookieTestMode, CookieTestResult, CookieTestState } from '@/types'
 
 interface Props {
@@ -59,6 +73,18 @@ interface Props {
   accounts: Account[]
   results: CookieTestResult[]
   loading: boolean
+  /** 本模式的后台任务是否在跑 */
+  running?: boolean
+  /** 停止请求是否在途 */
+  stopping?: boolean
+  /** 另一模式的任务占用中，本模式暂时不能启动 */
+  busy?: boolean
+  /** 当前轮次 */
+  round?: number
+  /** 已定论账号数 */
+  settled?: number
+  /** 参与本次检测的账号总数 */
+  total?: number
 }
 
 interface CookieTestRow extends Account {
@@ -68,13 +94,21 @@ interface CookieTestRow extends Account {
 const props = defineProps<Props>()
 const emit = defineEmits<{
   run: [accountNames: string[]]
+  stop: []
 }>()
+
+const running = computed(() => props.running === true)
+const stopping = computed(() => props.stopping === true)
+const busy = computed(() => props.busy === true)
+const round = computed(() => props.round ?? 0)
+const settled = computed(() => props.settled ?? 0)
+const total = computed(() => props.total ?? props.accounts.length)
 
 const selectedKeys = ref<string[]>([])
 const modeLabel = computed(() => props.mode === 'github_cookie' ? 'GitHub OAuth' : '站点 Cookie')
 const hint = computed(() => props.mode === 'github_cookie'
-  ? '只执行站点 OAuth state（POST /api/oauth/state）与 GitHub authorize：Client ID 取账号配置，未填则读站点 /api/status。取得授权 code 即视为凭据可用，不会调用站点 OAuth 回调或执行签到。'
-  : '直接验证 /api/user/self；检测到 new_api_refresh 时会先刷新凭据再验证，不会执行签到。')
+  ? '只执行站点 OAuth state（POST /api/oauth/state）与 GitHub authorize：Client ID 取账号配置，未填则读站点 /api/status。检测走服务器代理池，遇到代理/CDN 拦截会自动换出口无限重试，只有站点或凭据本身给出结论才会停止；不会调用 OAuth 回调或执行签到。'
+  : '直接验证 /api/user/self；检测到 new_api_refresh 时会先刷新凭据再验证。检测走服务器代理池，遇到代理/CDN 拦截会自动换出口无限重试，只有站点或凭据本身给出结论才会停止；不会执行签到。')
 const resultByName = computed(() => new Map(props.results.map((result) => [result.name, result])))
 const rows = computed<CookieTestRow[]>(() => props.accounts.map((account) => ({
   ...account,
@@ -94,6 +128,7 @@ function rowKey(row: CookieTestRow) {
 }
 
 function handleRun() {
+  if (busy.value) return
   emit('run', selectedKeys.value)
 }
 
@@ -108,6 +143,8 @@ function statusLabel(state: CookieTestState | undefined) {
     case 'invalid': return '失效'
     case 'abnormal': return '异常'
     case 'skipped': return '跳过'
+    case 'pending': return '排队中'
+    case 'running': return '检测中'
     default: return '未测试'
   }
 }
@@ -118,6 +155,8 @@ function statusType(state: CookieTestState | undefined): TagProps['type'] {
     case 'invalid': return 'error'
     case 'abnormal': return 'warning'
     case 'skipped': return 'default'
+    case 'pending': return 'default'
+    case 'running': return 'info'
     default: return 'info'
   }
 }
@@ -172,6 +211,29 @@ const columns: DataTableColumns<CookieTestRow> = [
     })
   },
   {
+    title: '尝试',
+    key: 'attempts',
+    width: 80,
+    render: (row) => {
+      const attempts = row.result?.attempts ?? 0
+      if (!attempts) return h('span', { class: 'muted' }, '—')
+      return h('span', { class: attempts > 1 ? 'attempts-many' : '' }, `${attempts} 次`)
+    }
+  },
+  {
+    title: '出口',
+    key: 'proxy',
+    width: 170,
+    ellipsis: { tooltip: true },
+    render: (row) => {
+      const proxy = row.result?.proxy ?? ''
+      if (!row.result) return h('span', { class: 'muted' }, '—')
+      return proxy
+        ? h('span', { class: 'mono-inline' }, proxy)
+        : h('span', { class: 'muted' }, '直连')
+    }
+  },
+  {
     title: '结果说明',
     key: 'message',
     minWidth: 280,
@@ -222,5 +284,15 @@ const columns: DataTableColumns<CookieTestRow> = [
 
 .muted {
   color: #a3aec0;
+}
+
+.mono-inline {
+  font-family: 'JetBrains Mono', Consolas, Monaco, monospace;
+  font-size: 12px;
+}
+
+.attempts-many {
+  color: #f0a020;
+  font-weight: 600;
 }
 </style>

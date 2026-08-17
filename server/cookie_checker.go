@@ -30,6 +30,8 @@ const (
 	cookieTestStateInvalid  = "invalid"
 	cookieTestStateAbnormal = "abnormal"
 	cookieTestStateSkipped  = "skipped"
+	cookieTestStatePending  = "pending"
+	cookieTestStateRunning  = "running"
 
 	cookieTestSelfPath        = "/api/user/self"
 	cookieTestRefreshPath     = "/api/user/auth/refresh"
@@ -38,7 +40,26 @@ const (
 	cookieTestGithubAuthorize = "https://github.com/login/oauth/authorize"
 	cookieTestRefreshTokenKey = "new_api_refresh="
 	cookieTestDefaultUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
+
+	// cookieTestConcurrency 账号级并发上限
+	cookieTestConcurrency = 5
 )
+
+// cookieTestChallengeStatuses 与 Python cf/detect.py 的 CHALLENGE_STATUSES 保持一致。
+var cookieTestChallengeStatuses = []int{403, 429, 503}
+
+// cookieTestCFHints / cookieTestChallengeMarkers 对齐 Python cf/detect.py 的 _CF_HINTS 与标题标记，
+// 用来区分「链路被挡在站点外」和「站点自己在回答」。
+var cookieTestCFHints = []string{"cloudflare", "cf-ray", "cdn-cgi"}
+
+var cookieTestChallengeMarkers = []string{
+	"just a moment", "attention required", "checking your browser", "请稍候",
+	"cdn-cgi/challenge-platform", "__cf_chl", "cf-browser-verification",
+	"you have been blocked", "error 1020", "sorry, you have been blocked",
+}
+
+// cookieTestProxyStatuses 代理自身报错的状态码：换一个代理有意义。
+var cookieTestProxyStatuses = []int{407, 502, 504}
 
 var cookieTestAuthMarkers = []string{
 	"未登录", "无权限", "登录已过期", "无效的凭证", "请先登录", "身份验证",
@@ -54,6 +75,13 @@ type CookieTestResult struct {
 	UserID     *int64 `json:"user_id"`
 	DurationMS int64  `json:"duration_ms"`
 	Message    string `json:"message"`
+	// Attempts 已尝试轮次；Proxy 最后一次使用的代理（host:port，空=直连）
+	Attempts int    `json:"attempts"`
+	Proxy    string `json:"proxy"`
+	// retryable 仅在服务内部使用：true 表示失败发生在链路层（代理/CF 拦截），换代理重试有意义
+	retryable bool `json:"-"`
+	// degradeNote 内部备注：账号代理降级到代理池后，附加在 message 前的提示
+	degradeNote string `json:"-"`
 }
 
 // CookieTestSummary 一轮检测的状态汇总。
@@ -65,14 +93,8 @@ type CookieTestSummary struct {
 	Skipped  int `json:"skipped"`
 }
 
-// CookieTestResponse Cookie 检测接口响应；不包含任何敏感凭据。
-type CookieTestResponse struct {
-	Mode      string             `json:"mode"`
-	CheckedAt string             `json:"checked_at"`
-	Summary   CookieTestSummary  `json:"summary"`
-	Results   []CookieTestResult `json:"results"`
-}
-
+// summarizeCookieTestResults 汇总四类终态；pending / running 属于中间态，不计入任何一类，
+// 但仍计入 Total，这样前端"总数 - 已定论"就是还在跑的数量。
 func summarizeCookieTestResults(results []CookieTestResult) CookieTestSummary {
 	summary := CookieTestSummary{Total: len(results)}
 	for _, result := range results {
@@ -91,7 +113,17 @@ func summarizeCookieTestResults(results []CookieTestResult) CookieTestSummary {
 }
 
 // runCookieTests 并发检测指定登录方式的启用账号，结果顺序与配置顺序一致。
+// 全程直连（不经代理池），供既有调用方与单轮直连场景使用。
 func runCookieTests(ctx context.Context, cfg *Config, mode string, names []string) ([]CookieTestResult, error) {
+	targets, err := selectCookieTestTargets(cfg, mode, names)
+	if err != nil {
+		return nil, err
+	}
+	return runCookieTestPass(ctx, cfg, mode, targets, func() string { return "" }), nil
+}
+
+// selectCookieTestTargets 按登录方式与账号名筛出待检测账号（启用且方式匹配）。
+func selectCookieTestTargets(cfg *Config, mode string, names []string) ([]Account, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("配置不能为空")
 	}
@@ -126,26 +158,38 @@ func runCookieTests(ctx context.Context, cfg *Config, mode string, names []strin
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("没有匹配 %s 的启用账号", cookieTestModeLabel(mode))
 	}
+	return targets, nil
+}
 
+// runCookieTestPass 跑一轮：并发 cookieTestConcurrency，每个账号从 nextProxy 领一个代理地址。
+// nextProxy 返回空串表示该次直连。结果下标与 targets 对应。
+func runCookieTestPass(ctx context.Context, cfg *Config, mode string,
+	targets []Account, nextProxy func() string) []CookieTestResult {
 	results := make([]CookieTestResult, len(targets))
-	sem := make(chan struct{}, 5)
+	sem := make(chan struct{}, cookieTestConcurrency)
 	var wg sync.WaitGroup
 	for i, account := range targets {
+		proxyAddr := ""
+		if nextProxy != nil {
+			proxyAddr = nextProxy()
+		}
 		wg.Add(1)
-		go func(index int, target Account) {
+		go func(index int, target Account, proxy string) {
 			defer wg.Done()
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
-				results[index] = cookieTestResult(target, cookieTestStateSkipped, "检测已取消", nil)
+				cancelled := cookieTestResult(target, cookieTestStateSkipped, "检测已取消", nil)
+				cancelled.Proxy = proxy
+				results[index] = cancelled
 				return
 			}
 			defer func() { <-sem }()
-			results[index] = checkCookieAccount(ctx, cfg.HTTP, target, mode)
-		}(i, account)
+			results[index] = checkCookieAccount(ctx, cfg.HTTP, target, mode, proxy)
+		}(i, account, proxyAddr)
 	}
 	wg.Wait()
-	return results, nil
+	return results
 }
 
 func cookieTestModeLabel(mode string) string {
@@ -155,22 +199,44 @@ func cookieTestModeLabel(mode string) string {
 	return "newapi_cookie"
 }
 
-func checkCookieAccount(ctx context.Context, httpCfg HTTPConfig, account Account, mode string) CookieTestResult {
+func checkCookieAccount(ctx context.Context, httpCfg HTTPConfig, account Account,
+	mode string, proxyAddr string) CookieTestResult {
 	started := time.Now()
 	var result CookieTestResult
 	if mode == LoginMethodGitHubCookie {
 		if strings.TrimSpace(account.GithubUserSession) == "" {
 			result = cookieTestResult(account, cookieTestStateSkipped, "缺少 GitHub Cookie（github_user_session）", nil)
 		} else {
-			result = checkGithubCookie(ctx, httpCfg, account)
+			result = checkGithubCookie(ctx, httpCfg, account, proxyAddr)
 		}
 	} else if strings.TrimSpace(account.Cookie) == "" {
-		result = cookieTestResult(account, cookieTestStateSkipped, "缺少 NewAPI Cookie（cookie）", nil)
+		result = cookieTestResult(account, cookieTestStateSkipped, "缺少站点 Cookie（cookie）", nil)
 	} else {
-		result = checkNewAPICookie(ctx, httpCfg, account)
+		result = checkNewAPICookie(ctx, httpCfg, account, proxyAddr)
 	}
 	result.DurationMS = time.Since(started).Milliseconds()
+	result.Proxy = cookieTestEffectiveProxy(account, proxyAddr)
 	return result
+}
+
+// cookieTestEffectiveProxy 返回本次实际生效的代理标识：账号自带代理优先，其次池子地址。
+func cookieTestEffectiveProxy(account Account, proxyAddr string) string {
+	if account.Proxy != nil && strings.TrimSpace(*account.Proxy) != "" {
+		return maskCookieTestProxy(strings.TrimSpace(*account.Proxy))
+	}
+	return strings.TrimSpace(proxyAddr)
+}
+
+// maskCookieTestProxy 账号自带代理可能带用户名密码，展示前抹掉认证信息。
+func maskCookieTestProxy(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "已配置账号代理"
+	}
+	if u.User != nil {
+		u.User = url.User("***")
+	}
+	return u.String()
 }
 
 func cookieTestResult(account Account, state, message string, userID *int64) CookieTestResult {
@@ -183,12 +249,51 @@ func cookieTestResult(account Account, state, message string, userID *int64) Coo
 	}
 }
 
-func checkNewAPICookie(ctx context.Context, httpCfg HTTPConfig, account Account) CookieTestResult {
+// cookieTestProxyIssue 构造「链路层失败」结果：状态仍是 abnormal，但标记为可换代理重试。
+func cookieTestProxyIssue(account Account, message string) CookieTestResult {
+	result := cookieTestResult(account, cookieTestStateAbnormal, message, nil)
+	result.retryable = true
+	return result
+}
+
+// cookieTestLooksLikeChallenge 判断响应是否为「链路被挡在站点外」：
+// 非 JSON 正文、CF/WAF 特征头或挑战页文案、挑战类状态码、代理自身错误码。
+func cookieTestLooksLikeChallenge(status int, header http.Header, body []byte) bool {
+	for _, code := range cookieTestProxyStatuses {
+		if status == code {
+			return true
+		}
+	}
+	if _, ok := cookieTestJSONMap(body); ok {
+		// 站点回了合法 JSON，说明请求已经到站点并被处理，属于源站在回答
+		return false
+	}
+	lowerBody := strings.ToLower(string(body))
+	if cookieTestContainsAny(lowerBody, cookieTestChallengeMarkers) {
+		return true
+	}
+	if header != nil {
+		joined := strings.ToLower(strings.Join([]string{
+			header.Get("Server"), header.Get("Cf-Ray"), header.Get("Cf-Mitigated"),
+		}, " "))
+		if cookieTestContainsAny(joined, cookieTestCFHints) {
+			return true
+		}
+	}
+	for _, code := range cookieTestChallengeStatuses {
+		if status == code {
+			return true
+		}
+	}
+	return false
+}
+
+func checkNewAPICookie(ctx context.Context, httpCfg HTTPConfig, account Account, proxyAddr string) CookieTestResult {
 	base, err := cookieTestBaseURL(account.URL)
 	if err != nil {
 		return cookieTestResult(account, cookieTestStateAbnormal, "站点 URL 无效: "+err.Error(), nil)
 	}
-	client, err := newCookieTestHTTPClient(account, httpCfg, true)
+	client, err := newCookieTestHTTPClient(account, httpCfg, true, proxyAddr)
 	if err != nil {
 		return cookieTestResult(account, cookieTestStateAbnormal, "HTTP 客户端配置失败: "+err.Error(), nil)
 	}
@@ -208,11 +313,16 @@ func checkNewAPIDirect(ctx context.Context, client *http.Client, base string, ac
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "网络错误: "+shortCookieTestError(err), nil)
+		return cookieTestProxyIssue(account, "网络错误: "+shortCookieTestError(err))
 	}
+	header := resp.Header
 	body, readErr := readCookieTestBody(resp)
 	if readErr != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "读取响应失败: "+readErr.Error(), nil)
+		return cookieTestProxyIssue(account, "读取响应失败: "+readErr.Error())
+	}
+	if cookieTestLooksLikeChallenge(resp.StatusCode, header, body) {
+		return cookieTestProxyIssue(account,
+			fmt.Sprintf("站点未放行当前出口（HTTP %d，疑似 CDN/WAF 拦截）", resp.StatusCode))
 	}
 	return classifyCookieTestSelf(account, resp.StatusCode, body, nil)
 }
@@ -227,11 +337,15 @@ func checkNewAPIWithRefresh(ctx context.Context, client *http.Client, base strin
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "refresh 网络错误: "+shortCookieTestError(err), nil)
+		return cookieTestProxyIssue(account, "refresh 网络错误: "+shortCookieTestError(err))
 	}
 	body, readErr := readCookieTestBody(resp)
 	if readErr != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "读取 refresh 响应失败: "+readErr.Error(), nil)
+		return cookieTestProxyIssue(account, "读取 refresh 响应失败: "+readErr.Error())
+	}
+	if cookieTestLooksLikeChallenge(resp.StatusCode, resp.Header, body) {
+		return cookieTestProxyIssue(account,
+			fmt.Sprintf("refresh 未放行当前出口（HTTP %d，疑似 CDN/WAF 拦截）", resp.StatusCode))
 	}
 	if result, done := classifyCookieTestRefresh(account, resp.StatusCode, body); done {
 		return result
@@ -254,16 +368,29 @@ func checkNewAPIWithRefresh(ctx context.Context, client *http.Client, base strin
 
 	selfResp, err := client.Do(selfReq)
 	if err != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "self 网络错误: "+shortCookieTestError(err), bundle.userID)
+		result := cookieTestProxyIssue(account, "self 网络错误: "+shortCookieTestError(err))
+		result.UserID = bundle.userID
+		return result
 	}
 	selfBody, readErr := readCookieTestBody(selfResp)
 	if readErr != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "读取 self 响应失败: "+readErr.Error(), bundle.userID)
+		result := cookieTestProxyIssue(account, "读取 self 响应失败: "+readErr.Error())
+		result.UserID = bundle.userID
+		return result
+	}
+	if cookieTestLooksLikeChallenge(selfResp.StatusCode, selfResp.Header, selfBody) {
+		result := cookieTestProxyIssue(account,
+			fmt.Sprintf("self 未放行当前出口（HTTP %d，疑似 CDN/WAF 拦截）", selfResp.StatusCode))
+		result.UserID = bundle.userID
+		return result
 	}
 	return classifyCookieTestSelf(account, selfResp.StatusCode, selfBody, bundle.userID)
 }
 
-func newCookieTestHTTPClient(account Account, httpCfg HTTPConfig, followRedirects bool) (*http.Client, error) {
+// newCookieTestHTTPClient 构造检测用客户端。
+// 代理优先级：账号自带 proxy > 传入的池子地址 proxyAddr > 进程环境变量。
+func newCookieTestHTTPClient(account Account, httpCfg HTTPConfig,
+	followRedirects bool, proxyAddr string) (*http.Client, error) {
 	timeout := time.Duration(httpCfg.Timeout) * time.Second
 	if timeout <= 0 {
 		timeout = 20 * time.Second
@@ -281,6 +408,16 @@ func newCookieTestHTTPClient(account Account, httpCfg HTTPConfig, followRedirect
 		proxyURL, err := url.Parse(strings.TrimSpace(*account.Proxy))
 		if err != nil || proxyURL.Scheme == "" || proxyURL.Host == "" {
 			return nil, fmt.Errorf("代理地址无效")
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	} else if addr := strings.TrimSpace(proxyAddr); addr != "" {
+		// 代理池里存的是裸 host:port，与 proxies.go 的 proxyFromRequest 保持同一套构造方式
+		if !strings.Contains(addr, "://") {
+			addr = "http://" + addr
+		}
+		proxyURL, err := url.Parse(addr)
+		if err != nil || proxyURL.Host == "" {
+			return nil, fmt.Errorf("代理池地址无效: %s", proxyAddr)
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
@@ -435,9 +572,14 @@ func classifyCookieTestSelf(account Account, status int, body []byte, fallbackID
 		case status == http.StatusUnauthorized || status == http.StatusForbidden:
 			return cookieTestResult(account, cookieTestStateInvalid, fmt.Sprintf("HTTP %d", status), fallbackID)
 		case status >= 500:
-			return cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("HTTP %d 服务器错误", status), fallbackID)
+			// 非 JSON 的 5xx 更像 CDN/网关错误页，换出口有意义
+			result := cookieTestProxyIssue(account, fmt.Sprintf("HTTP %d 网关错误（非 JSON）", status))
+			result.UserID = fallbackID
+			return result
 		default:
-			return cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("HTTP %d 非 JSON 响应", status), fallbackID)
+			result := cookieTestProxyIssue(account, fmt.Sprintf("HTTP %d 非 JSON 响应", status))
+			result.UserID = fallbackID
+			return result
 		}
 	}
 
@@ -479,17 +621,18 @@ func classifyCookieTestSelf(account Account, status int, body []byte, fallbackID
 	return cookieTestResult(account, cookieTestStateValid, username, userID)
 }
 
-func checkGithubCookie(ctx context.Context, httpCfg HTTPConfig, account Account) CookieTestResult {
-	return checkGithubCookieWithAuthorizeURL(ctx, httpCfg, account, cookieTestGithubAuthorize)
+func checkGithubCookie(ctx context.Context, httpCfg HTTPConfig, account Account, proxyAddr string) CookieTestResult {
+	return checkGithubCookieWithAuthorizeURL(ctx, httpCfg, account, cookieTestGithubAuthorize, proxyAddr)
 }
 
 // checkGithubCookieWithAuthorizeURL 为测试注入 authorize 地址；生产路径使用 GitHub 官方地址。
-func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, account Account, authorizeURL string) CookieTestResult {
+func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, account Account,
+	authorizeURL string, proxyAddr string) CookieTestResult {
 	base, err := cookieTestBaseURL(account.URL)
 	if err != nil {
 		return cookieTestResult(account, cookieTestStateAbnormal, "站点 URL 无效: "+err.Error(), nil)
 	}
-	client, err := newCookieTestHTTPClient(account, httpCfg, false)
+	client, err := newCookieTestHTTPClient(account, httpCfg, false, proxyAddr)
 	if err != nil {
 		return cookieTestResult(account, cookieTestStateAbnormal, "HTTP 客户端配置失败: "+err.Error(), nil)
 	}
@@ -511,11 +654,16 @@ func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, 
 	stateReq.Header.Set("Cache-Control", "no-store")
 	stateResp, err := client.Do(stateReq)
 	if err != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "OAuth state 网络错误: "+shortCookieTestError(err), nil)
+		return cookieTestProxyIssue(account, "OAuth state 网络错误: "+shortCookieTestError(err))
 	}
+	stateHeader := stateResp.Header
 	stateBody, readErr := readCookieTestBody(stateResp)
 	if readErr != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "读取 OAuth state 响应失败: "+readErr.Error(), nil)
+		return cookieTestProxyIssue(account, "读取 OAuth state 响应失败: "+readErr.Error())
+	}
+	if cookieTestLooksLikeChallenge(stateResp.StatusCode, stateHeader, stateBody) {
+		return cookieTestProxyIssue(account,
+			fmt.Sprintf("站点未放行当前出口（OAuth state HTTP %d，疑似 CDN/WAF 拦截）", stateResp.StatusCode))
 	}
 	state, stateResult := classifyCookieTestOAuthState(account, stateResp.StatusCode, stateBody)
 	if stateResult != nil {
@@ -537,11 +685,16 @@ func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, 
 		setCookieTestCommonHeaders(statusReq, base, "")
 		statusResp, doErr := client.Do(statusReq)
 		if doErr != nil {
-			return cookieTestResult(account, cookieTestStateAbnormal, "站点状态网络错误: "+shortCookieTestError(doErr), nil)
+			return cookieTestProxyIssue(account, "站点状态网络错误: "+shortCookieTestError(doErr))
 		}
+		statusHeader := statusResp.Header
 		statusBody, readErr := readCookieTestBody(statusResp)
 		if readErr != nil {
-			return cookieTestResult(account, cookieTestStateAbnormal, "读取站点状态失败: "+readErr.Error(), nil)
+			return cookieTestProxyIssue(account, "读取站点状态失败: "+readErr.Error())
+		}
+		if cookieTestLooksLikeChallenge(statusResp.StatusCode, statusHeader, statusBody) {
+			return cookieTestProxyIssue(account,
+				fmt.Sprintf("站点未放行当前出口（/api/status HTTP %d，疑似 CDN/WAF 拦截）", statusResp.StatusCode))
 		}
 		statusData, ok := cookieTestJSONMap(statusBody)
 		if !ok || statusResp.StatusCode >= 400 {
@@ -573,7 +726,7 @@ func checkGithubCookieWithAuthorizeURL(ctx context.Context, httpCfg HTTPConfig, 
 
 	authorizeResp, err := client.Do(authorizeReq)
 	if err != nil {
-		return cookieTestResult(account, cookieTestStateAbnormal, "GitHub authorize 网络错误: "+shortCookieTestError(err), nil)
+		return cookieTestProxyIssue(account, "GitHub authorize 网络错误: "+shortCookieTestError(err))
 	}
 	defer authorizeResp.Body.Close()
 	return classifyCookieTestGithubAuthorize(account, authorizeResp.StatusCode, authorizeResp.Header.Get("Location"))
@@ -586,11 +739,8 @@ func classifyCookieTestOAuthState(account Account, status int, body []byte) (str
 			result := cookieTestResult(account, cookieTestStateInvalid, fmt.Sprintf("OAuth state HTTP %d", status), nil)
 			return "", &result
 		}
-		if status >= 500 {
-			result := cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("OAuth state HTTP %d 服务器错误", status), nil)
-			return "", &result
-		}
-		result := cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("OAuth state HTTP %d 非 JSON 响应", status), nil)
+		// 非 JSON 一律视作链路被挡（CDN 错误页/挑战页），换出口重试
+		result := cookieTestProxyIssue(account, fmt.Sprintf("OAuth state HTTP %d 非 JSON 响应", status))
 		return "", &result
 	}
 	message := cookieTestMessage(data)
@@ -659,13 +809,19 @@ func classifyCookieTestGithubAuthorize(account Account, status int, location str
 		}
 		return cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("GitHub 未返回授权 code（HTTP %d）", status), nil)
 	}
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		return cookieTestResult(account, cookieTestStateInvalid, fmt.Sprintf("GitHub authorize HTTP %d，user_session 可能已失效", status), nil)
+	if status == http.StatusForbidden || status == http.StatusTooManyRequests {
+		// GitHub 在风控当前出口 IP（而不是否定 Cookie），换出口有意义
+		return cookieTestProxyIssue(account,
+			fmt.Sprintf("GitHub authorize HTTP %d，当前出口被 GitHub 限制", status))
+	}
+	if status == http.StatusUnauthorized {
+		return cookieTestResult(account, cookieTestStateInvalid, "GitHub authorize HTTP 401，user_session 已失效", nil)
 	}
 	if status >= 500 {
-		return cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("GitHub authorize HTTP %d 服务器错误", status), nil)
+		return cookieTestProxyIssue(account, fmt.Sprintf("GitHub authorize HTTP %d 服务器错误", status))
 	}
-	return cookieTestResult(account, cookieTestStateAbnormal, fmt.Sprintf("GitHub 未返回授权重定向（HTTP %d）", status), nil)
+	return cookieTestResult(account, cookieTestStateAbnormal,
+		fmt.Sprintf("GitHub 未返回授权重定向（HTTP %d），可能需要先在 GitHub 授权该 OAuth 应用", status), nil)
 }
 
 func parseCookieTestCookies(raw string) map[string]string {

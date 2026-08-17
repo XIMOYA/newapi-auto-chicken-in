@@ -2,14 +2,15 @@
 web/src/views/CookieTestsView.vue
 页面：Cookie 可用性测试
 职责：
-- 站点 Cookie 与 GitHub OAuth 使用两个独立 Tab 和独立请求状态
-- 只检测当前登录方式下的启用账号
-- 只做凭据可用性检查，不执行真正签到
+- 站点 Cookie 与 GitHub OAuth 使用两个独立 Tab；后端同一时刻只跑一个任务
+- 检测在服务端后台执行，本页每 2s 轮询进度，可手动停止
+- 代理类失败由服务端换代理无限重试，只做凭据可用性检查，不执行真正签到
 -->
 <template>
   <div class="page-container cookie-tests-page">
     <n-alert type="warning" :bordered="false" class="intro-alert">
-      站点 Cookie 与 GitHub OAuth 分开检测，结果不会互相覆盖。检测在服务端使用已保存的敏感凭据，浏览器不会接触 Cookie 明文。
+      检测在服务端后台执行并走服务器代理池：遇到代理或 CDN 拦截会自动换出口重试，只有站点/凭据本身给出结论才会停止，
+      因此需要时可点「停止检测」。浏览器不会接触 Cookie 明文。
     </n-alert>
 
     <n-tabs v-model:value="activeMode" type="line" animated>
@@ -17,20 +18,28 @@ web/src/views/CookieTestsView.vue
         <div class="tab-summary">
           <n-space :size="8" align="center">
             <n-tag size="small" type="info" :bordered="false">可检测 {{ newapiAccounts.length }} 个启用账号</n-tag>
-            <template v-if="newapiResponse">
-              <n-tag size="small" type="success" :bordered="false">有效 {{ newapiResponse.summary.valid }}</n-tag>
-              <n-tag size="small" type="error" :bordered="false">失效 {{ newapiResponse.summary.invalid }}</n-tag>
-              <n-tag size="small" type="warning" :bordered="false">异常 {{ newapiResponse.summary.abnormal }}</n-tag>
-              <span class="checked-at">上次检测：{{ formatTime(newapiResponse.checked_at) }}</span>
+            <template v-if="newapiSummary">
+              <n-tag size="small" type="success" :bordered="false">有效 {{ newapiSummary.valid }}</n-tag>
+              <n-tag size="small" type="error" :bordered="false">失效 {{ newapiSummary.invalid }}</n-tag>
+              <n-tag size="small" type="warning" :bordered="false">异常 {{ newapiSummary.abnormal }}</n-tag>
+              <n-tag v-if="newapiSummary.skipped" size="small" :bordered="false">跳过 {{ newapiSummary.skipped }}</n-tag>
+              <span v-if="newapiCheckedAt" class="checked-at">上次检测：{{ formatTime(newapiCheckedAt) }}</span>
             </template>
           </n-space>
         </div>
         <cookie-test-panel
           mode="newapi_cookie"
           :accounts="newapiAccounts"
-          :results="newapiResponse?.results ?? []"
-          :loading="newapiLoading"
+          :results="newapiResults"
+          :loading="starting === 'newapi_cookie'"
+          :running="runningMode === 'newapi_cookie'"
+          :stopping="stopping"
+          :busy="busyWith('newapi_cookie')"
+          :round="runningMode === 'newapi_cookie' ? round : 0"
+          :settled="newapiSettled"
+          :total="newapiTotal"
           @run="runNewAPITest"
+          @stop="handleStop"
         />
       </n-tab-pane>
 
@@ -38,20 +47,28 @@ web/src/views/CookieTestsView.vue
         <div class="tab-summary">
           <n-space :size="8" align="center">
             <n-tag size="small" type="info" :bordered="false">可检测 {{ githubAccounts.length }} 个启用账号</n-tag>
-            <template v-if="githubResponse">
-              <n-tag size="small" type="success" :bordered="false">有效 {{ githubResponse.summary.valid }}</n-tag>
-              <n-tag size="small" type="error" :bordered="false">失效 {{ githubResponse.summary.invalid }}</n-tag>
-              <n-tag size="small" type="warning" :bordered="false">异常 {{ githubResponse.summary.abnormal }}</n-tag>
-              <span class="checked-at">上次检测：{{ formatTime(githubResponse.checked_at) }}</span>
+            <template v-if="githubSummary">
+              <n-tag size="small" type="success" :bordered="false">有效 {{ githubSummary.valid }}</n-tag>
+              <n-tag size="small" type="error" :bordered="false">失效 {{ githubSummary.invalid }}</n-tag>
+              <n-tag size="small" type="warning" :bordered="false">异常 {{ githubSummary.abnormal }}</n-tag>
+              <n-tag v-if="githubSummary.skipped" size="small" :bordered="false">跳过 {{ githubSummary.skipped }}</n-tag>
+              <span v-if="githubCheckedAt" class="checked-at">上次检测：{{ formatTime(githubCheckedAt) }}</span>
             </template>
           </n-space>
         </div>
         <cookie-test-panel
           mode="github_cookie"
           :accounts="githubAccounts"
-          :results="githubResponse?.results ?? []"
-          :loading="githubLoading"
+          :results="githubResults"
+          :loading="starting === 'github_cookie'"
+          :running="runningMode === 'github_cookie'"
+          :stopping="stopping"
+          :busy="busyWith('github_cookie')"
+          :round="runningMode === 'github_cookie' ? round : 0"
+          :settled="githubSettled"
+          :total="githubTotal"
           @run="runGithubTest"
+          @stop="handleStop"
         />
       </n-tab-pane>
     </n-tabs>
@@ -59,26 +76,69 @@ web/src/views/CookieTestsView.vue
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { NAlert, NSpace, NTabPane, NTabs, NTag, useMessage } from 'naive-ui'
 import CookieTestPanel from '@/components/CookieTestPanel.vue'
-import { testGithubCookies, testNewAPICookies } from '@/api/cookieTests'
+import {
+  getCookieTestStatus,
+  startGithubCookieTest,
+  startNewAPICookieTest,
+  stopCookieTest
+} from '@/api/cookieTests'
 import { useConfigStore } from '@/stores/config'
 import { extractErrorMessage } from '@/utils/error'
-import type { Account, CookieTestResponse } from '@/types'
+import {
+  belongsToMode,
+  isBusyWithOtherMode,
+  justFinished,
+  snapshotFromStatus,
+  type CookieTestSnapshot
+} from '@/utils/cookieTestPolling'
+import type { Account, CookieTestMode, CookieTestResult, CookieTestStatus, CookieTestSummary } from '@/types'
+
+const POLL_INTERVAL = 2000
 
 const configStore = useConfigStore()
 const message = useMessage()
 
-const activeMode = ref<'newapi_cookie' | 'github_cookie'>('newapi_cookie')
-const newapiLoading = ref(false)
-const githubLoading = ref(false)
-const newapiResponse = ref<CookieTestResponse | null>(null)
-const githubResponse = ref<CookieTestResponse | null>(null)
+const activeMode = ref<CookieTestMode>('newapi_cookie')
+const starting = ref<CookieTestMode | ''>('')
+const stopping = ref(false)
+
+// 后端只有一个任务，这里按模式分别缓存最近一次结果，切 Tab 不会互相覆盖
+const newapiResults = ref<CookieTestResult[]>([])
+const githubResults = ref<CookieTestResult[]>([])
+const newapiSummary = ref<CookieTestSummary | null>(null)
+const githubSummary = ref<CookieTestSummary | null>(null)
+const newapiCheckedAt = ref('')
+const githubCheckedAt = ref('')
+
+const snapshot = ref<CookieTestSnapshot | null>(null)
+const round = ref(0)
+let prevSnapshot: CookieTestSnapshot | null = null
+let timer: ReturnType<typeof setInterval> | null = null
 
 const accounts = computed<Account[]>(() => configStore.config?.accounts ?? [])
-const newapiAccounts = computed(() => accounts.value.filter((account) => account.enabled && account.login_method !== 'github_cookie'))
-const githubAccounts = computed(() => accounts.value.filter((account) => account.enabled && account.login_method === 'github_cookie'))
+const newapiAccounts = computed(() => accounts.value.filter((a) => a.enabled && a.login_method !== 'github_cookie'))
+const githubAccounts = computed(() => accounts.value.filter((a) => a.enabled && a.login_method === 'github_cookie'))
+
+const runningMode = computed<CookieTestMode | ''>(() =>
+  snapshot.value?.running ? (snapshot.value.mode as CookieTestMode) : ''
+)
+const newapiSettled = computed(() => settledOf('newapi_cookie', newapiSummary.value))
+const githubSettled = computed(() => settledOf('github_cookie', githubSummary.value))
+const newapiTotal = computed(() => newapiSummary.value?.total ?? newapiAccounts.value.length)
+const githubTotal = computed(() => githubSummary.value?.total ?? githubAccounts.value.length)
+
+function settledOf(mode: CookieTestMode, summary: CookieTestSummary | null) {
+  if (runningMode.value === mode && snapshot.value) return snapshot.value.settled
+  if (!summary) return 0
+  return summary.valid + summary.invalid + summary.abnormal + summary.skipped
+}
+
+function busyWith(mode: CookieTestMode) {
+  return isBusyWithOtherMode(snapshot.value, mode)
+}
 
 function formatTime(value: string) {
   if (!value) return '—'
@@ -87,37 +147,107 @@ function formatTime(value: string) {
   return date.toLocaleString('zh-CN', { hour12: false })
 }
 
-function summaryMessage(label: string, response: CookieTestResponse) {
-  const { valid, invalid, abnormal, skipped } = response.summary
-  const extra = skipped ? `，跳过 ${skipped}` : ''
-  return `${label}检测完成：有效 ${valid}，失效 ${invalid}，异常 ${abnormal}${extra}`
+/** 把一次状态响应落到对应模式的缓存里 */
+function applyStatus(status: CookieTestStatus) {
+  const next = snapshotFromStatus(status)
+  snapshot.value = next
+  round.value = next.round
+
+  if (belongsToMode(next, 'newapi_cookie')) {
+    newapiResults.value = status.results
+    newapiSummary.value = status.summary
+    if (status.checked_at) newapiCheckedAt.value = status.checked_at
+  } else if (belongsToMode(next, 'github_cookie')) {
+    githubResults.value = status.results
+    githubSummary.value = status.summary
+    if (status.checked_at) githubCheckedAt.value = status.checked_at
+  }
+
+  if (justFinished(prevSnapshot, next)) {
+    stopPolling()
+    stopping.value = false
+    const label = next.mode === 'github_cookie' ? 'GitHub OAuth' : '站点 Cookie'
+    const { valid, invalid, abnormal, skipped } = status.summary
+    const extra = skipped ? `，跳过 ${skipped}` : ''
+    const prefix = next.stopped ? `${label}检测已停止` : `${label}检测完成`
+    message.success(`${prefix}：有效 ${valid}，失效 ${invalid}，异常 ${abnormal}${extra}`)
+    if (status.last_error) message.warning(status.last_error)
+  }
+  prevSnapshot = next
 }
 
-async function runNewAPITest(accountNames: string[]) {
-  newapiLoading.value = true
+async function pollOnce() {
   try {
-    const response = await testNewAPICookies(accountNames)
-    newapiResponse.value = response
-    message.success(summaryMessage('站点 Cookie', response))
+    applyStatus(await getCookieTestStatus())
   } catch (error) {
-    message.error(extractErrorMessage(error, '站点 Cookie 检测失败'))
-  } finally {
-    newapiLoading.value = false
+    stopPolling()
+    message.error(extractErrorMessage(error, '读取检测进度失败'))
   }
 }
 
-async function runGithubTest(accountNames: string[]) {
-  githubLoading.value = true
-  try {
-    const response = await testGithubCookies(accountNames)
-    githubResponse.value = response
-    message.success(summaryMessage('GitHub OAuth', response))
-  } catch (error) {
-    message.error(extractErrorMessage(error, 'GitHub OAuth 检测失败'))
-  } finally {
-    githubLoading.value = false
+function startPolling() {
+  if (timer !== null) return
+  timer = setInterval(pollOnce, POLL_INTERVAL)
+}
+
+function stopPolling() {
+  if (timer !== null) {
+    clearInterval(timer)
+    timer = null
   }
 }
+
+async function start(mode: CookieTestMode, accountNames: string[]) {
+  starting.value = mode
+  try {
+    if (mode === 'github_cookie') {
+      await startGithubCookieTest(accountNames)
+    } else {
+      await startNewAPICookieTest(accountNames)
+    }
+    // 立即拉一次，让表格马上进入「排队中/检测中」，不用等第一个轮询周期
+    prevSnapshot = null
+    await pollOnce()
+    startPolling()
+  } catch (error) {
+    message.error(extractErrorMessage(error, '启动检测失败'))
+  } finally {
+    starting.value = ''
+  }
+}
+
+function runNewAPITest(accountNames: string[]) {
+  void start('newapi_cookie', accountNames)
+}
+
+function runGithubTest(accountNames: string[]) {
+  void start('github_cookie', accountNames)
+}
+
+async function handleStop() {
+  stopping.value = true
+  try {
+    await stopCookieTest()
+    await pollOnce()
+  } catch (error) {
+    message.error(extractErrorMessage(error, '停止检测失败'))
+    stopping.value = false
+  }
+}
+
+onMounted(async () => {
+  // 页面刷新后若后台任务仍在跑，直接接管展示并继续轮询
+  await pollOnce()
+  if (snapshot.value?.running) {
+    prevSnapshot = snapshot.value
+    if (snapshot.value.mode === 'github_cookie' || snapshot.value.mode === 'newapi_cookie') {
+      activeMode.value = snapshot.value.mode
+    }
+    startPolling()
+  }
+})
+
+onBeforeUnmount(stopPolling)
 </script>
 
 <style scoped>

@@ -145,7 +145,8 @@ export interface ApiError {
 
 export type CookieTestMode = 'newapi_cookie' | 'github_cookie'
 
-export type CookieTestState = 'valid' | 'invalid' | 'abnormal' | 'skipped'
+/** pending / running 是后台任务的中间态，只在轮询期间出现 */
+export type CookieTestState = 'valid' | 'invalid' | 'abnormal' | 'skipped' | 'pending' | 'running'
 
 export interface CookieTestResult {
   name: string
@@ -154,6 +155,10 @@ export interface CookieTestResult {
   user_id: number | null
   duration_ms: number
   message: string
+  /** 已尝试轮次 */
+  attempts: number
+  /** 最后一次使用的代理（host:port，空串=直连） */
+  proxy: string
 }
 
 export interface CookieTestSummary {
@@ -164,9 +169,16 @@ export interface CookieTestSummary {
   skipped: number
 }
 
-export interface CookieTestResponse {
-  mode: CookieTestMode
+/** GET /api/cookie-tests/status 的响应：后台任务快照 */
+export interface CookieTestStatus {
+  running: boolean
+  stopped: boolean
+  mode: CookieTestMode | ''
+  round: number
+  started_at: string
   checked_at: string
+  duration_sec: number
+  last_error: string
   summary: CookieTestSummary
   results: CookieTestResult[]
 }
