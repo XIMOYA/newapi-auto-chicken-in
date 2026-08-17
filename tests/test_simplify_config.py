@@ -135,6 +135,31 @@ class TestSimplifyDocument:
             assert cfg[key] == raw[key]
 
 
+class TestUnwrap:
+    """用户可能直接把平台接口的响应喂进来，不该逼他先手工拆一层。"""
+
+    def test_bare_config_passes_through(self):
+        raw = {"config_version": 2, "accounts": []}
+        assert simplify_config.unwrap_payload(raw) is raw
+
+    def test_export_response_with_json_string(self):
+        inner = {"config_version": 2, "accounts": [account()]}
+        wrapped = {"json": json.dumps(inner, ensure_ascii=False)}
+        assert simplify_config.unwrap_payload(wrapped) == inner
+
+    def test_import_shape_with_config_object(self):
+        inner = {"config_version": 2, "accounts": []}
+        assert simplify_config.unwrap_payload({"config": inner, "mode": "overwrite"}) == inner
+
+    def test_unrecognized_shape_is_returned_as_is(self):
+        raw = {"something": 1}
+        assert simplify_config.unwrap_payload(raw) is raw
+
+    def test_broken_inner_json_does_not_raise(self):
+        wrapped = {"json": "{not json"}
+        assert simplify_config.unwrap_payload(wrapped) == wrapped
+
+
 class TestCLI:
     def test_check_mode_writes_nothing(self, tmp_path, capsys):
         src = tmp_path / "in.json"
@@ -168,3 +193,17 @@ class TestCLI:
     def test_stdin_requires_explicit_output(self, capsys):
         assert simplify_config.main(["-"]) == 2
         assert "-o" in capsys.readouterr().err
+
+    def test_export_response_file_is_accepted_end_to_end(self, tmp_path):
+        """整链路：把 GET /api/export 的响应原样存盘也能直接处理。"""
+        inner = {"config_version": 2, "accounts": [account()],
+                 "config_sync": {"enabled": False, "url": ""}}
+        src = tmp_path / "export.json"
+        src.write_text(json.dumps({"json": json.dumps(inner, ensure_ascii=False)}),
+                       encoding="utf-8")
+        dst = tmp_path / "out.json"
+        assert simplify_config.main([str(src), "-o", str(dst)]) == 0
+        cfg = json.loads(dst.read_text(encoding="utf-8"))
+        assert cfg["config_version"] == 3
+        assert cfg["tabiai"]["cdp_url"] == "http://127.0.0.1:9222"
+        assert "browser_path" not in cfg["accounts"][0]

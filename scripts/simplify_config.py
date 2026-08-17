@@ -91,6 +91,30 @@ def audit_account(account: dict) -> str:
     return ""
 
 
+def unwrap_payload(value):
+    """剥掉平台接口的外层包裹，拿到真正的配置对象。
+
+    GET /api/export 返回 {"json": "<配置的 JSON 字符串>"}，
+    导入格式是 {"config": {...}}，网页上复制出来的又是裸配置。
+    三种都直接接受，省得用户先手工拆一层。
+    """
+    for _ in range(3):  # 最多剥三层，避免畸形输入把自己绕进去
+        if not isinstance(value, dict):
+            return value
+        if "accounts" in value or "config_version" in value:
+            return value
+        inner = value.get("json", value.get("config"))
+        if inner is None:
+            return value
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner)
+            except ValueError:
+                return value
+        value = inner
+    return value
+
+
 def simplify(raw: dict) -> tuple[dict, dict]:
     """返回 (简化后的配置, 统计信息)。"""
     stats = {"dropped_fields": 0, "login_method_migrated": 0, "added_sections": []}
@@ -140,7 +164,7 @@ def main(argv=None) -> int:
     src = Path(args.input)
     try:
         text_in = sys.stdin.read() if from_stdin else src.read_text(encoding="utf-8")
-        raw = json.loads(text_in)
+        raw = unwrap_payload(json.loads(text_in))
     except (OSError, ValueError) as exc:
         print(f"读取失败: {exc}", file=sys.stderr)
         return 2
