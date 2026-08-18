@@ -6,7 +6,10 @@ web/src/views/OverviewView.vue
 - 账号管理表格：搜索、多选、启停开关、打码凭据、手动隧道、编辑/删除
 - 凭据列按登录方式展示：站点 Cookie 只有一项，TaBiAI 另附 user_session（签发原料）
 - 新增/编辑账号弹窗；批量启用/停用/删除（带确认）
-数据来源：GET /api/config（经 config store）、PUT /api/config（保存）
+数据来源：
+- GET /api/config（经 config store）
+- POST /api/accounts/ops（账号增删改：提交操作而非整份快照，多人同时编辑互不覆盖）
+- PUT /api/config（站点预设仍整份保存，走 revision 乐观锁）
 -->
 <template>
   <div class="overview">
@@ -166,7 +169,7 @@ import { verifyPassword } from '@/api/auth'
 import { exportConfig } from '@/api/export'
 import { deepClone } from '@/utils/clone'
 import { extractErrorMessage } from '@/utils/error'
-import type { Account, LoginMethod, Site } from '@/types'
+import type { Account, AccountOp, LoginMethod, Site } from '@/types'
 
 interface AccountRow extends Account {
   _index: number
@@ -436,10 +439,10 @@ async function handleCredentialIssued(accountName: string) {
 }
 
 function toggleEnabled(row: AccountRow, value: boolean) {
-  const target = accounts.value[row._index]
-  if (!target) return
-  target.enabled = value
-  persistAccounts(`${value ? '启用' : '停用'}账号「${row.name}」`)
+  void submitOps(
+    [{ type: 'set_enabled', name: row.name, enabled: value }],
+    `${value ? '启用' : '停用'}账号「${row.name}」`
+  )
 }
 
 const columns: DataTableColumns<AccountRow> = [
@@ -537,16 +540,18 @@ function openEditModal(row: AccountRow) {
 
 async function handleAccountSubmit(payload: Account) {
   submitting.value = true
+  // 编辑时带上原名：服务端据此定位旧记录，改名也能找回打码字段的真值
+  const previousName = editingAccount.value?.name
   try {
-    if (editingIndex.value >= 0 && accounts.value[editingIndex.value]) {
-      // 编辑：按索引替换
-      accounts.value[editingIndex.value] = payload
-    } else {
-      // 新增
-      accounts.value.push(payload)
-    }
-    await persistAccounts(editingIndex.value >= 0 ? `账号「${payload.name}」已更新` : `账号「${payload.name}」已添加`)
+    await submitOps(
+      [previousName && previousName !== payload.name
+        ? { type: 'upsert', account: payload, previous_name: previousName }
+        : { type: 'upsert', account: payload }],
+      editingIndex.value >= 0 ? `账号「${payload.name}」已更新` : `账号「${payload.name}」已添加`
+    )
     modalVisible.value = false
+  } catch {
+    // submitOps 内部已提示错误，弹窗保持打开让用户改
   } finally {
     submitting.value = false
   }
@@ -559,9 +564,8 @@ function confirmDelete(row: AccountRow) {
     positiveText: '删除',
     negativeText: '取消',
     onPositiveClick: () => {
-      accounts.value.splice(row._index, 1)
       selectedKeys.value = []
-      persistAccounts(`账号「${row.name}」已删除`)
+      void submitOps([{ type: 'delete', name: row.name }], `账号「${row.name}」已删除`)
     }
   })
 }
@@ -575,12 +579,14 @@ function batchToggle(enable: boolean) {
     positiveText: action,
     negativeText: '取消',
     onPositiveClick: () => {
-      selectedKeys.value.forEach((i) => {
-        if (accounts.value[i]) accounts.value[i].enabled = enable
-      })
-      const count = selectedKeys.value.length
+      // 选中项存的是行下标，先换成账号名再下发：别人插入/删除账号后下标会错位，名字不会
+      const names = selectedNames()
+      if (!names.length) return
       selectedKeys.value = []
-      persistAccounts(`已批量${action} ${count} 个账号`)
+      void submitOps(
+        names.map((name) => ({ type: 'set_enabled' as const, name, enabled: enable })),
+        `已批量${action} ${names.length} 个账号`
+      )
     }
   })
 }
@@ -593,17 +599,47 @@ function batchDelete() {
     positiveText: '删除',
     negativeText: '取消',
     onPositiveClick: () => {
-      const indexes = [...selectedKeys.value].sort((a, b) => b - a)
-      indexes.forEach((i) => {
-        if (accounts.value[i]) accounts.value.splice(i, 1)
-      })
-      const count = indexes.length
+      const names = selectedNames()
+      if (!names.length) return
       selectedKeys.value = []
-      persistAccounts(`已批量删除 ${count} 个账号`)
+      void submitOps(
+        names.map((name) => ({ type: 'delete' as const, name })),
+        `已批量删除 ${names.length} 个账号`
+      )
     }
   })
 }
 
+/** 把选中的行下标翻译成账号名，跳过已经不在列表里的（别人删掉的） */
+function selectedNames(): string[] {
+  return selectedKeys.value
+    .map((i) => accounts.value[i]?.name)
+    .filter((name): name is string => !!name)
+}
+
+/**
+ * 账号增删改统一出口：提交操作而非整份配置。
+ *
+ * 服务端在最新配置上重放，所以两个人同时加账号都能成功；别人已删掉的账号会被
+ * 跳过并在 skipped 里说明，这不算错误，提示一下就好。
+ */
+async function submitOps(ops: AccountOp[], successTip?: string) {
+  saving.value = true
+  try {
+    const res = await configStore.submitAccountOps(ops)
+    if (successTip) message.success(successTip)
+    if (res.skipped?.length) {
+      message.warning(`部分操作已跳过：${res.skipped.join('；')}`)
+    }
+  } catch (e) {
+    message.error(extractErrorMessage(e, '账号配置保存失败'))
+    throw e
+  } finally {
+    saving.value = false
+  }
+}
+
+/** 站点预设仍走整份保存：它没有并发热点，沿用 revision 乐观锁即可 */
 async function persistAccounts(successTip?: string) {
   if (!configStore.config) return
   saving.value = true

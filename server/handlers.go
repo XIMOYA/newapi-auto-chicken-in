@@ -63,9 +63,13 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/login", s.handleLogin)
 
 	mux.HandleFunc("GET /api/config", s.requireJWT(s.handleGetConfig))
+	mux.HandleFunc("GET /api/config/revision", s.requireJWT(s.handleConfigRevision))
 	mux.HandleFunc("PUT /api/config", s.requireJWT(s.handlePutConfig))
 	mux.HandleFunc("POST /api/config/import", s.requireJWT(s.handleImportConfig))
 	mux.HandleFunc("GET /api/config/raw", s.requireAPIKey(s.handleRawConfig))
+
+	// 账号级增量操作：多人同时编辑账号列表走这里，不走整份覆盖
+	mux.HandleFunc("POST /api/accounts/ops", s.requireJWT(s.handleAccountOps))
 
 	mux.HandleFunc("GET /api/keys", s.requireJWT(s.handleListKeys))
 	mux.HandleFunc("POST /api/keys", s.requireJWT(s.handleCreateKey))
@@ -175,6 +179,23 @@ func clientIP(r *http.Request) string {
 // ---------------------------------------------------------------------------
 // 辅助
 // ---------------------------------------------------------------------------
+// handleConfigRevision GET /api/config/revision（JWT）—— 只返回乐观锁版本号。
+//
+// 供前端轮询做「多人编辑无感同步」：配置本身可能有几十 KB，而判断「有没有变」
+// 只需要一个整数。只查一行一列，可以放心用短间隔轮询。
+//
+// 有意不返回 updated_at：凭据轮转会更新它但不推进 revision（见
+// saveConfigLockedKeepRevision），若把它一起返回，很容易被误用来判断变更，
+// 结果又让后台轮转触发全量刷新。
+func (s *Server) handleConfigRevision(w http.ResponseWriter, r *http.Request) {
+	_, _, revision, err := LoadConfigWithRevision(s.db)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "服务器内部错误")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"revision": revision})
+}
+
 // handleGetConfig GET /api/config（JWT）—— 返回打码后的配置、更新时间与乐观锁版本号。
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	cfg, updatedAt, revision, err := LoadConfigWithRevision(s.db)

@@ -5,7 +5,9 @@ web/src/layouts/AdminLayout.vue
 - 深蓝色侧边栏导航（配置总览/AI/浏览器/HTTP/全局默认/代理池/邮件通知/API Key/导出）
 - 顶部栏：当前页面标题 + 用户名下拉（修改密码/退出登录）
 - 首次进入时拉取 GET /api/config 初始化 config store
-数据来源：GET /api/config
+- 常驻轮询 GET /api/config/revision：版本号变了就静默换上最新配置，让别人的改动
+  自己出现在界面上（表单是本地副本，不会被冲掉）
+数据来源：GET /api/config、GET /api/config/revision
 -->
 <template>
   <n-layout has-sider class="admin-layout">
@@ -76,7 +78,7 @@ web/src/layouts/AdminLayout.vue
 
 <script setup lang="ts">
 import { computed, h, ref } from 'vue'
-import { onMounted } from 'vue'
+import { onMounted, onUnmounted } from 'vue'
 import { NLayout, NLayoutSider, NLayoutHeader, NLayoutContent, NMenu, NIcon, NButton, NDropdown, NTag, NSpin, useDialog, useMessage, type MenuOption, type DropdownOption } from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
 import {
@@ -100,6 +102,7 @@ import {
 import PasswordModal from '@/components/PasswordModal.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useConfigStore } from '@/stores/config'
+import { REVISION_POLL_INTERVAL, shouldPollRevision } from '@/utils/revisionSync'
 
 const route = useRoute()
 const router = useRouter()
@@ -186,6 +189,40 @@ onMounted(async () => {
     // 拦截器已处理 401；其他错误由各页面展示
   } finally {
     configReady.value = true
+  }
+  startRevisionPolling()
+})
+
+// 版本号轮询：只取一个整数，比轮询整份配置便宜得多
+let pollTimer: ReturnType<typeof setInterval> | null = null
+let pollInFlight = false
+
+function startRevisionPolling() {
+  if (pollTimer !== null) return
+  pollTimer = setInterval(pollRevisionOnce, REVISION_POLL_INTERVAL)
+}
+
+async function pollRevisionOnce() {
+  const ctx = {
+    hidden: typeof document !== 'undefined' && document.hidden,
+    inFlight: pollInFlight,
+    loading: configStore.loading
+  }
+  if (!shouldPollRevision(ctx)) return
+  pollInFlight = true
+  try {
+    await configStore.syncIfStale()
+  } catch {
+    // 轮询是尽力而为：网络抖动、401（拦截器会跳登录）都不该在界面上刷错误
+  } finally {
+    pollInFlight = false
+  }
+}
+
+onUnmounted(() => {
+  if (pollTimer !== null) {
+    clearInterval(pollTimer)
+    pollTimer = null
   }
 })
 </script>

@@ -57,7 +57,9 @@ func updateAccountCookie(db *sql.DB, name, cookie string) (bool, error) {
 	if !found {
 		return false, nil
 	}
-	if _, err := saveConfigLocked(db, cfg); err != nil {
+	// 轮转不推进 revision：否则一轮 Cookie 检测就能让所有打开的编辑页撞 409，
+	// 而用户改的往往是与凭据无关的字段（详见 saveConfigLockedKeepRevision 注释）
+	if _, err := saveConfigLockedKeepRevision(db, cfg); err != nil {
 		return false, err
 	}
 	return true, nil

@@ -464,20 +464,8 @@ function handleSubmit() {
       ? originalGithubUserSession.value
       : form.github_user_session
 
-    // 服务端按「账号名」匹配已保存的凭据：改名后占位符找不到旧值会被拒绝（400）。
-    // 这里提前拦一次，让用户当场重填，而不是提交后吃一个看不懂的报错。
-    const renamed = isEdit.value && props.account !== null && form.name.trim() !== props.account.name
-    const stillMasked = finalCookie === '***' || finalGithubUserSession === '***'
-    if (renamed && stillMasked) {
-      dialog.warning({
-        title: '改名需要重填凭据',
-        content: `账号名从「${props.account!.name}」改为「${form.name.trim()}」后，`
-          + '服务端无法再按原名找回已保存的凭据。请在本弹窗内重新填写对应的凭据后再保存。',
-        positiveText: '知道了'
-      })
-      return
-    }
-
+    // 改名不必重填凭据：提交时会带上原名（previous_name），
+    // 服务端据此定位旧记录，把 "***" 还原成已保存的真值
     const payload: Account = {
       name: form.name.trim(),
       url: form.url.trim(),

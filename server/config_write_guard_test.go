@@ -310,3 +310,136 @@ func TestSaveConfigKeepingCookiesSanitizesLeftovers(t *testing.T) {
 			saved.Accounts[0].Cookie, saved.AI.APIKey)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 凭据轮转不占用 revision（多人编辑无感同步的前提）
+// ---------------------------------------------------------------------------
+
+func TestRotationDoesNotBumpRevision(t *testing.T) {
+	// 线上现象：一轮 Cookie 检测给每个 tabiai 账号轮转一次凭据，每次都 bump revision，
+	// 于是所有打开的编辑页全部失效 —— 而用户改的往往是 AI 超时这类无关字段。
+	db, err := OpenDB(filepath.Join(t.TempDir(), "rev.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	cfg := DefaultConfig()
+	cfg.Accounts = []Account{
+		{Name: "tabi", URL: "https://a.com", LoginMethod: LoginMethodTabiAI,
+			Cookie: "new_api_refresh=gen1", Enabled: true},
+	}
+	if _, err := SaveConfig(db, cfg); err != nil {
+		t.Fatal(err)
+	}
+	_, _, before, err := LoadConfigWithRevision(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 连续轮转多次，模拟一轮检测扫过多个账号
+	for i := 0; i < 3; i++ {
+		if ok, err := updateAccountCookie(db, "tabi", "new_api_refresh=gen2"); err != nil || !ok {
+			t.Fatalf("轮转失败: ok=%v err=%v", ok, err)
+		}
+	}
+
+	stored, _, after, err := LoadConfigWithRevision(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Errorf("轮转推进了 revision（%d -> %d），打开的编辑页会被无关写入打断", before, after)
+	}
+	// 值本身必须真的写进去了
+	if stored.Accounts[0].Cookie != "new_api_refresh=gen2" {
+		t.Errorf("轮转值没落库: %q", stored.Accounts[0].Cookie)
+	}
+}
+
+func TestUserEditsStillBumpRevision(t *testing.T) {
+	// 对照：用户可见的变更仍然要推进版本号，否则乐观锁就失效了
+	srv := newTestServer(t)
+	seedConfig(t, srv, []Account{
+		{Name: "A", URL: "https://a.com", LoginMethod: LoginMethodNewAPICookie,
+			Cookie: "session=x", Enabled: true},
+	}, nil)
+	_, _, before, err := LoadConfigWithRevision(srv.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"revision":` + strconv.FormatInt(before, 10) + `,"config":{"accounts":[{"name":"A",` +
+		`"url":"https://a.com","login_method":"newapi_cookie","cookie":"***","enabled":false}]}}`
+	if rr := authedRequest(t, srv, "PUT", "/api/config", body); rr.Code != http.StatusOK {
+		t.Fatalf("保存失败 = %d, %s", rr.Code, rr.Body.String())
+	}
+	_, _, after, err := LoadConfigWithRevision(srv.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after <= before {
+		t.Errorf("用户编辑应推进 revision（%d -> %d）", before, after)
+	}
+}
+
+func TestRevisionPutStillSafeAfterSilentRotation(t *testing.T) {
+	// 改动「轮转不 bump revision」唯一可能破坏 H-1 的地方：
+	// 客户端读到 revision=N，后台静默轮转 gen1->gen2（revision 仍是 N），
+	// 客户端带 revision=N 提交且 cookie 为占位符 —— 版本号匹配，会真的写入。
+	// 保护来自 handlePutConfig 重读最新 oldCfg 后的 UnmaskConfig 还原。
+	srv := newTestServer(t)
+	seedConfig(t, srv, []Account{
+		{Name: "tabi", URL: "https://a.com", LoginMethod: LoginMethodTabiAI,
+			Cookie: "new_api_refresh=gen1", Enabled: true},
+	}, nil)
+
+	_, _, revision, err := LoadConfigWithRevision(srv.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := updateAccountCookie(srv.db, "tabi", "new_api_refresh=gen2"); err != nil || !ok {
+		t.Fatalf("轮转失败: ok=%v err=%v", ok, err)
+	}
+	// 前提确认：轮转没改版本号，所以下面这次提交不会被 409 挡住
+	_, _, afterRotate, err := LoadConfigWithRevision(srv.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRotate != revision {
+		t.Fatalf("前提不成立：轮转把 revision 从 %d 改成了 %d", revision, afterRotate)
+	}
+
+	// 前端提交的 cookie 恒为占位符（界面上看到的就是 "***"）
+	body := `{"revision":` + strconv.FormatInt(revision, 10) + `,"config":{"accounts":[{"name":"tabi",` +
+		`"url":"https://a.com","login_method":"tabiai","cookie":"***","enabled":true}]}}`
+	if rr := authedRequest(t, srv, "PUT", "/api/config", body); rr.Code != http.StatusOK {
+		t.Fatalf("版本号匹配应保存成功 = %d, %s", rr.Code, rr.Body.String())
+	}
+	if got := accountByName(t, srv, "tabi").Cookie; got != "new_api_refresh=gen2" {
+		t.Fatalf("占位符被还原成了旧代次 %q，期望 gen2", got)
+	}
+}
+
+func TestRevisionPutWritesExplicitPlaintextCookie(t *testing.T) {
+	// 反向断言：带 revision 且提交明文（非占位符）时，按用户意图写入。
+	// 这是「显式修改凭据」的正规入口，把行为钉住，避免以后被误判为 bug。
+	srv := newTestServer(t)
+	seedConfig(t, srv, []Account{
+		{Name: "tabi", URL: "https://a.com", LoginMethod: LoginMethodTabiAI,
+			Cookie: "new_api_refresh=gen1", Enabled: true},
+	}, nil)
+
+	_, _, revision, err := LoadConfigWithRevision(srv.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"revision":` + strconv.FormatInt(revision, 10) + `,"config":{"accounts":[{"name":"tabi",` +
+		`"url":"https://a.com","login_method":"tabiai","cookie":"new_api_refresh=manual","enabled":true}]}}`
+	if rr := authedRequest(t, srv, "PUT", "/api/config", body); rr.Code != http.StatusOK {
+		t.Fatalf("保存失败 = %d, %s", rr.Code, rr.Body.String())
+	}
+	if got := accountByName(t, srv, "tabi").Cookie; got != "new_api_refresh=manual" {
+		t.Fatalf("显式提交的明文凭据未生效: %q", got)
+	}
+}

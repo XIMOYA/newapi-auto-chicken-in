@@ -435,7 +435,12 @@ var configWriteMu sync.Mutex
 func SaveConfigKeepingCookies(db *sql.DB, cfg Config) (string, error) {
 	configWriteMu.Lock()
 	defer configWriteMu.Unlock()
+	return saveConfigKeepingCookiesLocked(db, cfg)
+}
 
+// saveConfigKeepingCookiesLocked 是 SaveConfigKeepingCookies 的实现体，不自己加锁。
+// 已持有 configWriteMu 的调用方（账号 ops）必须走这里，否则会自死锁。
+func saveConfigKeepingCookiesLocked(db *sql.DB, cfg Config) (string, error) {
 	stored, _, err := loadConfigLocked(db)
 	if err != nil {
 		return "", err
@@ -507,6 +512,42 @@ func saveConfigLocked(db *sql.DB, cfg Config) (string, error) {
 func loadConfigLocked(db *sql.DB) (Config, string, error) {
 	cfg, updatedAt, _, err := LoadConfigWithRevision(db)
 	return cfg, updatedAt, err
+}
+
+// saveConfigLockedKeepRevision 写入配置但**不推进 revision**（调用方需已持有 configWriteMu）。
+//
+// 只给凭据轮转用。revision 是给「用户可见的编辑」做乐观锁的，而 TaBiAI 的
+// new_api_refresh 由后台签到持续更新、在界面上永远显示为 "***" —— 用户既看不到也
+// 管不着。若轮转也 bump 版本号，跑一轮 Cookie 检测就能让所有打开的编辑页全部失效
+// （每个 tabiai 账号轮转一次 bump 一次），用户改的明明是 AI 超时这类无关字段。
+//
+// 不 bump 之后各写入路径各有防线，不共用一套兜底：
+//   - 带 revision 的 PUT：handlePutConfig 会重新读最新 oldCfg，UnmaskConfig 把前端提交的
+//     "***" 还原成轮转后的新值（前端提交的 cookie 恒为占位符），所以版本号没变也不会写回旧代次
+//   - 不带 revision 的 PUT、import、账号 ops：靠 SaveConfigKeepingCookies 保留库中现值
+func saveConfigLockedKeepRevision(db *sql.DB, cfg Config) (string, error) {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("序列化配置: %w", err)
+	}
+	updatedAt := time.Now().UTC().Format(time.RFC3339)
+	// 只更新 data 与 updated_at；revision 原样保留
+	res, err := db.Exec(
+		`UPDATE config SET data = ?, updated_at = ? WHERE id = ?`,
+		string(data), updatedAt, configRowID,
+	)
+	if err != nil {
+		return "", fmt.Errorf("保存配置: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("保存配置: %w", err)
+	}
+	if affected == 0 {
+		// 配置行还不存在（首次运行尚未初始化）：退回带 bump 的插入
+		return saveConfigLocked(db, cfg)
+	}
+	return updatedAt, nil
 }
 
 // SaveConfigIfMatch 仅当库中 revision 等于 expected 时写入（乐观锁）。

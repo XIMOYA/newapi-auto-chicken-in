@@ -1,0 +1,123 @@
+/*
+web/src/api/__tests__/config.test.ts
+配置接口封装测试（Vitest）
+覆盖：
+- applyAccountOps 打到 /accounts/ops 且不带 revision（服务端在最新配置上重放，无需乐观锁）
+- upsert 带 previous_name 时原样透传（改名靠它还原打码凭据）
+- getConfigRevision 走轻量端点
+- saveConfig 的 revision 可选语义
+说明：mock 掉 ../http，只验证「调了哪个地址、带了什么体」，不发真实请求
+*/
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const get = vi.fn()
+const put = vi.fn()
+const post = vi.fn()
+
+vi.mock('../http', () => ({
+  default: {
+    get: (...args: unknown[]) => get(...args),
+    put: (...args: unknown[]) => put(...args),
+    post: (...args: unknown[]) => post(...args)
+  }
+}))
+
+import { applyAccountOps, getConfigRevision, saveConfig } from '../config'
+import type { Account, AppConfig } from '@/types'
+
+const account = (name: string): Account => ({
+  name,
+  url: 'https://a.com',
+  login_method: 'newapi_cookie',
+  cookie: '***',
+  github_user_session: '',
+  github_client_id: '',
+  user_id: null,
+  proxy: null,
+  checkin_path: null,
+  browser_path: null,
+  enabled: true
+})
+
+beforeEach(() => {
+  get.mockReset()
+  put.mockReset()
+  post.mockReset()
+})
+
+describe('账号增量操作', () => {
+  it('打到 /accounts/ops，且请求体里没有 revision', async () => {
+    post.mockResolvedValue({ data: { ok: true, config: {}, updated_at: 't', revision: 7, skipped: null } })
+    await applyAccountOps([{ type: 'delete', name: 'A' }])
+    expect(post).toHaveBeenCalledWith('/accounts/ops', { ops: [{ type: 'delete', name: 'A' }] })
+    const body = post.mock.calls[0][1] as Record<string, unknown>
+    expect('revision' in body).toBe(false)
+  })
+
+  it('改名的 previous_name 原样透传', async () => {
+    post.mockResolvedValue({ data: { ok: true, config: {}, updated_at: 't', revision: 8, skipped: null } })
+    const payload = account('new-name')
+    await applyAccountOps([{ type: 'upsert', account: payload, previous_name: 'old-name' }])
+    expect(post).toHaveBeenCalledWith('/accounts/ops', {
+      ops: [{ type: 'upsert', account: payload, previous_name: 'old-name' }]
+    })
+  })
+
+  it('一次可以下发多条操作，顺序保持不变', async () => {
+    post.mockResolvedValue({ data: { ok: true, config: {}, updated_at: 't', revision: 9, skipped: [] } })
+    await applyAccountOps([
+      { type: 'set_enabled', name: 'A', enabled: false },
+      { type: 'set_enabled', name: 'B', enabled: false },
+      { type: 'delete', name: 'C' }
+    ])
+    const body = post.mock.calls[0][1] as { ops: Array<{ name: string }> }
+    expect(body.ops.map((o) => o.name)).toEqual(['A', 'B', 'C'])
+  })
+
+  it('解出服务端回传的最新配置与 skipped', async () => {
+    post.mockResolvedValue({
+      data: {
+        ok: true,
+        config: { accounts: [account('A')] } as unknown as AppConfig,
+        updated_at: '2024-01-01T00:00:00Z',
+        revision: 12,
+        skipped: ['账号 "X" 已不存在，跳过删除']
+      }
+    })
+    const res = await applyAccountOps([{ type: 'delete', name: 'X' }])
+    expect(res.revision).toBe(12)
+    expect(res.config.accounts).toHaveLength(1)
+    expect(res.skipped).toEqual(['账号 "X" 已不存在，跳过删除'])
+  })
+
+  it('服务端 400 原样抛出，交给页面提示', async () => {
+    post.mockRejectedValue({ response: { status: 400, data: { error: '账号名重复' } } })
+    await expect(applyAccountOps([{ type: 'delete', name: 'A' }])).rejects.toMatchObject({
+      response: { data: { error: '账号名重复' } }
+    })
+  })
+})
+
+describe('轻量版本号', () => {
+  it('走 /config/revision 而不是整份 /config', async () => {
+    get.mockResolvedValue({ data: { revision: 5 } })
+    const res = await getConfigRevision()
+    expect(get).toHaveBeenCalledWith('/config/revision')
+    expect(res.revision).toBe(5)
+  })
+})
+
+describe('整份保存的乐观锁', () => {
+  it('传了 revision 就带上', async () => {
+    put.mockResolvedValue({ data: { ok: true, updated_at: 't', revision: 3 } })
+    await saveConfig({} as AppConfig, 2)
+    expect(put).toHaveBeenCalledWith('/config', { config: {}, revision: 2 })
+  })
+
+  it('没传 revision 时请求体里不出现该字段', async () => {
+    put.mockResolvedValue({ data: { ok: true, updated_at: 't', revision: 3 } })
+    await saveConfig({} as AppConfig)
+    const body = put.mock.calls[0][1] as Record<string, unknown>
+    expect('revision' in body).toBe(false)
+  })
+})

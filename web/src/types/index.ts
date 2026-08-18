@@ -234,6 +234,37 @@ export interface SaveConfigResult {
   revision: number
 }
 
+/** 轻量版本号：只用于轮询判断配置有没有被别人改过 */
+export interface ConfigRevisionResult {
+  revision: number
+}
+
+// ===== 账号级增量操作 =====
+
+/**
+ * 一条账号操作。走 POST /api/accounts/ops 时提交的是「意图」而不是整份快照，
+ * 服务端在最新配置上按账号名重放，多人同时改不同账号互不覆盖。
+ */
+export type AccountOp =
+  | {
+      type: 'upsert'
+      account: Account
+      /** 改名时填原名：服务端据此找回打码字段的真值，用户不必重填凭据 */
+      previous_name?: string
+    }
+  | { type: 'delete'; name: string }
+  | { type: 'set_enabled'; name: string; enabled: boolean }
+
+export interface AccountOpsResult {
+  ok: boolean
+  /** 服务端重放后的最新打码配置，前端直接换上即可 */
+  config: AppConfig
+  updated_at: string
+  revision: number
+  /** 被跳过的操作说明（如目标账号已被他人删除），非错误 */
+  skipped: string[] | null
+}
+
 // ===== API Key =====
 
 export interface ApiKey {
