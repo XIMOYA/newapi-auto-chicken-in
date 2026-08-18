@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -28,8 +29,8 @@ STRATEGY_LABEL = {
 }
 
 # 「盾类」失败：被质询拦住、或拿不到 Turnstile token。
-# 这两种都靠「换出口 IP + 重开浏览器」翻盘，所以不限次数地重试，
-# 只由 ACCOUNT_DEADLINE_SECONDS 这个时间盒收口。
+# 这两种都靠「换出口 IP + 重开浏览器」翻盘，所以不限次数地重试；
+# 默认连时间也不限（见 ACCOUNT_DEADLINE_SECONDS），一直试到成功或拿到定论。
 _SHIELD_RETRYABLE = (api.CF_BLOCKED, api.TURNSTILE_REQUIRED)
 # 计次重试的结果：网络层瞬时故障、以及响应看不懂（可能是临时的网关页）
 _RETRYABLE = (api.NETWORK_ERROR, api.UNKNOWN) + _SHIELD_RETRYABLE
@@ -57,9 +58,17 @@ MAX_ACCOUNT_PARALLELISM = 16
 # 是 CPU 密集的；开到 4 个会互相抢核，让本来能过的实例撞上 browser.timeout。
 FIXED_BROWSER_PARALLELISM = 3
 MAX_BROWSER_PARALLELISM = FIXED_BROWSER_PARALLELISM
-# 单账号的总时长上限（秒）。盾类失败是「不限次数重试到成功」，必须有一个
-# 时间盒兜底，否则一个卡住的账号会占死一个并发位，把整轮拖到 Actions 超时。
-ACCOUNT_DEADLINE_SECONDS = 1200
+# 单账号的总时长上限（秒）。<=0 表示不限时：盾类与网络失败一直重试到出结果。
+#
+# 默认关闭是有意的取舍。之前设 1200s 是怕一个卡住的账号占死并发位、把整轮拖到
+# Actions 超时；但代价是过盾本来就慢的站点会被半途掐掉，白扔一个账号的签到。
+# 现在选择「宁可整轮慢，也不放弃账号」，唯一的兜底是 Actions 自己的 6 小时硬上限
+# （workflow 有意不设 timeout-minutes，走平台默认 360 分钟）。
+#
+# 注意这不等于「卡死也不管」：只有盾类和网络层失败会无限重试，源站业务失败与 WAF
+# 硬封禁仍只换 SOURCE_IP_SWAP_LIMIT 次 IP 就跳过，认证失败等定论直接跳过。
+# 想恢复收口只改这一个数字，下面的时间盒逻辑仍在。
+ACCOUNT_DEADLINE_SECONDS = 0
 # 盾类重试的退避上限（秒）。连续硬刚 Cloudflare 只会让质询更难过
 SHIELD_RETRY_BACKOFF_MAX = 30
 # 出口 IP 探测结果缓存的上限。代理池在换 IP 时地址是有限的，但 daemon 长跑
@@ -546,14 +555,19 @@ class Runner:
         2. 源站业务失败/WAF 硬封禁：额外换最多 5 次 IP，每次等待 5 秒；
            换 IP 和等待耗时仍计入账号时间盒，仍是同类问题就跳过。
         3. 盾类失败（Cloudflare/Turnstile）：换 IP + 重开浏览器，次数不限；换不到新 IP
-           时沿用当前出口继续试，唯一的收口是账号时间盒。
+           时沿用当前出口继续试。
         4. 认证、未知或其他不可恢复结果：直接跳过，不浪费重试次数。
 
-        时间盒是所有重试的统一上限：一旦耗尽，本账号不再做任何重试，带着当前
-        结果收工。排队等浏览器槽位的耗时会加回时间盒 —— 那是等全局资源，
+        时间盒默认关闭（ACCOUNT_DEADLINE_SECONDS <= 0），此时 1 与 3 一直试到出结果，
+        只有 Actions 的 6 小时硬上限能中止它们；2 与 4 的收口与时间盒无关，照旧生效。
+        设成正数时它就是所有重试的统一上限：一旦耗尽，本账号不再做任何重试，带着当前
+        结果收工；排队等浏览器槽位的耗时会加回时间盒 —— 那是等全局资源，
         不属于这个账号自己的过盾时间。
         """
-        deadline = time.monotonic() + ACCOUNT_DEADLINE_SECONDS
+        # inf 让下面所有 deadline 运算与比较都自然退化成「永不耗尽」，
+        # 不必在每个分支上再套一层「是否限时」的判断
+        unlimited = ACCOUNT_DEADLINE_SECONDS <= 0
+        deadline = math.inf if unlimited else time.monotonic() + ACCOUNT_DEADLINE_SECONDS
         # 网络异常成功换 IP 的耗时会加回 deadline；源站/WAF/盾类换 IP及退避仍计入。
         # 网络换 IP 不限次数；源站/WAF 只允许额外换五次；两类都记入真实累计数。
         swapped_total = 0
@@ -610,7 +624,7 @@ class Runner:
                     else "源站/WAF 问题且没有可用的新 IP",
                 )
 
-            # 3) 盾类失败：换 IP + 重开浏览器，次数不限，只由时间盒收口
+            # 3) 盾类失败：换 IP + 重开浏览器，次数不限；限了时才由时间盒收口
             if row.status in _SHIELD_RETRYABLE and self._should_retry(row):
                 left = deadline - time.monotonic()
                 if left <= 0:
@@ -627,7 +641,9 @@ class Runner:
                 log.warn(f"{label}：第 {shield_rounds} 轮重试"
                          + (f"（已换出口 IP，本账号累计已换 {swapped_total} 个）" if swapped
                             else "（无新 IP 可换，沿用当前 IP 重开浏览器）")
-                         + f"，退避 {backoff:.0f}s，剩余时间盒 {left:.0f}s")
+                         + f"，退避 {backoff:.0f}s，"
+                         + ("时间盒不限，试到出结果为止" if unlimited
+                            else f"剩余时间盒 {left:.0f}s"))
                 if backoff > 0:
                     time.sleep(backoff)
                 continue

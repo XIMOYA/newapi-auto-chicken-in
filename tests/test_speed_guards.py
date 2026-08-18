@@ -3,6 +3,7 @@
 这些断言存在的原因是「签到太慢」的具体成因，改动相关逻辑时不要放宽它们。
 """
 
+import math
 import threading
 import time
 
@@ -87,8 +88,13 @@ class TestRetrySemantics:
 class TestShieldRetriesUntilDeadline:
     """被盾拦住 / 拿不到 Turnstile token：换 IP + 重开浏览器，一直试到成功。"""
 
-    def test_account_deadline_is_1200_seconds(self):
-        assert runner_mod.ACCOUNT_DEADLINE_SECONDS == 1200
+    def test_account_deadline_is_disabled_by_default(self):
+        """默认不限时：宁可整轮慢，也不半途掐掉一个过盾本来就慢的账号。
+
+        唯一的兜底是 Actions 自己的 6 小时硬上限。下面那些用例仍会把它
+        monkeypatch 成正数，用来守「一旦设了上限，收口逻辑照旧正确」。
+        """
+        assert runner_mod.ACCOUNT_DEADLINE_SECONDS <= 0
 
     @staticmethod
     def _wire(runner, monkeypatch, statuses, *, deadline=0.6):
@@ -760,3 +766,131 @@ class TestDeadlineStopsAllRetries:
         row = runner._run_account(runner.cfg.accounts[0])
         assert len(calls) == 1
         assert row.status == api.SUCCESS
+
+
+class TestUnlimitedRetriesWhenDeadlineOff:
+    """时间盒关闭（默认）后的边界：盾类和网络无限试，源站问题该收口的仍收口。
+
+    「无限」只针对靠换 IP / 重开浏览器能翻盘的失败。源站已经给出业务结论、
+    WAF 硬封禁、认证失败这些，多试也是白试，收口逻辑不能被一起关掉 ——
+    否则一个已经废掉的账号会把并发位占到 Actions 被强杀。
+    """
+
+    @staticmethod
+    def _wire(runner, monkeypatch, statuses, *, clock=None):
+        """让时钟飞快前进，证明重试不是因为「时间还没到」才继续的。"""
+        monkeypatch.setattr(runner_mod, "ACCOUNT_DEADLINE_SECONDS", 0)
+        monkeypatch.setattr(runner_mod, "SHIELD_RETRY_BACKOFF_MAX", 0)
+        monkeypatch.setattr(runner_mod.time, "sleep", lambda _s: None)
+        if clock is not None:
+            monkeypatch.setattr(runner_mod.time, "monotonic", clock.monotonic)
+        if runner.options.use_browser and runner._pool is None:
+            runner._pool = _EndlessPool()
+        calls = []
+
+        def fake_attempt(account, record):
+            calls.append(account.proxy)
+            if clock is not None:
+                clock.now += 600.0  # 每轮烧掉 10 分钟，早该撞穿原来的 1200s
+            index = min(len(calls) - 1, len(statuses) - 1)
+            return _row(account.name, statuses[index])
+
+        monkeypatch.setattr(runner, "_attempt", fake_attempt)
+        return calls
+
+    def test_shield_keeps_retrying_far_beyond_the_old_1200s_box(self, tmp_path, monkeypatch):
+        """原本 1200s 就该放弃；现在跑到 30 分钟仍在试，直到自己成功。"""
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        clock = _FakeClock()
+        calls = self._wire(
+            runner, monkeypatch,
+            [api.CF_BLOCKED] * 3 + [api.SUCCESS],
+            clock=clock,
+        )
+        row = runner._run_account(runner.cfg.accounts[0])
+        assert row.status == api.SUCCESS
+        assert len(calls) == 4
+        assert clock.now > 1200  # 确实越过了旧时间盒
+
+    def test_turnstile_also_retries_without_time_limit(self, tmp_path, monkeypatch):
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        clock = _FakeClock()
+        calls = self._wire(
+            runner, monkeypatch,
+            [api.TURNSTILE_REQUIRED] * 4 + [api.SUCCESS],
+            clock=clock,
+        )
+        assert runner._run_account(runner.cfg.accounts[0]).status == api.SUCCESS
+        assert len(calls) == 5
+        assert clock.now > 1200
+
+    def test_network_error_retries_without_time_limit(self, tmp_path, monkeypatch):
+        """网络层失败同样不再被时间掐断，只要池子还能给新 IP。"""
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        clock = _FakeClock()
+        calls = self._wire(
+            runner, monkeypatch,
+            [api.NETWORK_ERROR] * 5 + [api.SUCCESS],
+            clock=clock,
+        )
+        assert runner._run_account(runner.cfg.accounts[0]).status == api.SUCCESS
+        assert len(calls) == 6
+        assert clock.now > 1200
+
+    def test_network_error_without_new_ip_still_skips(self, tmp_path, monkeypatch):
+        """换不到新 IP 仍然跳过：不限时不等于在同一个坏出口上空转。"""
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        calls = self._wire(runner, monkeypatch, [api.NETWORK_ERROR])
+        monkeypatch.setattr(runner, "_swap_pooled_proxy", lambda _a: False)
+        row = runner._run_account(runner.cfg.accounts[0])
+        assert row.status == "skipped"
+        assert len(calls) == 1
+
+    def test_source_failure_still_stops_after_ip_swap_limit(self, tmp_path, monkeypatch):
+        """源站业务失败：仍只换 SOURCE_IP_SWAP_LIMIT 次就跳过，不受关闭时间盒影响。"""
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        calls = self._wire(runner, monkeypatch, [api.FAILED])
+        row = runner._run_account(runner.cfg.accounts[0])
+        assert row.status == "skipped"
+        # 首次尝试 + 换 IP 上限次重试，一轮不多
+        assert len(calls) == runner_mod.SOURCE_IP_SWAP_LIMIT + 1
+
+    def test_waf_block_still_stops_after_ip_swap_limit(self, tmp_path, monkeypatch):
+        """WAF 硬封禁同理：这是源站态度，多试只会加深封禁。"""
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        calls = self._wire(runner, monkeypatch, [api.WAF_BLOCKED])
+        row = runner._run_account(runner.cfg.accounts[0])
+        assert row.status == "skipped"
+        assert len(calls) == runner_mod.SOURCE_IP_SWAP_LIMIT + 1
+
+    def test_auth_failure_still_skips_immediately(self, tmp_path, monkeypatch):
+        """认证失败是定论，一次就收工。"""
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        calls = self._wire(runner, monkeypatch, [api.AUTH_FAILED])
+        runner._run_account(runner.cfg.accounts[0])
+        assert len(calls) == 1
+
+    def test_shield_without_browser_still_skips(self, tmp_path, monkeypatch):
+        """没有浏览器时盾类无法自救，不该借着「不限时」空转。"""
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=False)
+        calls = self._wire(runner, monkeypatch, [api.CF_BLOCKED])
+        assert runner._run_account(runner.cfg.accounts[0]).status == "skipped"
+        assert len(calls) == 1
+
+    def test_backoff_is_not_truncated_by_a_missing_deadline(self, tmp_path, monkeypatch):
+        """不限时时退避按正常曲线走，不该被 inf 运算弄成 0 或 inf。"""
+        runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
+        monkeypatch.setattr(runner_mod, "ACCOUNT_DEADLINE_SECONDS", 0)
+        monkeypatch.setattr(runner_mod, "SHIELD_RETRY_BACKOFF_MAX", 30)
+        runner._pool = _EndlessPool()
+        slept: list = []
+        monkeypatch.setattr(runner_mod.time, "sleep", slept.append)
+        results = [api.CF_BLOCKED, api.CF_BLOCKED, api.SUCCESS]
+        monkeypatch.setattr(
+            runner, "_attempt",
+            lambda acct, record: _row(acct.name, results.pop(0)),
+        )
+        assert runner._run_account(runner.cfg.accounts[0]).status == api.SUCCESS
+        # 5 * 轮数，且都是有限正数
+        assert slept == [5, 10]
+        assert all(0 < s < math.inf for s in slept)
