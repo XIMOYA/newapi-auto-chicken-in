@@ -32,22 +32,24 @@ const serverVersion = "1.0.0"
 
 // Server 服务依赖：数据库连接、JWT 签名密钥、代理池管理器与登录限流器。
 type Server struct {
-	db          *sql.DB
-	jwtSecret   []byte
-	proxies     *ProxyManager
-	cookieTests *CookieTestRunner
-	loginLim    *loginLimiter
+	db            *sql.DB
+	jwtSecret     []byte
+	proxies       *ProxyManager
+	cookieTests   *CookieTestRunner
+	loginLim      *loginLimiter
+	exportTickets *exportTicketStore
 }
 
 // NewServer 构造服务实例；jwtSecret 为 JWT 签名密钥（main 已校验长度）。
 func NewServer(db *sql.DB, jwtSecret string) *Server {
 	proxies := NewProxyManager(db)
 	return &Server{
-		db:          db,
-		jwtSecret:   []byte(jwtSecret),
-		proxies:     proxies,
-		cookieTests: NewCookieTestRunner(proxies, db),
-		loginLim:    newLoginLimiter(),
+		db:            db,
+		jwtSecret:     []byte(jwtSecret),
+		proxies:       proxies,
+		cookieTests:   NewCookieTestRunner(proxies, db),
+		loginLim:      newLoginLimiter(),
+		exportTickets: newExportTicketStore(),
 	}
 }
 
@@ -191,7 +193,10 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 //
 // 并发保护：请求带 revision 时走乐观锁，版本不一致返回 409 并回传当前最新配置，
 // 避免多人/多标签页各自用陈旧快照整份覆盖（曾导致别人刚填的 Cookie 被静默清空）。
-// 不带 revision 时保持原有无条件覆盖行为，兼容既有外部脚本。
+//
+// 不带 revision 时保持无条件覆盖行为以兼容既有外部脚本，但 accounts[].cookie 会
+// 保留库中现有值 —— 该字段由后台签到持续轮转，用陈旧请求体写回旧代次会触发站点
+// 重放检测、导致整条会话被撤销。要改凭据请带上 revision，或用签发/回写接口。
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Config   *Config `json:"config"`
@@ -223,7 +228,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 
 	if req.Revision == nil {
 		log.Printf("[config] PUT /api/config 未携带 revision，按无条件覆盖处理（并发保护未生效）")
-		updatedAt, saveErr := SaveConfig(s.db, *merged)
+		updatedAt, saveErr := SaveConfigKeepingCookies(s.db, *merged)
 		if saveErr != nil {
 			writeError(w, http.StatusInternalServerError, "服务器内部错误")
 			return
@@ -321,12 +326,21 @@ func (s *Server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 	} else {
 		target = in
 	}
+	// 导入的往往是从本平台导出的 JSON：GET /api/config 里的敏感字段是 "***"。
+	// 不还原就会把占位符字面量当真值落库，不可逆地摧毁 api_key / SMTP 密码等凭据。
+	restored, err := UnmaskConfig(&target, &oldCfg)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	target = *restored
 	if err := ValidateConfig(&target); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	updatedAt, err := SaveConfig(s.db, target)
+	// 走保留凭据的写入：导入文件通常是几小时前的快照，而 cookie 由后台持续轮转
+	updatedAt, err := SaveConfigKeepingCookies(s.db, target)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 		return
@@ -457,7 +471,18 @@ func (s *Server) handleVerifyPassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "密码错误")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	// 签发一次性票据：GET /api/export 会校验并销毁它，
+	// 这样「查看明文前先验密码」在服务端真正生效，而不是只靠前端自觉调用。
+	ticket, expiresIn, err := s.exportTickets.issue(username)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "服务器内部错误")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"ticket":     ticket,
+		"expires_in": expiresIn,
+	})
 }
 
 // handleNewAPICookieTest POST /api/cookie-tests/newapi（JWT）—— 启动站点 Cookie 检测任务。
@@ -595,8 +620,18 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 // 导出 / 修改密码
 // ---------------------------------------------------------------------------
 
-// handleExport GET /api/export（JWT）—— 返回完整明文配置的 JSON 字符串。
+// handleExport GET /api/export（JWT + 一次性票据）—— 返回完整明文配置的 JSON 字符串。
+//
+// 除 JWT 外还要求 X-Export-Ticket：票据由 POST /api/auth/verify-password 签发，
+// 单次使用、2 分钟过期、绑定用户。没有这层绑定的话，拿到 JWT 就能直接拉走全部
+// 明文凭据，前端那步密码确认等于装饰。
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	username, _ := r.Context().Value(ctxKeyUsername).(string)
+	if !s.exportTickets.consume(r.Header.Get("X-Export-Ticket"), username) {
+		writeError(w, http.StatusForbidden,
+			"导出需要先通过密码确认（票据缺失、已使用或已过期），请重新验证密码")
+		return
+	}
 	cfg, _, err := LoadConfig(s.db)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
@@ -631,8 +666,8 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "旧密码错误")
 		return
 	}
-	if len(req.NewPassword) < 8 {
-		writeError(w, http.StatusBadRequest, "新密码至少 8 个字符")
+	if len(req.NewPassword) < minPasswordLen {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("新密码至少 %d 个字符", minPasswordLen))
 		return
 	}
 

@@ -265,8 +265,9 @@ const cookieRevealLabel = ref('')
 async function handleRevealCookie(password: string) {
   revealing.value = true
   try {
-    await verifyPassword(password)
-    const res = await exportConfig()
+    // 票据只能用一次，必须紧接着交给 exportConfig
+    const { ticket } = await verifyPassword(password)
+    const res = await exportConfig(ticket)
     const cfg = JSON.parse(res.json) as { accounts?: Account[] }
     const target = (cfg.accounts ?? []).find((a) => a.name === cookieRevealTarget.value)
     const value = target?.[cookieRevealField.value]

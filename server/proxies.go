@@ -43,6 +43,10 @@ type ProxyEntry struct {
 
 var ipPortRe = regexp.MustCompile(`\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\b`)
 
+// maxProxySourceBytes 单个代理源允许读入的最大字节数。
+// 代理列表通常只有几十 KB，8 MiB 留足余量；主要用途是挡住上游异常/被投毒时的超大响应。
+const maxProxySourceBytes = 8 << 20
+
 // createProxiesTable 建 proxies 表（幂等）。
 func createProxiesTable(db *sql.DB) error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS proxies (
@@ -274,11 +278,18 @@ func fetchSourceOnce(url string, timeout int) []string {
 		log.Printf("[proxy] 源 %s HTTP %d", url, resp.StatusCode)
 		return nil
 	}
-	// 读全部 body（文本可能较大，但远小于 Go 默认内存限制）
+	// 限制读入体积：默认源是 6 个第三方 GitHub raw 地址，上游被投毒/劫持返回
+	// 超大响应就能把服务打到 OOM（对比站点检测那边已有 4MiB 上限）。
+	// 超限只截断不整体失败 —— 已读到的部分照样能解析出可用代理。
 	buf := new(strings.Builder)
-	if _, err := copyBody(buf, resp.Body); err != nil {
+	read, err := copyBody(buf, io.LimitReader(resp.Body, maxProxySourceBytes))
+	if err != nil {
 		log.Printf("[proxy] 读源 %s 失败: %v", url, err)
 		return nil
+	}
+	if read >= maxProxySourceBytes {
+		log.Printf("[proxy] 源 %s 响应超过 %d MiB 上限，已截断读取（可能是上游异常）",
+			url, maxProxySourceBytes>>20)
 	}
 	return parseProxyLines(buf.String())
 }

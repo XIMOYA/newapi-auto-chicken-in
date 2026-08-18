@@ -33,18 +33,32 @@ import (
 	"time"
 )
 
+// minJWTSecretLen 是 NCF_JWT_SECRET 的长度下限，对所有环境无条件生效。
+//
+// 不区分环境的原因：isProduction 只认精确的 "production"，运维写成 prod / Production_1
+// 都会静默走到非生产分支。若那里放过短密钥，攻击者猜到字典词就能自签 JWT，
+// 一次请求通过 requireJWT，随后 /api/export 拉走全部明文凭据 —— 完整鉴权绕过。
+const minJWTSecretLen = 32
+
 // resolveJWTSecret 根据环境与已设置的密钥决定最终 JWT 签名密钥：
-// - NCF_ENV=production：必须显式提供至少 32 字符密钥，否则报错（绝不随机生成）。
-// - 其他环境：未设置时随机生成（调用方不得打印密钥本身）；弱密钥仅警告照常使用。
+// - NCF_ENV=production：必须显式提供密钥，否则报错（绝不随机生成）。
+// - 其他环境：未设置时随机生成（调用方不得打印密钥本身）。
+// 两种情况下只要显式设置了密钥，长度都必须达标 —— 弱密钥一律拒绝启动，不再只警告。
 func resolveJWTSecret(env, secret string) (string, error) {
 	if isProduction(env) {
-		if len(secret) < 32 {
-			return "", fmt.Errorf("NCF_ENV=production 时必须设置 NCF_JWT_SECRET（至少 32 字符）")
+		if len(secret) < minJWTSecretLen {
+			return "", fmt.Errorf("NCF_ENV=production 时必须设置 NCF_JWT_SECRET（至少 %d 字符）",
+				minJWTSecretLen)
 		}
 		return secret, nil
 	}
 	if secret == "" {
 		return randomHex(32), nil
+	}
+	if len(secret) < minJWTSecretLen {
+		return "", fmt.Errorf(
+			"NCF_JWT_SECRET 至少需要 %d 字符（当前 %d）；留空则自动生成随机密钥",
+			minJWTSecretLen, len(secret))
 	}
 	return secret, nil
 }
@@ -69,11 +83,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("JWT 密钥配置错误: %v", err)
 	}
-	if envSecret := os.Getenv("NCF_JWT_SECRET"); !isProduction(env) {
-		if envSecret == "" {
+	if !isProduction(env) {
+		if os.Getenv("NCF_JWT_SECRET") == "" {
 			log.Printf("NCF_JWT_SECRET 未设置，已自动生成随机密钥（重启后登录态失效；生产环境请用 NCF_ENV=production + NCF_JWT_SECRET 固定）")
-		} else if len(envSecret) < 32 {
-			log.Printf("NCF_JWT_SECRET 长度不足 32 字符（当前 %d）；建议使用至少 32 字符的强密钥", len(envSecret))
+		}
+		// NCF_ENV 写错（prod / Production_1 之类）会静默按非生产运行，
+		// 这里把实际判定结果说出来，免得运维以为自己开着生产模式
+		if strings.TrimSpace(env) != "" {
+			log.Printf("NCF_ENV=%q 不等于 \"production\"，当前按非生产环境运行", env)
 		}
 	}
 
@@ -162,7 +179,7 @@ func startProxyRefresher(db *sql.DB, mgr *ProxyManager) {
 	go func() {
 		// 启动后立即刷一次，让页面/Actions 第一时间有数据
 		cfg, _, err := LoadConfig(db)
-		if err == nil {
+		if err == nil && cfg.ProxyPool.Enabled {
 			if _, rerr := mgr.RefreshProxies(cfg.ProxyPool, cfg.ProxyPool.SaveLimit); rerr != nil {
 				log.Printf("[proxy] 启动刷新失败: %v", rerr)
 			}
@@ -171,6 +188,12 @@ func startProxyRefresher(db *sql.DB, mgr *ProxyManager) {
 			cfg, _, err = LoadConfig(db)
 			if err != nil {
 				time.Sleep(60 * time.Second)
+				continue
+			}
+			// 代理池在界面上关掉了就不该继续外联第三方源、也不该做并发测通；
+			// 手动点「刷新」仍可随时触发（那是用户的显式意图）
+			if !cfg.ProxyPool.Enabled {
+				time.Sleep(10 * time.Minute)
 				continue
 			}
 			interval := cfg.ProxyPool.RefreshMinutes

@@ -109,7 +109,12 @@ web/src/components/AccountModal.vue
         <n-input v-model:value="form.user_id" placeholder="可选，留空自动识别" />
       </n-form-item>
       <n-form-item label="手动隧道(proxy)" path="proxy">
-        <n-input v-model:value="form.proxy" placeholder="可选，例如 http://127.0.0.1:7890" />
+        <div class="field-col">
+          <n-input v-model:value="form.proxy" placeholder="可选，例如 http://127.0.0.1:7890" />
+          <div class="field-note">
+            该字段不打码，会以明文回传给已登录管理员；含账号密码的代理建议改用 IP 白名单授权。
+          </div>
+        </div>
       </n-form-item>
       <n-form-item label="签到路径" path="checkin_path">
         <n-input v-model:value="form.checkin_path" placeholder="可选，例如 /user/checkin" />
@@ -354,9 +359,10 @@ function openReveal(field: 'cookie' | 'github_user_session') {
 async function handleRevealCookie(password: string) {
   revealing.value = true
   try {
-    await verifyPassword(password)
+    // 票据只能用一次，必须紧接着交给 exportConfig
+    const { ticket } = await verifyPassword(password)
     // 密码确认通过 → 拉取完整明文配置，取当前账号对应的 Cookie
-    const res = await exportConfig()
+    const res = await exportConfig(ticket)
     const cfg = JSON.parse(res.json) as { accounts?: Account[] }
     const target = (cfg.accounts ?? []).find((a) => a.name === props.account?.name)
     const value = target?.[revealField.value]
@@ -515,5 +521,12 @@ function handleSubmit() {
   color: #8492a6;
   font-size: 12px;
   line-height: 1.5;
+}
+
+/* 输入框下面要挂说明文字时，让它们竖排且撑满表单项宽度 */
+.field-col {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
 }
 </style>

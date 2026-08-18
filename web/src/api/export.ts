@@ -5,8 +5,14 @@ web/src/api/export.ts
 import http from './http'
 import type { ExportResult, ImportParams, ImportResult } from '@/types'
 
-export function exportConfig(): Promise<ExportResult> {
-  return http.get<ExportResult>('/export').then((r) => r.data)
+/**
+ * 拉取完整明文配置。ticket 由 verifyPassword() 签发，单次有效、2 分钟过期，
+ * 通过 X-Export-Ticket 头提交；缺失或复用会被服务端 403 拒绝。
+ */
+export function exportConfig(ticket: string): Promise<ExportResult> {
+  return http
+    .get<ExportResult>('/export', { headers: { 'X-Export-Ticket': ticket } })
+    .then((r) => r.data)
 }
 
 export function importConfig(params: ImportParams): Promise<ImportResult> {

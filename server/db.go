@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -30,6 +31,11 @@ import (
 
 // configRowID config 表固定单行的主键。
 const configRowID = 1
+
+// minPasswordLen 管理员密码长度下限。初始管理员（NCF_ADMIN_PASS）与改密码接口
+// 共用同一条规则 —— 否则首次部署能设 4 位数字，改密码却要求 8 位，规则自相矛盾，
+// 而登录限流只有「同 IP+用户名 1 分钟 5 次」的强度，短口令仍可被穷举。
+const minPasswordLen = 8
 
 // User 管理员账号记录。
 type User struct {
@@ -164,6 +170,9 @@ func EnsureAdmin(db *sql.DB, username, password string) error {
 	}
 	if username == "" || password == "" {
 		return fmt.Errorf("users 表为空且未提供初始管理员凭据，请设置 NCF_ADMIN_USER / NCF_ADMIN_PASS")
+	}
+	if len(password) < minPasswordLen {
+		return fmt.Errorf("NCF_ADMIN_PASS 至少需要 %d 个字符（当前 %d）", minPasswordLen, len(password))
 	}
 	hash, err := HashPassword(password)
 	if err != nil {
@@ -405,9 +414,78 @@ func LoadConfigWithRevision(db *sql.DB) (Config, string, int64, error) {
 // ErrConfigRevisionConflict 期望版本与库中当前版本不一致：调用方应转 409 并让用户重新加载。
 var ErrConfigRevisionConflict = errors.New("配置已被他人修改")
 
+// configWriteMu 串行化所有「读-改-写」式的整份配置写入，以及 cookie 的定点更新。
+//
+// 光锁写入是不够的：陈旧快照覆盖是「读到写之间」的竞态，
+// 必须在持锁范围内重新读库，才能保证不抹掉这期间落库的轮转凭据。
+var configWriteMu sync.Mutex
+
+// SaveConfigKeepingCookies 无条件写入，但持锁重读后保留 tabiai 账号在库中的 cookie。
+//
+// 用于「不带 revision 的 PUT」与 import：这两条路径的请求体可能是很久以前的快照
+// （导出文件、外部脚本缓存），而 TaBiAI 的 new_api_refresh 由后台签到持续轮转。
+// 写回旧代次会触发站点重放检测，导致整条会话被撤销、必须人工重新签发 ——
+// 代价远大于「这两条路径不能改 tabiai 凭据」的不便。
+//
+// 只保护 login_method=tabiai 的账号：newapi_cookie 的 session 是静态凭据，
+// 不存在轮转，用户通过这两条路径修改它是正当操作，不该被拦。
+// 库中没有同名账号时（新增账号）一律采用请求体的值。
+//
+// 要显式修改 tabiai 凭据请走带 revision 的 PUT、issue-cookie 或 refresh-cookie。
+func SaveConfigKeepingCookies(db *sql.DB, cfg Config) (string, error) {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
+	stored, _, err := loadConfigLocked(db)
+	if err != nil {
+		return "", err
+	}
+	// 只收集会轮转的那批账号（tabiai），其余按请求体原样写入
+	keepCookieByName := make(map[string]string, len(stored.Accounts))
+	for _, a := range stored.Accounts {
+		if a.Name == "" || !strings.EqualFold(strings.TrimSpace(a.LoginMethod), LoginMethodTabiAI) {
+			continue
+		}
+		keepCookieByName[a.Name] = a.Cookie
+	}
+	var kept []string
+	for i := range cfg.Accounts {
+		old, ok := keepCookieByName[cfg.Accounts[i].Name]
+		if !ok {
+			continue
+		}
+		if cfg.Accounts[i].Cookie != old {
+			kept = append(kept, cfg.Accounts[i].Name)
+		}
+		cfg.Accounts[i].Cookie = old
+	}
+	if len(kept) > 0 {
+		log.Printf("[config] 已保留库中现有的 TaBiAI 凭据，忽略请求体里的旧值（账号: %s）；"+
+			"要改凭据请用带 revision 的保存、签发或回写接口", strings.Join(kept, ", "))
+	}
+	// 兜底：任何路径漏掉 UnmaskConfig 时，"***" 也不该落库
+	if cleaned := SanitizeMaskLeftovers(&cfg); len(cleaned) > 0 {
+		log.Printf("[config] 拦截到未还原的占位符并清空: %s", strings.Join(cleaned, ", "))
+	}
+	return saveConfigLocked(db, cfg)
+}
+
 // SaveConfig 以「完整替换」方式无条件写入配置（单行 id=1），返回新的 updated_at。
-// 供迁移、导入与测试使用；来自 Web 的保存走 SaveConfigIfMatch 以获得并发保护。
+//
+// 仅供启动期迁移（MigrateConfig / SanitizeConfigSecrets / EnsureDefaultConfig）与测试使用：
+// 那时进程单线程、还没开始接受请求，不存在并发写；而且迁移的职责本身就是改写字段，
+// 走 SaveConfigKeepingCookies 的「保留库中 cookie」逻辑会与其意图冲突。
+//
+// 运行期的写入一律不要用它：来自 Web 的保存走 SaveConfigIfMatch（乐观锁），
+// 不带 revision 的 PUT 与 import 走 SaveConfigKeepingCookies（持锁重读 + 保留凭据）。
 func SaveConfig(db *sql.DB, cfg Config) (string, error) {
+	return saveConfigLocked(db, cfg)
+}
+
+// saveConfigLocked 是 SaveConfig 的实现体，不自己加锁。
+// 已持有 configWriteMu 的调用方（SaveConfigKeepingCookies / updateAccountCookie）
+// 必须走这里，否则会自死锁。
+func saveConfigLocked(db *sql.DB, cfg Config) (string, error) {
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return "", fmt.Errorf("序列化配置: %w", err)
@@ -423,6 +501,12 @@ func SaveConfig(db *sql.DB, cfg Config) (string, error) {
 		return "", fmt.Errorf("保存配置: %w", err)
 	}
 	return updatedAt, nil
+}
+
+// loadConfigLocked 读取配置，不自己加锁；供已持锁的调用方在锁内重读用。
+func loadConfigLocked(db *sql.DB) (Config, string, error) {
+	cfg, updatedAt, _, err := LoadConfigWithRevision(db)
+	return cfg, updatedAt, err
 }
 
 // SaveConfigIfMatch 仅当库中 revision 等于 expected 时写入（乐观锁）。

@@ -20,12 +20,17 @@ export interface Account {
   name: string
   url: string
   login_method: LoginMethod
-  /** 站点凭据：newapi_cookie 存完整 Cookie 头；tabiai 存 new_api_refresh 的值（每次 refresh 会被轮转覆盖） */
+  /**
+   * 站点凭据：newapi_cookie 存完整 Cookie 头；tabiai 存 new_api_refresh 的值。
+   * tabiai 的值由后台签到持续轮转，因此不带 revision 的保存与导入都不会覆盖它 ——
+   * 要显式改就得带 revision（网页始终带），或用签发 / 回写接口。
+   */
   cookie: string
   /** 不再是登录凭据，仅作 POST /api/tabiai/issue-cookie 签发 new_api_refresh 的原料 */
   github_user_session: string
   github_client_id: string
   user_id: number | null
+  /** 手动代理。有意不打码，会以明文回传给已登录管理员（详见 api-contract 打码规则） */
   proxy: string | null
   checkin_path: string | null
   browser_path: string | null
@@ -285,6 +290,13 @@ export interface ProxyProgress {
 
 export interface ExportResult {
   json: string
+}
+
+/** 二次密码确认的结果：ticket 是 GET /api/export 的一次性通行证 */
+export interface VerifyPasswordResult {
+  ok: boolean
+  ticket: string
+  expires_in: number
 }
 
 // ===== 导入 =====

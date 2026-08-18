@@ -1053,9 +1053,10 @@ func TestExport(t *testing.T) {
 	token := loginToken(t, srv)
 	putTestConfig(t, srv, token)
 
-	rr := doReq(t, srv, http.MethodGet, "/api/export", token, nil)
+	// 导出前必须先过密码确认换票据：拿着 JWT 直接拉是不允许的
+	rr := exportWithTicket(t, srv, token, issueExportTicket(t, srv, token))
 	if rr.Code != http.StatusOK {
-		t.Fatalf("GET export status = %d", rr.Code)
+		t.Fatalf("GET export status = %d, %s", rr.Code, rr.Body.String())
 	}
 	var resp struct {
 		JSON string `json:"json"`
@@ -1203,4 +1204,105 @@ func TestGetenv(t *testing.T) {
 	if got := getenv("NCF_TEST_ENV_NOT_SET", "def"); got != "def" {
 		t.Errorf("未设置环境变量应取默认值: %q", got)
 	}
+}
+
+
+// issueExportTicket 走 verify-password 换一张导出票据。
+func issueExportTicket(t *testing.T, srv *Server, token string) string {
+	t.Helper()
+	rr := doReq(t, srv, http.MethodPost, "/api/auth/verify-password", token,
+		map[string]string{"password": "admin123456"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("verify-password = %d, %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Ticket    string `json:"ticket"`
+		ExpiresIn int    `json:"expires_in"`
+	}
+	decodeJSON(t, rr, &resp)
+	if resp.Ticket == "" {
+		t.Fatal("verify-password 未返回票据")
+	}
+	if resp.ExpiresIn <= 0 {
+		t.Fatalf("票据有效期应为正数，实际 %d", resp.ExpiresIn)
+	}
+	return resp.Ticket
+}
+
+// exportWithTicket 带指定票据请求导出；ticket 为空表示不带该头。
+func exportWithTicket(t *testing.T, srv *Server, token, ticket string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/export", nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if ticket != "" {
+		req.Header.Set("X-Export-Ticket", ticket)
+	}
+	rr := httptest.NewRecorder()
+	srv.routes().ServeHTTP(rr, req)
+	return rr
+}
+
+// TestExportRequiresTicket 覆盖审计发现 M-1：
+// 二次密码确认此前对 /api/export 没有任何服务端绑定，拿着 JWT 直接 curl 就能绕过。
+func TestExportRequiresTicket(t *testing.T) {
+	srv := newTestServer(t)
+	token := loginToken(t, srv)
+	putTestConfig(t, srv, token)
+
+	t.Run("无票据被拒绝", func(t *testing.T) {
+		if rr := exportWithTicket(t, srv, token, ""); rr.Code != http.StatusForbidden {
+			t.Fatalf("无票据应 403，实际 %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("伪造票据被拒绝", func(t *testing.T) {
+		if rr := exportWithTicket(t, srv, token, "deadbeef"); rr.Code != http.StatusForbidden {
+			t.Fatalf("伪造票据应 403，实际 %d", rr.Code)
+		}
+	})
+
+	t.Run("票据只能用一次", func(t *testing.T) {
+		ticket := issueExportTicket(t, srv, token)
+		if rr := exportWithTicket(t, srv, token, ticket); rr.Code != http.StatusOK {
+			t.Fatalf("首次使用应成功，实际 %d", rr.Code)
+		}
+		if rr := exportWithTicket(t, srv, token, ticket); rr.Code != http.StatusForbidden {
+			t.Fatalf("重复使用应 403，实际 %d", rr.Code)
+		}
+	})
+
+	t.Run("过期票据被拒绝", func(t *testing.T) {
+		ticket := issueExportTicket(t, srv, token)
+		// 把时钟推到有效期之后
+		srv.exportTickets.now = func() time.Time { return time.Now().Add(exportTicketTTL + time.Second) }
+		defer func() { srv.exportTickets.now = time.Now }()
+		if rr := exportWithTicket(t, srv, token, ticket); rr.Code != http.StatusForbidden {
+			t.Fatalf("过期票据应 403，实际 %d", rr.Code)
+		}
+	})
+
+	t.Run("跨用户票据被拒绝", func(t *testing.T) {
+		ticket := issueExportTicket(t, srv, token)
+		// 票据绑定签发时的用户名；换个用户名就不该认
+		srv.exportTickets.mu.Lock()
+		srv.exportTickets.entries[ticket] = exportTicketEntry{
+			username: "someone-else", expiresAt: time.Now().Add(exportTicketTTL)}
+		srv.exportTickets.mu.Unlock()
+		if rr := exportWithTicket(t, srv, token, ticket); rr.Code != http.StatusForbidden {
+			t.Fatalf("跨用户票据应 403，实际 %d", rr.Code)
+		}
+	})
+
+	t.Run("错误密码不签发票据", func(t *testing.T) {
+		rr := doReq(t, srv, http.MethodPost, "/api/auth/verify-password", token,
+			map[string]string{"password": "wrong"})
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("错误密码应 400，实际 %d", rr.Code)
+		}
+		if strings.Contains(rr.Body.String(), "ticket") {
+			t.Fatal("错误密码的响应里不该出现票据")
+		}
+	})
 }

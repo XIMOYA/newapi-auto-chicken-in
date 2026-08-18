@@ -260,6 +260,12 @@ func DefaultConfig() Config {
 // 打码字段：accounts[].cookie、accounts[].github_user_session、ai.api_key、
 // notify.email.password、config_sync.token、proxy_pool.remote_token、
 // security.config_key；非空才打码，空值原样保留。
+//
+// accounts[].proxy 有意不打码：地址是运维辨识出口的必要信息，而该字段在前端是普通
+// 输入框（不是 MaskedInput）。若打成 http://***@host，用户想「只改 host、保留认证」
+// 时提交回来是 http://***@newhost —— host 变了就无从判断该还原谁，结果会把字面量
+// "***" 写进代理里，静默弄坏一个本来可用的出口。因此带认证的代理请改用 IP 白名单
+// 授权，或接受它会明文回传给已登录管理员这一事实。
 func MaskConfig(cfg *Config) *Config {
 	m := cloneConfig(cfg)
 	for i := range m.Accounts {

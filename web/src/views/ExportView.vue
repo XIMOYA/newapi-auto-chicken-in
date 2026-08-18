@@ -2,11 +2,11 @@
 web/src/views/ExportView.vue
 页面：配置导出 / 导入
 职责：
-- 导出：展示完整 config.json 明文（textarea）+ 一键复制 + 重新获取
+- 导出：密码确认后展示完整 config.json 明文（textarea）+ 一键复制；离开页面即清空
 - 导入：粘贴 JSON 或上传文件 → 选择模式（覆盖 / 合并）→ 确认后提交
   - overwrite：整体覆盖当前配置
   - merge：账号/站点按 name 合并（同名更新、新名追加），其余模块保留
-数据来源：GET /api/export；POST /api/config/import
+数据来源：POST /api/auth/verify-password（换一次性票据）；GET /api/export；POST /api/config/import
 -->
 <template>
   <div class="page-container export-page">
@@ -38,7 +38,7 @@ web/src/views/ExportView.vue
       </n-spin>
 
       <div class="export-actions">
-        <n-button type="primary" :loading="loading" @click="fetchExport">
+        <n-button type="primary" :loading="loading" @click="requestExport">
           <template #icon><n-icon><refresh-outline /></n-icon></template>
           获取配置
         </n-button>
@@ -118,11 +118,18 @@ web/src/views/ExportView.vue
         <n-button v-if="importText" quaternary @click="clearImport">清空</n-button>
       </div>
     </n-card>
+
+    <password-confirm-modal
+      v-model:show="passwordConfirmVisible"
+      :loading="loading"
+      tip="导出内容包含全部站点 Cookie、AI api_key 与邮箱密码等明文，请输入管理员密码确认身份。"
+      @confirm="fetchExport"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onUnmounted, ref } from 'vue'
 import {
   NCard, NButton, NIcon, NInput, NTag, NAlert, NText, NSpin, NRadioGroup, NRadioButton, NUpload,
   NCheckbox, NCheckboxGroup, useDialog, useMessage
@@ -131,7 +138,9 @@ import {
   RefreshOutline, CopyOutline, InformationCircleOutline, WarningOutline,
   CloudUploadOutline, AlertCircleOutline, DownloadOutline
 } from '@vicons/ionicons5'
+import PasswordConfirmModal from '@/components/PasswordConfirmModal.vue'
 import { exportConfig, importConfig } from '@/api/export'
+import { verifyPassword } from '@/api/auth'
 import { extractErrorMessage } from '@/utils/error'
 import { copyText } from '@/utils/clipboard'
 import type { ImportParams } from '@/types'
@@ -181,11 +190,21 @@ const importSizeLabel = computed(() => {
   return `${(bytes / 1024).toFixed(1)} KB`
 })
 
-async function fetchExport() {
+// 导出的是全量明文（所有站点 Cookie、api_key、SMTP 密码），因此不再进页面就自动拉，
+// 改为点一下、验一次密码换取一次性票据后才展示 —— 与「查看单个 Cookie」的保护强度对齐
+const passwordConfirmVisible = ref(false)
+
+function requestExport() {
+  passwordConfirmVisible.value = true
+}
+
+async function fetchExport(password: string) {
   loading.value = true
   try {
-    const res = await exportConfig()
+    const { ticket } = await verifyPassword(password)
+    const res = await exportConfig(ticket)
     jsonText.value = res.json
+    passwordConfirmVisible.value = false
     message.success('完整配置已获取')
   } catch (e) {
     message.error(extractErrorMessage(e, '获取导出配置失败'))
@@ -283,8 +302,8 @@ function handleImport() {
         message.success(`导入成功（${mode === 'merge' ? '合并' : '覆盖'}）`)
         jsonText.value = ''
         clearImport()
-        // 刷新导出示意
-        fetchExport()
+        // 导入成功后不自动重拉明文（那会再要一次密码确认），需要时手动点「获取配置」
+        jsonText.value = ''
         void res
       } catch (e) {
         message.error(extractErrorMessage(e, '导入失败'))
@@ -295,7 +314,10 @@ function handleImport() {
   })
 }
 
-onMounted(fetchExport)
+// 离开页面时清掉明文，别让它一直留在 DOM 与内存里
+onUnmounted(() => {
+  jsonText.value = ''
+})
 </script>
 
 <style scoped>

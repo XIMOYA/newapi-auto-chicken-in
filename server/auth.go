@@ -160,18 +160,22 @@ func newLoginLimiter() *loginLimiter {
 }
 
 // check 查询当前键是否被退避拦截；allowed=false 时返回还需等待的时长。
-// 窗口过期（首次失败超过 1 分钟）视为放行，由下一次 recordFailure 重新计数。
+//
+// 封禁判断必须排在窗口过期之前：否则退避最长只能持续到 firstFail+loginWindow，
+// 指数退避（最高 16s）会被 60 秒的窗口重置截断，实测放宽到约 10 次/分钟。
+// 正在封禁期内就该拒绝，与统计窗口是否过期无关。
 func (l *loginLimiter) check(key string) (retryAfter time.Duration, allowed bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
 	e, ok := l.entries[key]
-	if !ok || now.Sub(e.firstFail) >= loginWindow {
+	if !ok {
 		return 0, true
 	}
 	if now.Before(e.blockedUntil) {
 		return e.blockedUntil.Sub(now), false
 	}
+	// 未处于封禁期：窗口是否过期都放行，过期由下一次 recordFailure 重新计数
 	return 0, true
 }
 
@@ -288,5 +292,93 @@ func (s *Server) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
 		_ = UpdateAPIKeyLastUsed(s.db, row.ID)
 		ctx := context.WithValue(r.Context(), ctxKeyAPIKeyID, row.ID)
 		next(w, r.WithContext(ctx))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 导出票据（/api/export 的二次确认）
+// ---------------------------------------------------------------------------
+
+// 导出票据参数：verify-password 成功后签发，单次使用，2 分钟内有效。
+const (
+	exportTicketTTL        = 2 * time.Minute
+	exportTicketMaxEntries = 1000 // 内存上限：满了先清过期，仍满则整体丢弃重来
+)
+
+// exportTicketEntry 一张票据的归属与有效期。
+type exportTicketEntry struct {
+	username  string
+	expiresAt time.Time
+}
+
+// exportTicketStore 管理 /api/export 的一次性票据（并发安全）。
+//
+// 为什么需要它：GET /api/export 返回全量明文配置（含所有站点 Cookie、api_key、
+// SMTP 密码）。此前它只有 requireJWT，而前端调用的 POST /api/auth/verify-password
+// 在服务端没有任何绑定 —— 拿着 JWT 直接 curl /api/export 就能跳过密码确认。
+// 票据把「刚验过密码」这件事变成服务端可校验的状态，让二次确认真正生效。
+type exportTicketStore struct {
+	mu         sync.Mutex
+	now        func() time.Time
+	entries    map[string]exportTicketEntry
+	maxEntries int
+}
+
+func newExportTicketStore() *exportTicketStore {
+	return &exportTicketStore{
+		now:        time.Now,
+		entries:    make(map[string]exportTicketEntry),
+		maxEntries: exportTicketMaxEntries,
+	}
+}
+
+// issue 为指定用户签发一张票据，返回明文票据与有效期秒数。
+func (s *exportTicketStore) issue(username string) (string, int, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", 0, fmt.Errorf("生成导出票据: %w", err)
+	}
+	ticket := hex.EncodeToString(buf)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	s.trimLocked(now)
+	s.entries[ticket] = exportTicketEntry{username: username, expiresAt: now.Add(exportTicketTTL)}
+	return ticket, int(exportTicketTTL.Seconds()), nil
+}
+
+// consume 校验并立即销毁票据：必须存在、未过期、且属于该用户。
+// 用后即删，所以同一张票据无法导出两次。
+func (s *exportTicketStore) consume(ticket, username string) bool {
+	if ticket == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[ticket]
+	if !ok {
+		return false
+	}
+	delete(s.entries, ticket)
+	if s.now().After(e.expiresAt) {
+		return false
+	}
+	return e.username == username
+}
+
+// trimLocked 惰性清理：条目过多时先删过期项，仍然超限就整体丢弃。
+// 票据是短时凭据，全部作废最多让用户重新输一次密码，不会造成数据损失。
+func (s *exportTicketStore) trimLocked(now time.Time) {
+	if len(s.entries) < s.maxEntries {
+		return
+	}
+	for k, e := range s.entries {
+		if now.After(e.expiresAt) {
+			delete(s.entries, k)
+		}
+	}
+	if len(s.entries) >= s.maxEntries {
+		s.entries = make(map[string]exportTicketEntry)
 	}
 }

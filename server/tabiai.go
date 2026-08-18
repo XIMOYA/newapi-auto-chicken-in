@@ -24,7 +24,6 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
-	"sync"
 )
 
 const (
@@ -34,17 +33,16 @@ const (
 	tabiaiGithubAuthorize   = "https://github.com/login/oauth/authorize"
 )
 
-// tabiaiCookieMu 串行化所有对 accounts[].cookie 的定点写入：
-// 并发检测/回写同时改同一份配置时，避免互相覆盖（配置是整份存储的单行 JSON）。
-var tabiaiCookieMu sync.Mutex
-
 // updateAccountCookie 只更新指定账号的 cookie 字段并落库，不动其他字段。
 // 返回 false 表示账号不存在。
+//
+// 与整份写入共用 configWriteMu（见 db.go）：定点写和整份写必须互斥，
+// 否则整份写的陈旧快照会把这里刚落库的新一代凭据抹回旧值。
 func updateAccountCookie(db *sql.DB, name, cookie string) (bool, error) {
-	tabiaiCookieMu.Lock()
-	defer tabiaiCookieMu.Unlock()
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 
-	cfg, _, err := LoadConfig(db)
+	cfg, _, err := loadConfigLocked(db)
 	if err != nil {
 		return false, err
 	}
@@ -59,7 +57,7 @@ func updateAccountCookie(db *sql.DB, name, cookie string) (bool, error) {
 	if !found {
 		return false, nil
 	}
-	if _, err := SaveConfig(db, cfg); err != nil {
+	if _, err := saveConfigLocked(db, cfg); err != nil {
 		return false, err
 	}
 	return true, nil
