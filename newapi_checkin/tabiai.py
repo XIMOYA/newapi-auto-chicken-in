@@ -364,7 +364,8 @@ class TabiAIClient:
         if turnstile_provider is None:
             return api.ApiResult(
                 api.TURNSTILE_REQUIRED,
-                message="需要 Turnstile token，但未启用 tabiai 浏览器取 token（配置 tabiai.enabled）",
+                message="需要 Turnstile token，未配置 CDP 接管真实 Chrome（tabiai.enabled），"
+                        "将改由脚本浏览器过盾链代取",
                 path=TABIAI_CHECKIN_PATH,
                 user_id=step.user_id,
             )

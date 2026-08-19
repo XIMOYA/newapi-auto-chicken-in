@@ -443,7 +443,9 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
 }
 ```
 
-- `enabled`：关闭时不取 token，遇到需要签到的账号直接报 `turnstile_required` 并说明原因
+- `enabled`：**不是签到的硬门槛**，只决定是否先试「CDP 接管真实 Chrome」这条首选路。
+  关闭（或连不上 CDP）时会退到脚本浏览器的过盾链去代取 token，见下一节。
+  该段是机器级配置、不参与远程配置合并，所以 Actions 里它必然是 false，也不需要开
 - `cdp_url`：先用 `chrome --remote-debugging-port=9222` 启动并保持登录状态；客户端只新开一个标签页，取完就关，不动用户其它窗口，断开连接也不会杀掉浏览器进程
 - `token_interval_minutes`：站点对同一环境有频率限制（实测约 20 分钟内反复 reset 拿不到新 token），多账号必须串行 + 间隔，默认 21 分钟
 - `keep_page`：排查问题时保留标签页
