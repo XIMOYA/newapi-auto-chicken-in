@@ -379,19 +379,45 @@
 
 Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_sync.writeback_url` 显式指定（支持 `{name}` 占位符）。回写失败不影响本次签到（本地 `sessions.json` 已存新值），但会打警告提示平台仍持有旧代次。
 
-### 凭据轮转与版本号
+### 签到期间锁住网页端凭据操作
 
-轮转回写（`refresh-cookie`、检测顺带写回、`issue-cookie` 之外的自动落库）**只更新 `updated_at`，
-不推进 `revision`**。
+`POST /api/run-state/start`（**API Key**）请求体 `{ "source": "GitHub Actions（me/repo）" }`
+`POST /api/run-state/heartbeat`（**API Key**）响应 `{ "ok": true, "running": true }`
+`POST /api/run-state/stop`（**API Key**）响应 `{ "ok": true }`
+`GET /api/run-state`（JWT）响应：
+```json
+{
+  "running": true,
+  "source": "GitHub Actions（me/repo）",
+  "started_at": "2026-08-18T11:00:00Z",
+  "heartbeat_at": "2026-08-18T11:04:00Z",
+  "stale_after_seconds": 300,
+  "heartbeat_seconds": 60
+}
+```
+`POST /api/run-state/unlock`（JWT）响应 `{ "ok": true }` —— 管理员强制解锁。
 
-原因：`revision` 是「用户可见改动」的乐观锁。轮转是后台行为，每个 tabiai 账号跑一次就要 +1，
-若也推进版本号，正在改 AI 超时或邮件配置的人一保存就撞 409 —— 而他改的字段与 cookie 毫无关系。
-这正是「配置已被他人修改」提示此前频繁误报的根因。
+为什么要它：网页端的 TaBiAI 凭据检测**本身就是一次真 refresh**，签到进程同时也在
+推进代次。两边一撞，谁手里的代次旧了下次就会被判重放，整条会话被撤销
+（`AUTH_SESSION_REVOKED`），只能重新签发。这不是「本次检测失败」，是把账号打死。
 
-安全性不受影响：带 `revision` 的 `PUT` 与 §4.1 的 ops 都会在写入前重读库中最新配置作为
-`"***"` 的还原基准，所以陈旧请求体拿不到、也覆盖不了轮转后的新代次（有测试守着这条）。
+- 锁定期间 `POST /api/cookie-tests/tabiai` 与 `POST /api/tabiai/issue-cookie` 返回
+  **409**，响应体为 `{ "error": "...可读说明...", "run_state": { ...同上... } }`，
+  前端可直接用回传状态刷新视图
+- `POST /api/cookie-tests/newapi` **不锁**：站点 Cookie 是静态凭据，不轮转也没有重放检测
+- 判活看心跳而非布尔开关：Actions 有 6 小时硬上限，超时是被平台强杀，客户端没有机会
+  发 `stop`。超过 `stale_after_seconds` 没心跳就自动视为已结束，否则一把只能显式关闭的
+  锁迟早会永久锁死网页端
+- 心跳时间解析失败时按「已结束」处理（fail-open）：宁可放开，也不要因为一条坏数据
+  锁到只能改库才能恢复
+- `heartbeat_seconds` 由平台下发，客户端不必硬编码间隔
+- 客户端只在这一轮**含 tabiai 账号**且 `config_sync.enabled` 时才上报；全是站点 Cookie
+  的一轮锁网页端毫无收益
+- 强制解锁是危险出口，留着是因为心跳机制本身也可能出岔子（客户端时钟错、上报地址配错），
+  没有它就只能等过期或改库。前端必须二次确认并讲清风险
 
 ### 签发凭据
+
 
 `POST /api/tabiai/issue-cookie`（JWT）
 
@@ -423,6 +449,40 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
 - `keep_page`：排查问题时保留标签页
 
 该段属于**机器级设置**（`cdp_url` 指向本机端口），因此和 `security` / `config_sync` 一样不参与远程配置合并，远端下发不会覆盖本地值。
+
+### TaBiAI 也走完整 S0-S4（页内签到）
+
+CDP 需要一个开着的真实 Chrome，而 GitHub Actions 云端没有。过去这种情况下
+tabiai 账号会就地判 `turnstile_required` 失败，整轮白跑。
+
+现在 tabiai 与站点 Cookie 一样**走完整的 S0-S4**，签到在浏览器上下文里完成：
+
+1. 进站前把 `new_api_refresh` 注入浏览器（以前有意不注入）
+2. S2/S3 过站点盾（与站点 Cookie 共用同一套编排）
+3. 页内 `POST /api/user/auth/refresh` 换 Bearer token
+4. 页内查本月签到状态；已签就收工，**不去取 Turnstile**（token 有 20 分钟级频率限制）
+5. 用 S4 那套机制现取 token：读页面已有 token → 几何点击 → AI 看截图代为点选 →
+   从站点状态接口取公开 site key 挂载官方 widget → 交互等待循环
+6. 页内 `POST /api/user/checkin?turnstile=<token>`，带 `Authorization: Bearer <jwt>`
+
+为什么一定要在页内签：Turnstile token 短时一次性，站点中间件校验时会连带看请求环境。
+把 token 取出来交给 curl_cffi 发等于「A 环境生成、B 环境使用」，本来就容易被拒；
+页内直发让 token 在哪生成就在哪用掉，还顺带带上刚过盾的 `cf_clearance` 与真实浏览器指纹。
+
+几个要点：
+- **页内 refresh 同样会轮转凭据**。新代次通过 `Set-Cookie` 下发，而它属于 fetch API 的
+  禁止读取响应头，页内 JS 拿不到，只能从浏览器 cookie jar 里取。取到后必须立刻交回上层
+  落盘 + 回写平台，**哪怕这次 refresh 判定失败也要回写** —— 漏一次，下轮用旧代就会被判
+  重放、整条会话被撤销
+- 没有轮转回写通道（未传 `on_rotate`）时**不走页内**，宁可少一步也不能把新代次丢在浏览器里
+- `--dry-run` / `--cookie-test` 不走页内签到：那两个只验证连通性
+- 失败分流：认证类失败是定论直接带出；`CF_BLOCKED` 与网络异常退回 HTTP 链路重试；
+  取不到 token 时**不硬发**签到请求（站点强校验，发出去只是白扔一次机会），
+  交回主循环换 IP + 重开浏览器再来
+- CDP 仍是首选，配了 `tabiai.enabled` 且能连上时优先用它
+- **不保证成功**：Turnstile 对脚本浏览器 + 数据中心 IP 的信誉判定很严，失败提示会建议
+  给该账号配住宅代理。它的价值是把「云端必失败」变成「有机会成功」
+- 汇总表里命中策略现在会显示 S4（签到确实在页内完成）；退回 HTTP 链路时仍显示过盾所在的 S2/S3
 
 ## 配置对象默认结构（后端初始化时内置）
 

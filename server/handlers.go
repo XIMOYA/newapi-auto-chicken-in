@@ -89,6 +89,14 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/tabiai/issue-cookie", s.requireJWT(s.handleIssueTabiAICookie))
 	mux.HandleFunc("POST /api/accounts/{name}/refresh-cookie", s.requireAPIKey(s.handleWriteBackRefreshCookie))
 
+	// 签到运行状态：客户端用 API Key 上报开跑/心跳/收尾，网页端据此锁住高危凭据操作。
+	// 强制解锁走 JWT —— 那是管理员在界面上的决定，不该让持有 API Key 的客户端能做。
+	mux.HandleFunc("POST /api/run-state/start", s.requireAPIKey(s.handleRunStateStart))
+	mux.HandleFunc("POST /api/run-state/heartbeat", s.requireAPIKey(s.handleRunStateHeartbeat))
+	mux.HandleFunc("POST /api/run-state/stop", s.requireAPIKey(s.handleRunStateStop))
+	mux.HandleFunc("GET /api/run-state", s.requireJWT(s.handleGetRunState))
+	mux.HandleFunc("POST /api/run-state/unlock", s.requireJWT(s.handleRunStateUnlock))
+
 	// 代理池管理
 	mux.HandleFunc("GET /api/proxies", s.requireJWT(s.handleListProxies))
 	mux.HandleFunc("GET /api/proxies/available", s.requireAPIKey(s.handleAvailableProxies))
@@ -512,7 +520,13 @@ func (s *Server) handleNewAPICookieTest(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleTabiAICookieTest POST /api/cookie-tests/tabiai（JWT）—— 启动 TaBiAI 凭据检测任务。
+//
+// 这个检测是一次真实的 refresh，会消耗一代 new_api_refresh。签到进程正在跑时两边
+// 都在推进代次，谁手里的旧了下次就会被判重放、整条会话被撤销，所以先拦一道。
 func (s *Server) handleTabiAICookieTest(w http.ResponseWriter, r *http.Request) {
+	if s.guardRunningCheckin(w) {
+		return
+	}
 	s.handleCookieTest(w, r, LoginMethodTabiAI)
 }
 

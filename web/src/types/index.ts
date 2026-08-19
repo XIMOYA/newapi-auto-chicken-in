@@ -265,6 +265,28 @@ export interface AccountOpsResult {
   skipped: string[] | null
 }
 
+// ===== 签到运行状态（网页端凭据操作锁）=====
+
+/**
+ * 签到进程在平台上占的那把锁。
+ *
+ * TaBiAI 的 new_api_refresh 有代次轮转 + 重放检测：签到进程和网页端同时动同一条
+ * sid，旧代次会被站点判为重放、整条会话被撤销。所以签到期间要锁住凭据检测与签发。
+ * running 由后端算好（有记录且心跳未过期），前端直接用，不要自己拿时间去判。
+ */
+export interface RunState {
+  running: boolean
+  /** 客户端自报来源，如 "GitHub Actions（me/repo）"；可能为空 */
+  source: string
+  started_at: string
+  /** 最后一次心跳；配合 stale_after_seconds 能算出最晚何时自动解锁 */
+  heartbeat_at: string
+  /** 多久没心跳就自动解锁——Actions 被强杀时没人来发「结束」，靠它兜底 */
+  stale_after_seconds: number
+  /** 平台建议的心跳间隔，客户端用 */
+  heartbeat_seconds: number
+}
+
 // ===== API Key =====
 
 export interface ApiKey {

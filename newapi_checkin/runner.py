@@ -71,6 +71,10 @@ MAX_BROWSER_PARALLELISM = FIXED_BROWSER_PARALLELISM
 ACCOUNT_DEADLINE_SECONDS = 0
 # 盾类重试的退避上限（秒）。连续硬刚 Cloudflare 只会让质询更难过
 SHIELD_RETRY_BACKOFF_MAX = 30
+# 平台没下发心跳间隔时用这个兜底（老版本平台、或响应结构变了）
+RUN_HEARTBEAT_FALLBACK_SECONDS = 60
+# 只用于日志文案：告诉用户漏解锁大概多久会自动过期。真实阈值在平台侧
+RUN_LOCK_STALE_HINT_MINUTES = 5
 # 出口 IP 探测结果缓存的上限。代理池在换 IP 时地址是有限的，但 daemon 长跑
 # 或手动配置频繁变更时不该让这个 dict 无界增长，超出后丢弃最早的一条。
 IP_CACHE_MAX = 256
@@ -113,6 +117,10 @@ class Runner:
         # Turnstile 取 token 有频率限制，必须跨账号串行 + 间隔
         self._turnstile_lock = threading.Lock()
         self._last_turnstile_at: float = 0.0
+        # 签到期间在平台上占的那把锁：网页端据此禁止动 TaBiAI 凭据
+        self._run_lock_active = False
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_stop: Optional[threading.Event] = None
 
     # ------------------------------------------------------------------ #
     # 懒加载资源
@@ -347,6 +355,9 @@ class Runner:
             else:
                 mode = "dry-run 连通性检查" if self.options.dry_run else "签到"
             log.step(f"开始{mode}，共 {len(accounts)} 个账号")
+            # 告诉平台「我开始跑了」，网页端据此锁住 TaBiAI 检测与签发。
+            # 放在账号筛选之后：没有账号可跑时压根不该上报，省得白锁一段时间。
+            self._start_run_report(accounts)
             workers = self._parallelism()
             browser_workers = self._browser_workers()
             self._browser_gate = threading.Semaphore(browser_workers)
@@ -360,9 +371,103 @@ class Runner:
             self._send_notification()
             return exit_code
         finally:
+            # 先解锁再收资源：网页端多锁一会儿没损失，但漏解锁要等 5 分钟过期
+            self._stop_run_report()
             # 释放懒加载创建的 AI 客户端（含各线程的 curl session），
             # 避免 daemon 长跑或多轮执行时泄漏资源。
             self._close_ai()
+
+    # ------------------------------------------------------------------ #
+    # 运行状态上报（配合平台锁住高危凭据操作）
+    # ------------------------------------------------------------------ #
+
+    def _needs_run_lock(self, accounts: list) -> bool:
+        """这一轮值不值得上报。
+
+        只有 tabiai 账号的凭据会轮转，也只有它怕跟网页端撞代次；一轮里全是
+        站点 Cookie 账号时上报纯属白锁网页端。dry-run 与 cookie_test 模式
+        同样会真的 refresh，所以照样要锁。
+        """
+        sync = getattr(self.cfg, "config_sync", None)
+        if sync is None or not getattr(sync, "enabled", False):
+            return False
+        return any(a.login_method == LOGIN_METHOD_TABIAI for a in accounts)
+
+    def _start_run_report(self, accounts: list) -> None:
+        """上报开跑并起心跳线程。上报失败只告警，绝不影响签到。"""
+        if not self._needs_run_lock(accounts):
+            return
+        from .remote_sync import report_run_start
+
+        ok, detail, gap = report_run_start(self.cfg.config_sync, self._run_source())
+        if not ok:
+            log.warn(f"未能上报签到状态（{detail}）：网页端不会被锁定，"
+                     "此时做 TaBiAI 凭据检测可能撞代次")
+            return
+        log.debug(f"已上报签到状态，网页端 TaBiAI 操作已锁定: {detail}")
+        self._run_lock_active = True
+        self._start_heartbeat(gap if gap > 0 else RUN_HEARTBEAT_FALLBACK_SECONDS)
+
+    def _start_heartbeat(self, interval: int) -> None:
+        """起一个守护线程持续续期。
+
+        必须独立于账号进度：一个账号过盾可能耗上十几分钟，若把心跳挂在账号
+        循环里，平台会在中途就把锁判过期。
+        """
+        self._heartbeat_stop = threading.Event()
+
+        def beat() -> None:
+            from .remote_sync import report_run_heartbeat
+
+            while not self._heartbeat_stop.wait(interval):
+                ok, running = report_run_heartbeat(self.cfg.config_sync)
+                if not ok:
+                    log.debug("签到状态心跳上报失败（网络问题？），下一拍再试")
+                    continue
+                if not running:
+                    log.warn("平台上的签到锁已被强制解锁：网页端现在可以动 TaBiAI 凭据，"
+                             "若此时做检测或签发会与本轮撞代次")
+
+        self._heartbeat_thread = threading.Thread(
+            target=beat, name="run-state-heartbeat", daemon=True)
+        self._heartbeat_thread.start()
+
+    def _stop_run_report(self) -> None:
+        """停心跳并解锁。异常一律吞掉：收尾阶段不能再抛错盖掉真正的结果。"""
+        if self._heartbeat_stop is not None:
+            self._heartbeat_stop.set()
+        thread = self._heartbeat_thread
+        if thread is not None and thread.is_alive():
+            # 只等一小会儿：线程是 daemon，拖着不退也不会阻止进程结束
+            thread.join(timeout=3)
+        self._heartbeat_thread = None
+        self._heartbeat_stop = None
+        if not self._run_lock_active:
+            return
+        self._run_lock_active = False
+        try:
+            from .remote_sync import report_run_stop
+
+            if report_run_stop(self.cfg.config_sync):
+                log.debug("已解除网页端的 TaBiAI 操作锁定")
+            else:
+                log.warn(f"未能解除网页端锁定：约 {RUN_LOCK_STALE_HINT_MINUTES} 分钟后会自动过期，"
+                         "也可在「Cookie 测试」页强制解锁")
+        except Exception as exc:  # noqa: BLE001 - 收尾失败不能影响退出码
+            log.debug(f"解除签到锁定时异常: {type(exc).__name__}: {exc}")
+
+    def _run_source(self) -> str:
+        """自报来源，只用于网页端展示「谁在跑」。"""
+        import os
+        import socket
+
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            repo = os.environ.get("GITHUB_REPOSITORY", "")
+            return f"GitHub Actions（{repo}）" if repo else "GitHub Actions"
+        try:
+            return socket.gethostname() or "签到客户端"
+        except Exception:  # noqa: BLE001 - 取不到主机名无所谓
+            return "签到客户端"
 
     def _send_notification(self) -> None:
         """把本轮汇总表以 HTML 邮件发出。未配置/发送失败均降级为 WARN。"""
@@ -729,9 +834,16 @@ class Runner:
             return self._row(account, result, "S1")
         if result.kind == api.NETWORK_ERROR:
             return self._row(account, result, "S1")
-        # Turnstile 拿不到 token 时浏览器过盾也救不了（那是人机验证，不是 CF 盾）
+        # Turnstile 不是 CF 盾，但脚本浏览器（S2/S3 那套 + AI）能代为点选拿 token。
+        # 首选仍是 CDP 接管本机真实 Chrome；走到这里说明那条路没给出 token
+        # （最典型的是 Actions 云端根本没有 Chrome 可接管），于是把这一轮交给过盾链，
+        # 让它顺手在浏览器里现取一个 token 回来立刻用掉。没有浏览器时还是死局，照旧跳过。
         if result.kind == api.TURNSTILE_REQUIRED:
-            return self._row(account, result, "S1", detail=result.message)
+            if not self.options.use_browser:
+                return self._row(account, result, "S1", detail=result.message)
+            log.warn(f"TaBiAI 需要 Turnstile token，转由浏览器代取: {result.message}")
+            self._take_browser_attempt(account)
+            return self._solve(account, record, ip, result, want_turnstile_token=True)
 
         verdict = result.verdict
         if result.kind == api.CF_BLOCKED:
@@ -751,8 +863,29 @@ class Runner:
         self._take_browser_attempt(account)
         return self._solve(account, record, ip, result)
 
-    def _tabiai_api_call(self, account: Account, cf) -> api.ApiResult:
-        from .tabiai import TabiAIClient, normalize_refresh_cookie
+    def _tabiai_rotate_callback(self, account: Account):
+        """凭据轮转的统一落盘回调。
+
+        HTTP 链路（TabiAIClient）和浏览器页内 refresh 都会轮转 new_api_refresh，
+        两条路必须用同一套处理：先落本地盘（当轮与后续本机运行都靠它），
+        再尽力回写平台。少写一处，下轮就会拿旧代次去撞重放检测。
+        """
+        from .tabiai import normalize_refresh_cookie
+
+        def on_rotate(value: str) -> None:
+            self.store.remember_refresh_cookie(account.slug, value)
+            account.cookie = normalize_refresh_cookie(value)
+            self._writeback_refresh_cookie(account, value)
+
+        return on_rotate
+
+    def _tabiai_api_call(self, account: Account, cf, turnstile_token: str = "") -> api.ApiResult:
+        """跑一轮 TaBiAI 签到。
+
+        turnstile_token 是过盾链刚在浏览器里取到的 token：传了就用它，没传就照旧
+        由 _turnstile_provider 决定要不要开 CDP 去取。
+        """
+        from .tabiai import TabiAIClient
 
         cookie = self._tabiai_cookie(account)
         if not cookie:
@@ -761,11 +894,7 @@ class Runner:
                 message="缺少 TaBiAI 凭据（new_api_refresh），请在管理端签发或从浏览器复制",
             )
 
-        def on_rotate(value: str) -> None:
-            # 站点换代次了：先落本地盘（当轮与后续本机运行都靠它），再尽力回写平台
-            self.store.remember_refresh_cookie(account.slug, value)
-            account.cookie = normalize_refresh_cookie(value)
-            self._writeback_refresh_cookie(account, value)
+        on_rotate = self._tabiai_rotate_callback(account)
 
         dry = bool(self.options.cookie_test or self.options.dry_run)
         with TabiAIClient(account, self.cfg.http, cookie, cf, on_rotate=on_rotate) as client:
@@ -774,7 +903,7 @@ class Runner:
                 + ("缓存 UA" if cf is not None and cf.user_agent else "默认 UA")
                 + (f", cookie 条数={len(cf.cookies)}" if cf is not None else "")
             )
-            provider = None if dry else self._turnstile_provider(account)
+            provider = None if dry else self._turnstile_provider(account, turnstile_token)
             result = client.checkin(turnstile_provider=provider, dry_run=dry)
         if result.kind in _SETTLED and result.user_id:
             account.user_id = result.user_id
@@ -801,8 +930,20 @@ class Runner:
             log.warn(f"新凭据未能回写管理平台（{detail}）：平台仍持有旧代次，"
                      "网页端检测会失败，请重新签发或检查 config_sync.writeback_url")
 
-    def _turnstile_provider(self, account: Account):
-        """返回 () -> (token, error)；未启用 tabiai 浏览器时返回 None。"""
+    def _turnstile_provider(self, account: Account, ready_token: str = ""):
+        """返回 () -> (token, error)；没有可用取 token 手段时返回 None。
+
+        ready_token 是过盾链刚在浏览器上下文里现取的 token。它短时、一次性且绑当前
+        浏览器上下文，只能在这一轮里立刻用掉，所以做成「用完即弃」的 provider：
+        不落盘、不进 store，也不占 Turnstile 的频率配额（token 已经拿到手了，
+        再走 _wait_turnstile_slot 只会白等一个间隔）。
+        """
+        if ready_token:
+            def ready():
+                return ready_token, ""
+
+            return ready
+
         tabiai_cfg = getattr(self.cfg, "tabiai", None)
         if tabiai_cfg is None or not tabiai_cfg.enabled:
             return None
@@ -836,7 +977,8 @@ class Runner:
     # 浏览器过盾（S2 / S3 / S4 / S5）
     # ------------------------------------------------------------------ #
 
-    def _solve_guarded(self, solve, account: Account, ip: Optional[str]):
+    def _solve_guarded(self, solve, account: Account, ip: Optional[str],
+                       want_turnstile_token: bool = False, on_rotate=None):
         """在浏览器并发信号量的保护下调用过盾流程。"""
         ai = self.ai()
 
@@ -847,6 +989,8 @@ class Runner:
                 exit_ip=ip,
                 options=self.options,
                 ai=ai,
+                want_turnstile_token=want_turnstile_token,
+                on_rotate=on_rotate,
             )
 
         def _call_bound():
@@ -882,7 +1026,18 @@ class Runner:
         return max(0.0, total)
 
     def _solve(self, account: Account, record, ip: Optional[str],
-               blocked: api.ApiResult) -> log.SummaryRow:
+               blocked: api.ApiResult, want_turnstile_token: bool = False) -> log.SummaryRow:
+        """浏览器过盾链。两种登录方式共用，都能在 S4 里把签到做完：
+
+        - 站点 Cookie：注入登录 cookie，页内直接 POST 签到
+        - TaBiAI：注入 new_api_refresh，页内先 refresh 换 Bearer token 再 POST 签到
+
+        TaBiAI 走页内是有意的：Turnstile token 短时一次性，站点校验时会连带看请求环境，
+        「浏览器生成、curl_cffi 使用」容易被拒。页内直发让 token 在哪生成就在哪用掉。
+        页内路走不通时仍会退回「拿 CF 会话回 HTTP 链路重发」的老路。
+
+        want_turnstile_token 只由 TaBiAI 的 TURNSTILE_REQUIRED 分支传 True。
+        """
         try:
             from .cf.solver import solve
         except ImportError as exc:
@@ -890,7 +1045,14 @@ class Runner:
             log.info("安装依赖: pip install -r requirements.txt && python -m camoufox fetch")
             return self._row(account, blocked, "S1", detail=f"过盾模块缺失: {exc}")
 
-        outcome = self._solve_guarded(solve, account, ip)
+        # 只有 TaBiAI 需要轮转回调：页内 refresh 会换代次，必须能落盘才敢走页内。
+        # dry-run / cookie_test 模式下不做页内签到，交回原链路按「只检查」处理。
+        dry = bool(self.options.cookie_test or self.options.dry_run)
+        on_rotate = None
+        if account.login_method == LOGIN_METHOD_TABIAI and not dry:
+            on_rotate = self._tabiai_rotate_callback(account)
+
+        outcome = self._solve_guarded(solve, account, ip, want_turnstile_token, on_rotate)
 
         if outcome.cf is not None:
             self.store.update_cf(account.slug, outcome.cf)
@@ -920,11 +1082,28 @@ class Runner:
             return self._row(account, outcome.api_result, outcome.strategy)
 
         # S2/S3：拿到 CF session，回到对应登录链路重发
-        result = (
-            self._tabiai_api_call(account, outcome.cf)
-            if account.login_method == LOGIN_METHOD_TABIAI
-            else self._api_call(account, outcome.cf)
-        )
+        if account.login_method == LOGIN_METHOD_TABIAI:
+            token = outcome.turnstile_token or ""
+            if want_turnstile_token and not token:
+                # 本轮取 token 的两条路（CDP 接管真实 Chrome、脚本浏览器现取）都空手而归。
+                # 再调一次 _tabiai_api_call 是纯浪费：refresh 会白轮转一代凭据，
+                # 而 CDP 那条路还得先干等一个 token_interval 间隔才失败第二次。
+                # 直接把 TURNSTILE_REQUIRED 交回主循环，由它换 IP + 重开浏览器再来一轮。
+                message = "浏览器过盾成功但仍未取到 Turnstile token"
+                if blocked.message:
+                    message += f"；上一步原因：{blocked.message}"
+                return self._row(account, api.ApiResult(
+                    api.TURNSTILE_REQUIRED,
+                    message=message,
+                    status=blocked.status,
+                    path=blocked.path,
+                    user_id=blocked.user_id,
+                ), outcome.strategy)
+            # 浏览器现取的 token 只在这一轮有效，紧接着就交给 TabiAIClient 用掉；
+            # 没取到时传空串，_turnstile_provider 会退回原来的 CDP 判定。
+            result = self._tabiai_api_call(account, outcome.cf, token)
+        else:
+            result = self._api_call(account, outcome.cf)
         return self._row(account, result, outcome.strategy)
 
     # ------------------------------------------------------------------ #

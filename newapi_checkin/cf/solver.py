@@ -1,8 +1,18 @@
 """过盾编排：S2 等自解 -> S3 AI 介入 -> S4 页内直发 -> S5 人工兜底。
 
-一个关键前提：浏览器 profile 本身没有登录态，所以进站前先把配置里的登录 cookie
-注入浏览器上下文；这样过盾后可以直接在页面里完成签到（S4），
+一个关键前提：浏览器 profile 本身没有登录态，所以进站前先把配置里的凭据注入
+浏览器上下文；这样过盾后可以直接在页面里完成签到（S4），
 不依赖「cookie 能否迁移回 curl_cffi」这件不确定的事。
+
+两种登录方式在 S4 的做法不同，但都在页内完成：
+- 站点 Cookie：注入的就是登录态，直接 POST 签到
+- TaBiAI：注入 new_api_refresh，页内先 POST /api/user/auth/refresh 换 Bearer token
+  再签到。页内 refresh 同样会轮转凭据，新代次必须通过 on_rotate 交回上层落盘，
+  否则下轮用旧代会被站点判重放、整条会话被撤销
+
+页内路走不通时（没给 on_rotate、refresh 网络异常等）仍会退回老路：把 CF 会话交回
+上层的 HTTP 链路重发，必要时附带一个在浏览器里现取的 Turnstile token，
+让云端没有真实 Chrome 可 CDP 接管的环境也签得上。
 """
 
 from __future__ import annotations
@@ -21,6 +31,8 @@ from ..config import (
     LOGIN_METHOD_TABIAI,
     SELF_PATH,
     SHOTS_DIR,
+    TABIAI_CHECKIN_PATH,
+    TABIAI_REFRESH_PATH,
     Account,
     Config,
 )
@@ -51,6 +63,9 @@ class SolveOutcome:
     detail: str = ""
     terminal: bool = False        # True 表示重试也没用（例如 WAF 硬封禁）
     result_kind: Optional[str] = None  # 失败原因的业务类型，避免统一映射成 WAF
+    # 浏览器里现取的 Turnstile token（只有 TaBiAI 链路会用）。短时一次性且绑当前
+    # 浏览器上下文，必须由调用方在同一轮里立刻用掉，不能缓存也不能落盘。
+    turnstile_token: str = ""
 
 
 def _make_driver(cfg: Config, account: Account, options) -> BrowserDriver:
@@ -64,8 +79,17 @@ def _make_driver(cfg: Config, account: Account, options) -> BrowserDriver:
 
 
 def solve(*, cfg: Config, account: Account, exit_ip: Optional[str], options,
-          ai=None) -> SolveOutcome:
-    """对外唯一入口。任何异常都转成 SolveOutcome，不向上抛。"""
+          ai=None, want_turnstile_token: bool = False, on_rotate=None) -> SolveOutcome:
+    """对外唯一入口。任何异常都转成 SolveOutcome，不向上抛。
+
+    want_turnstile_token 只对 TaBiAI 账号有意义：由 runner 显式要求「这一轮请顺便
+    带一个 Turnstile token 回来」，不在这里靠 login_method 猜——上层才知道 CDP
+    那条路是不是已经拿不到 token 了。
+
+    on_rotate 是 TaBiAI 页内签到的硬性依赖：页内 refresh 同样会轮转 new_api_refresh，
+    新代次必须立刻交回上层落盘。没传就退化成只过盾（S2/S3），不做页内签到 ——
+    宁可少走一步，也不能把轮转出来的代次丢在浏览器里。
+    """
     try:
         driver = _make_driver(cfg, account, options)
     except DriverUnavailable as exc:
@@ -73,7 +97,8 @@ def solve(*, cfg: Config, account: Account, exit_ip: Optional[str], options,
 
     try:
         with driver:
-            return _run(driver, cfg, account, exit_ip, options, ai)
+            return _run(driver, cfg, account, exit_ip, options, ai,
+                        want_turnstile_token=want_turnstile_token, on_rotate=on_rotate)
     except DriverUnavailable as exc:
         return SolveOutcome(False, "S2", detail=str(exc))
     except Exception as exc:  # noqa: BLE001 - 过盾失败不能让整轮崩掉
@@ -85,12 +110,13 @@ def solve(*, cfg: Config, account: Account, exit_ip: Optional[str], options,
 
 
 def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional[str],
-         options, ai) -> SolveOutcome:
+         options, ai, want_turnstile_token: bool = False, on_rotate=None) -> SolveOutcome:
     is_tabiai = account.login_method == LOGIN_METHOD_TABIAI
     log.info(f"启动 {driver.name} 过盾（profile: {account.profile_dir.name}）")
-    # 站点 Cookie 模式注入站点登录 Cookie；TaBiAI 模式只需要站点 CF 上下文，
-    # new_api_refresh 由 TabiAIClient 在 /api/user/auth 路径下单独发送。
-    driver.inject_cookies("" if is_tabiai else account.cookie)
+    # 两种模式都要把凭据注入浏览器：站点 Cookie 是登录态，TaBiAI 是 new_api_refresh。
+    # TaBiAI 以前有意不注入（签到走 HTTP 链路，浏览器只负责过盾），现在页内也要
+    # 换 Bearer token 完成签到，不注入的话页内 refresh 会直接 401。
+    driver.inject_cookies(account.cookie)
     if not is_tabiai and account.user_id:
         if driver.seed_auth_state(account.user_id):
             log.debug(f"浏览器入口已预置 localStorage 登录态 user_id={account.user_id}")
@@ -169,35 +195,33 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
               + ("（含 cf_clearance）" if "cf_clearance" in cf.cookies else "（无 cf_clearance）"))
 
     if is_tabiai:
-        # TaBiAI 的签到要先用 new_api_refresh 换 Bearer token，页面里没有登录态，
-        # 不能在此直接 POST checkin；把 CF session 交回 runner 的 TabiAIClient。
-        return SolveOutcome(True, strategy, cf=cf,
-                            detail="站点过盾完成，交回 TaBiAI 签到链路")
+        # 到这一步站点盾已经过了。接下来在同一个浏览器上下文里把签到做完（S4）：
+        # 页内 refresh 换 Bearer token，再带 Turnstile token 发签到。
+        #
+        # 为什么非要在页内做：Turnstile token 是短时一次性的，而且站点中间件校验它时
+        # 会连带看请求环境。把 token 取出来交给 curl_cffi 发，等于「A 环境生成、B 环境
+        # 使用」，本来就容易被拒；页内直发则和站点 Cookie 模式一样，token 在哪生成就
+        # 在哪用掉，还顺带带上了刚过盾的 cf_clearance 与真实浏览器指纹。
+        outcome = _tabiai_checkin_in_page(
+            driver, cfg, account, options, ai, cf, strategy, on_rotate)
+        if outcome is not None:
+            return outcome
+        # 页内路线不可用（没给 on_rotate、或 refresh 阶段就失败）时退回老路：
+        # 把 CF 会话交回 TabiAIClient 走 HTTP 链路，必要时附带现取的 token。
+        detail = "站点过盾完成，交回 TaBiAI 签到链路"
+        token = ""
+        if want_turnstile_token:
+            token = _acquire_turnstile_token(driver, cfg, account, options, ai)
+            detail += "（已附带浏览器现取的 Turnstile token）" if token \
+                else "（浏览器未取到 Turnstile token）"
+        return SolveOutcome(True, strategy, cf=cf, detail=detail, turnstile_token=token)
 
     # ---------------- S4：直接在页面里完成签到 ----------------
     result = _checkin_in_page(driver, account)
     if result is not None and result.kind == api.TURNSTILE_REQUIRED:
         # New API 的 Turnstile 中间件要求把当前 widget 生成的 token 放到
         # ?turnstile=...；token 是短时、一次性的，只在当前浏览器上下文立即使用。
-        token = driver.turnstile_token()
-        if not token:
-            # 页面上可能已有 Turnstile 组件（业务页或质询残留），先尝试直接点击
-            clicked = driver.click_turnstile()
-            if not clicked and ai is not None:
-                clicked = _click_turnstile_with_ai(driver, ai)
-            if clicked:
-                log.debug("检测到站点要求 Turnstile，已尝试点击当前页面 widget")
-            token = driver.turnstile_token()
-        if not token:
-            # 业务页面上通常没有 Turnstile（签到接口才要求），从站点状态接口读
-            # 公开 site key 后挂载官方 widget，再由交互循环主动应对质询。
-            site_key = _turnstile_site_key(driver, account)
-            if site_key and driver.mount_turnstile(site_key):
-                log.debug("已在当前页面挂载官方 Turnstile widget，开始交互等待 token")
-
-        wait = MANUAL_TIMEOUT if getattr(options, "manual", False) else cfg.browser.timeout
-        if not token:
-            token = _wait_turnstile_token_interactive(driver, ai, wait)
+        token = _acquire_turnstile_token(driver, cfg, account, options, ai)
         if token:
             result = _checkin_in_page(driver, account, token)
         else:
@@ -444,6 +468,42 @@ def _with_turnstile(path: str, token: Optional[str]) -> str:
     return urlunsplit(("", "", parts.path, urlencode(query), parts.fragment))
 
 
+def _acquire_turnstile_token(driver: BrowserDriver, cfg: Config, account: Account,
+                             options, ai) -> str:
+    """在当前浏览器页面里想尽办法拿一个 Turnstile token；拿不到返回空串。
+
+    顺序是按「代价从低到高」排的，别调换：
+      1. 页面已有 token（业务页自带 widget，或质询自解时回填的）直接读走；
+      2. 几何点击复选框，失败再让 AI 看截图代为点选（省一次视觉调用是有意的）；
+      3. 页面上压根没有 widget 时（签到接口才要 token，控制台页面上没有），
+         从 /api/status 读公开 site key 自己挂一个官方 widget；
+      4. 仍然没有就进交互等待循环，边点边让 AI 应对图片点选质询。
+
+    S4（站点 Cookie 页内直发）与 TaBiAI 收割 CF 会话后都走这里，两边的取 token
+    需求完全一样，不要各写一份。
+    """
+    token = driver.turnstile_token()
+    if not token:
+        # 页面上可能已有 Turnstile 组件（业务页或质询残留），先尝试直接点击
+        clicked = driver.click_turnstile()
+        if not clicked and ai is not None:
+            clicked = _click_turnstile_with_ai(driver, ai)
+        if clicked:
+            log.debug("检测到站点要求 Turnstile，已尝试点击当前页面 widget")
+        token = driver.turnstile_token()
+    if not token:
+        # 业务页面上通常没有 Turnstile（签到接口才要求），从站点状态接口读
+        # 公开 site key 后挂载官方 widget，再由交互循环主动应对质询。
+        site_key = _turnstile_site_key(driver, account)
+        if site_key and driver.mount_turnstile(site_key):
+            log.debug("已在当前页面挂载官方 Turnstile widget，开始交互等待 token")
+
+    wait = MANUAL_TIMEOUT if getattr(options, "manual", False) else cfg.browser.timeout
+    if not token:
+        token = _wait_turnstile_token_interactive(driver, ai, wait)
+    return token
+
+
 def _wait_turnstile_token_interactive(driver: BrowserDriver, ai, timeout: int) -> str:
     """交互式等待 Turnstile token，而不是干等。
 
@@ -574,6 +634,194 @@ def _checkin_in_page(driver: BrowserDriver, account: Account,
             continue
         return result
     return last
+
+
+# --------------------------------------------------------------------------- #
+# S4（TaBiAI）：在浏览器上下文里换 Bearer token 并完成签到
+# --------------------------------------------------------------------------- #
+
+
+def _tabiai_rotated_cookie(driver: BrowserDriver) -> str:
+    """从浏览器 cookie jar 里读回轮转后的 new_api_refresh。
+
+    为什么不从响应头读：refresh 的新代次是通过 Set-Cookie 下发的，而 Set-Cookie 属于
+    fetch API 的禁止读取响应头，页内 JS 永远拿不到它。浏览器自己会把它写进 cookie jar，
+    所以只能绕道从 jar 里取。
+    """
+    value = (driver.cookie_dict().get("new_api_refresh") or "").strip()
+    return f"new_api_refresh={value}" if value else ""
+
+
+def _tabiai_page_refresh(driver: BrowserDriver, account: Account,
+                         on_rotate) -> tuple[str, Optional[int], Optional[api.ApiResult]]:
+    """页内 POST /api/user/auth/refresh 换 Bearer token。
+
+    返回 (access_token, user_id, 失败结果)。成功时第三项为 None。
+
+    轮转处理是这里最要命的部分：只要浏览器实际发出了 refresh，就必须把 cookie jar 里
+    的新代次交回上层落盘，**无论这次请求判定成功还是失败**。漏一次，下轮用旧代就会被
+    站点判重放，整条会话直接撤销。
+    """
+    before = (driver.cookie_dict().get("new_api_refresh") or "").strip()
+    raw = driver.fetch_in_page(
+        account.base_url + TABIAI_REFRESH_PATH, "POST",
+        {"Accept": "application/json, text/plain, */*", "Content-Type": "application/json"},
+    )
+
+    # 先抢救凭据，再判成败：任何 return 之前都必须走过这一步
+    rotated = _tabiai_rotated_cookie(driver)
+    if rotated and rotated.split("=", 1)[1] != before and on_rotate is not None:
+        log.debug("页内 refresh 轮转了 new_api_refresh，已交回上层落盘")
+        on_rotate(rotated)
+
+    if not raw.get("ok"):
+        return "", None, api.ApiResult(
+            api.NETWORK_ERROR, message=f"页内 refresh 失败: {str(raw.get('body'))[:160]}",
+            path=TABIAI_REFRESH_PATH)
+
+    status, body, resp_headers, data = _parse_raw(raw)
+    verdict = detect.analyze(status, resp_headers, body)
+    if verdict.blocked:
+        return "", None, api.ApiResult(
+            api.CF_BLOCKED, message=verdict.describe(), status=status,
+            path=TABIAI_REFRESH_PATH, verdict=verdict, signals=list(verdict.signals))
+    if data is None:
+        return "", None, api.ApiResult(
+            api.UNKNOWN, message=f"页内 refresh 返回非 JSON（HTTP {status}）：{body[:160]}",
+            status=status, path=TABIAI_REFRESH_PATH)
+
+    code = str(data.get("code") or "").upper()
+    message = str(data.get("message") or "")
+    if status in (401, 403) or not data.get("success"):
+        if code == "AUTH_SESSION_REVOKED":
+            message = "会话已被撤销（旧代次重放或在别处登出了会话），需要重新签发 new_api_refresh"
+        elif code == "AUTH_UNAUTHORIZED":
+            message = "凭据已失效：可能已过期，或被更新后的代次取代"
+        kind = api.AUTH_FAILED if status in (401, 403) else api.FAILED
+        return "", None, api.ApiResult(kind, message=message or f"页内 refresh HTTP {status}",
+                                       status=status, path=TABIAI_REFRESH_PATH)
+
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        return "", None, api.ApiResult(
+            api.FAILED, message="页内 refresh 成功但未返回 access_token",
+            status=status, path=TABIAI_REFRESH_PATH)
+
+    user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+    uid = user.get("id")
+    uid = int(uid) if isinstance(uid, (int, float)) and int(uid) > 0 else None
+    if uid:
+        account.user_id = uid
+    return token, uid, None
+
+
+def _tabiai_page_already_checked(driver: BrowserDriver, account: Account,
+                                 token: str) -> Optional[bool]:
+    """页内查本月签到状态。返回 None 表示查不出来（交给签到本身去判）。
+
+    先查一次是为了省 Turnstile：已签的话压根不用取 token，而 token 有 20 分钟级的
+    频率限制，能省一次就省一次。
+    """
+    from datetime import datetime as _dt
+
+    month = _dt.now().strftime("%Y-%m")
+    raw = driver.fetch_in_page(
+        f"{account.base_url}{TABIAI_CHECKIN_PATH}?month={month}", "GET",
+        {"Accept": "application/json, text/plain, */*",
+         "Authorization": f"Bearer {token}"},
+    )
+    if not raw.get("ok"):
+        return None
+    status, body, _headers, data = _parse_raw(raw)
+    if data is None or not data.get("success") or status >= 400:
+        return None
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+    checked = stats.get("checked_in_today")
+    return bool(checked) if checked is not None else None
+
+
+def _tabiai_page_checkin(driver: BrowserDriver, account: Account, token: str,
+                         turnstile: str) -> api.ApiResult:
+    """页内 POST 签到。turnstile 必须是当前页面刚生成的那个。"""
+    path = _with_turnstile(TABIAI_CHECKIN_PATH, turnstile)
+    raw = driver.fetch_in_page(
+        account.base_url + path, "POST",
+        {"Accept": "application/json, text/plain, */*",
+         "Authorization": f"Bearer {token}",
+         "Content-Type": "application/json"},
+    )
+    if not raw.get("ok"):
+        return api.ApiResult(api.NETWORK_ERROR, message=str(raw.get("body"))[:160],
+                             path=TABIAI_CHECKIN_PATH)
+    status, body, resp_headers, data = _parse_raw(raw)
+    verdict = detect.analyze(status, resp_headers, body)
+    if verdict.blocked:
+        return api.ApiResult(api.CF_BLOCKED, message=verdict.describe(), status=status,
+                             path=TABIAI_CHECKIN_PATH, verdict=verdict,
+                             signals=list(verdict.signals))
+    return api.classify_checkin(status, data, body[:160], TABIAI_CHECKIN_PATH)
+
+
+def _tabiai_checkin_in_page(driver: BrowserDriver, cfg: Config, account: Account,
+                            options, ai, cf: CFSession, strategy: str,
+                            on_rotate) -> Optional[SolveOutcome]:
+    """TaBiAI 的 S4：过盾后在同一个页面里把签到做完。
+
+    返回 None 表示这条路走不通，调用方应退回「交回 HTTP 链路」的老路。返回
+    SolveOutcome 表示已有结论（成功、已签、或明确的失败），不必再走 HTTP。
+
+    on_rotate 为空时直接放弃：页内 refresh 一定会轮转凭据，没有回写通道就等于把新
+    代次丢在浏览器里，下轮必然被判重放。这种情况下宁可不走页内。
+    """
+    if on_rotate is None:
+        log.debug("未提供凭据轮转回调，跳过 TaBiAI 页内签到")
+        return None
+
+    token, uid, failure = _tabiai_page_refresh(driver, account, on_rotate)
+    if failure is not None:
+        # refresh 阶段失败：CF_BLOCKED 说明盾其实没过干净，交回上层换 IP 重试；
+        # 认证类失败是定论，直接带出去，别再让 HTTP 链路重复消耗一代凭据。
+        if failure.kind in (api.AUTH_FAILED, api.FAILED):
+            return SolveOutcome(False, "S4", cf=cf, api_result=failure,
+                                detail=failure.message or "页内换令牌失败",
+                                result_kind=failure.kind)
+        log.debug(f"页内 refresh 未成功（{failure.kind}），退回 HTTP 链路: {failure.message[:80]}")
+        return None
+
+    log.debug(f"页内已换到 Bearer token（user_id={uid}）")
+    if _tabiai_page_already_checked(driver, account, token) is True:
+        result = api.ApiResult(api.ALREADY_DONE, message="今日已签到",
+                              path=TABIAI_CHECKIN_PATH, user_id=uid)
+        return SolveOutcome(True, "S4", cf=cf, api_result=result,
+                            detail=f"过盾于 {strategy}，页内查得今日已签到")
+
+    turnstile = _acquire_turnstile_token(driver, cfg, account, options, ai)
+    if not turnstile:
+        # 拿不到 token 就别硬发：站点强校验，发出去只会白白消耗一次机会。
+        # 上层按 TURNSTILE_REQUIRED 换 IP 重开浏览器再来，那才有可能翻盘。
+        result = api.ApiResult(
+            api.TURNSTILE_REQUIRED,
+            message="站点要求 Turnstile token，浏览器内多种方式均未取到；"
+                    "该出口 IP 可能被判为不可信，可尝试给该账号配置住宅代理",
+            path=TABIAI_CHECKIN_PATH, user_id=uid)
+        return SolveOutcome(False, "S4", cf=cf, api_result=result,
+                            detail=result.message, result_kind=api.TURNSTILE_REQUIRED)
+
+    result = _tabiai_page_checkin(driver, account, token, turnstile)
+    if result.user_id is None:
+        result.user_id = uid
+    if result.kind in (api.SUCCESS, api.ALREADY_DONE):
+        return SolveOutcome(True, "S4", cf=cf, api_result=result,
+                            detail=f"过盾于 {strategy}，签到在浏览器上下文内完成")
+    if result.kind == api.NETWORK_ERROR:
+        # 页内网络抖动不是定论，交回 HTTP 链路再试一次
+        log.debug(f"页内签到网络异常，退回 HTTP 链路: {result.message[:80]}")
+        return None
+    return SolveOutcome(False, "S4", cf=cf, api_result=result,
+                        detail=result.message or "浏览器内签到失败",
+                        result_kind=result.kind)
 
 
 # --------------------------------------------------------------------------- #

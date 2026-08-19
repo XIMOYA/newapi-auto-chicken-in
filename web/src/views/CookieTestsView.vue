@@ -5,17 +5,36 @@ web/src/views/CookieTestsView.vue
 - 站点 Cookie 与 TaBiAI 凭据使用两个独立 Tab；后端同一时刻只跑一个任务
 - 检测在服务端后台执行，本页每 2s 轮询进度，可手动停止
 - 代理类失败由服务端换代理无限重试，只做凭据可用性检查，不执行真正签到
+- 签到进程在跑时锁住 TaBiAI 检测：那也是一次真 refresh，两边同时推进代次会让
+  旧代被判重放、整条会话被站点撤销。站点 Cookie 是静态凭据，不受此限
 数据来源：
 - POST /api/cookie-tests/newapi
 - POST /api/cookie-tests/tabiai
 - GET  /api/cookie-tests/status
 - POST /api/cookie-tests/stop
+- GET  /api/run-state
+- POST /api/run-state/unlock
 -->
 <template>
   <div class="page-container cookie-tests-page">
     <n-alert type="warning" :bordered="false" class="intro-alert">
       检测在服务端后台执行并走服务器代理池：遇到代理或 CDN 拦截会自动换出口重试，只有站点/凭据本身给出结论才会停止，
       因此需要时可点「停止检测」。浏览器不会接触 Cookie 明文。
+    </n-alert>
+
+    <!-- 签到锁：只影响 TaBiAI，所以放在页面顶部统一说明，Tab 里再禁用按钮 -->
+    <n-alert v-if="runLock.running" type="error" :bordered="false" class="lock-alert">
+      <template #header>TaBiAI 凭据操作已锁定</template>
+      <div class="lock-body">
+        <div>{{ lockSummary }}</div>
+        <div v-if="runLock.started_at" class="lock-meta">
+          开始于 {{ formatTime(runLock.started_at) }}
+          <span v-if="runLock.heartbeat_at">· 最后心跳 {{ formatTime(runLock.heartbeat_at) }}</span>
+        </div>
+        <n-button size="small" type="error" ghost :loading="unlocking" @click="confirmUnlock">
+          确认没在跑？强制解锁
+        </n-button>
+      </div>
     </n-alert>
 
     <n-tabs v-model:value="activeMode" type="line" animated>
@@ -52,6 +71,9 @@ web/src/views/CookieTestsView.vue
         <div class="tab-summary">
           <n-space :size="8" align="center">
             <n-tag size="small" type="info" :bordered="false">可检测 {{ tabiaiAccounts.length }} 个启用账号</n-tag>
+            <n-tag v-if="runLock.running" size="small" type="error" :bordered="false">
+              签到进行中，已锁定
+            </n-tag>
             <template v-if="tabiaiSummary">
               <n-tag size="small" type="success" :bordered="false">有效 {{ tabiaiSummary.valid }}</n-tag>
               <n-tag size="small" type="error" :bordered="false">失效 {{ tabiaiSummary.invalid }}</n-tag>
@@ -68,7 +90,7 @@ web/src/views/CookieTestsView.vue
           :loading="starting === 'tabiai'"
           :running="runningMode === 'tabiai'"
           :stopping="stopping"
-          :busy="busyWith('tabiai')"
+          :busy="busyWith('tabiai') || runLock.running"
           :round="runningMode === 'tabiai' ? round : 0"
           :settled="tabiaiSettled"
           :total="tabiaiTotal"
@@ -82,7 +104,7 @@ web/src/views/CookieTestsView.vue
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { NAlert, NSpace, NTabPane, NTabs, NTag, useMessage } from 'naive-ui'
+import { NAlert, NButton, NSpace, NTabPane, NTabs, NTag, useDialog, useMessage } from 'naive-ui'
 import CookieTestPanel from '@/components/CookieTestPanel.vue'
 import {
   getCookieTestStatus,
@@ -90,6 +112,7 @@ import {
   startTabiAICookieTest,
   stopCookieTest
 } from '@/api/cookieTests'
+import { getRunState, unlockRunState } from '@/api/runState'
 import { useConfigStore } from '@/stores/config'
 import { extractErrorMessage } from '@/utils/error'
 import {
@@ -99,11 +122,21 @@ import {
   snapshotFromStatus,
   type CookieTestSnapshot
 } from '@/utils/cookieTestPolling'
-import type { Account, CookieTestMode, CookieTestResult, CookieTestStatus, CookieTestSummary } from '@/types'
+import {
+  RUN_LOCK_POLL_INTERVAL,
+  idleRunState,
+  runLockFromError,
+  runLockSummary,
+  shouldPollRunLock
+} from '@/utils/runLock'
+import type {
+  Account, CookieTestMode, CookieTestResult, CookieTestStatus, CookieTestSummary, RunState
+} from '@/types'
 
 const POLL_INTERVAL = 2000
 
 const configStore = useConfigStore()
+const dialog = useDialog()
 const message = useMessage()
 
 const activeMode = ref<CookieTestMode>('newapi_cookie')
@@ -120,6 +153,13 @@ const tabiaiCheckedAt = ref('')
 
 const snapshot = ref<CookieTestSnapshot | null>(null)
 const round = ref(0)
+
+// 签到锁：只影响 TaBiAI。running 由后端判活，这里不自己拿时间算
+const runLock = ref<RunState>(idleRunState())
+const unlocking = ref(false)
+// 让「还剩几分钟」跟着时钟走，否则页面开着不动文案就一直是刚拉到时的值
+const lockClock = ref(Date.now())
+const lockSummary = computed(() => runLockSummary(runLock.value, lockClock.value))
 let prevSnapshot: CookieTestSnapshot | null = null
 let timer: ReturnType<typeof setInterval> | null = null
 
@@ -215,6 +255,13 @@ async function start(mode: CookieTestMode, accountNames: string[]) {
     await pollOnce()
     startPolling()
   } catch (error) {
+    // 按钮禁用只能挡住「已知在锁」的情况：签到恰好在两次轮询之间开跑时仍会撞 409。
+    // 后端会把最新锁状态一起回传，直接换上，省一次往返
+    const locked = runLockFromError(error)
+    if (locked) {
+      runLock.value = locked
+      lockClock.value = Date.now()
+    }
     message.error(extractErrorMessage(error, '启动检测失败'))
   } finally {
     starting.value = ''
@@ -240,6 +287,72 @@ async function handleStop() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 签到锁
+// ---------------------------------------------------------------------------
+
+let lockTimer: ReturnType<typeof setInterval> | null = null
+let lockInFlight = false
+
+async function pollRunLockOnce() {
+  const ctx = {
+    hidden: typeof document !== 'undefined' && document.hidden,
+    inFlight: lockInFlight
+  }
+  if (!shouldPollRunLock(ctx)) return
+  lockInFlight = true
+  try {
+    runLock.value = await getRunState()
+    lockClock.value = Date.now()
+  } catch {
+    // 查不到锁状态时不改本地值也不刷错误：这只是个提示，别打断用户做别的事
+  } finally {
+    lockInFlight = false
+  }
+}
+
+function startLockPolling() {
+  if (lockTimer !== null) return
+  lockTimer = setInterval(pollRunLockOnce, RUN_LOCK_POLL_INTERVAL)
+}
+
+function stopLockPolling() {
+  if (lockTimer !== null) {
+    clearInterval(lockTimer)
+    lockTimer = null
+  }
+}
+
+function confirmUnlock() {
+  dialog.error({
+    title: '强制解锁前请确认签到真的停了',
+    content: () =>
+      '这把锁是为了防止两边同时动同一条 new_api_refresh。'
+      + '如果签到其实还在跑，解锁后再做检测或签发，站点会把旧代次判为重放，'
+      + '整条 TaBiAI 会话被直接撤销 —— 届时所有 tabiai 账号都会签到失败，'
+      + '必须重新签发凭据才能恢复。\n\n'
+      + '只有在确认对方进程已经结束（例如 Actions 显示已完成/已取消）时才继续。',
+    positiveText: '我确认已停止，强制解锁',
+    negativeText: '再等等',
+    onPositiveClick: () => {
+      void doUnlock()
+    }
+  })
+}
+
+async function doUnlock() {
+  unlocking.value = true
+  try {
+    await unlockRunState()
+    await pollRunLockOnce()
+    message.success('已强制解锁；若签到仍在运行，它下次心跳会重新上锁')
+  } catch (error) {
+    message.error(extractErrorMessage(error, '强制解锁失败'))
+  } finally {
+    unlocking.value = false
+  }
+}
+
 onMounted(async () => {
   // 页面刷新后若后台任务仍在跑，直接接管展示并继续轮询
   await pollOnce()
@@ -250,9 +363,14 @@ onMounted(async () => {
     }
     startPolling()
   }
+  await pollRunLockOnce()
+  startLockPolling()
 })
 
-onBeforeUnmount(stopPolling)
+onBeforeUnmount(() => {
+  stopPolling()
+  stopLockPolling()
+})
 </script>
 
 <style scoped>
@@ -261,6 +379,20 @@ onBeforeUnmount(stopPolling)
   flex-direction: column;
   gap: 16px;
   max-width: 1280px;
+}
+
+/* 锁定提示要足够显眼：用户很可能是点了按钮没反应才来看这里 */
+.lock-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.lock-meta {
+  color: #8492a6;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .intro-alert {

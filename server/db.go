@@ -88,7 +88,7 @@ func OpenDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// createSchema 创建 users / api_keys / config 三张表（幂等）。
+// createSchema 创建 users / api_keys / config / proxies / run_state 表（幂等）。
 func createSchema(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS users (
@@ -121,6 +121,9 @@ func createSchema(db *sql.DB) error {
 		return err
 	}
 	if err := createProxiesTable(db); err != nil {
+		return err
+	}
+	if err := createRunStateTable(db); err != nil {
 		return err
 	}
 	return nil
