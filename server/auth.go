@@ -269,6 +269,53 @@ func (s *Server) requireJWT(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// requireJWTOrAPIKey 双认证中间件：JWT（网页端管理员）或 API Key（自动化脚本）任一即可。
+//
+// 为什么需要它：网页端的运维功能原本只认 JWT，而 JWT 要用密码换、两小时过期，
+// 脚本没法用。放开这批端点后，Actions / 本机脚本能用同一把 API Key 干完
+// 「拉配置、改账号、跑检测、管代理」这些事，不必再去模拟登录。
+//
+// 有意不放开的是「控制平面」：改密码、增删 API Key、整份导入。那几个一旦被冒用
+// 就能永久夺取平台控制权，而 API Key 是要躺在 CI secrets 里的，风险等级不同。
+//
+// 先试 JWT 再试 API Key：网页端请求量远大于脚本，让常见路径少走一次数据库查询。
+func (s *Server) requireJWTOrAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tok, ok := bearerToken(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "未认证")
+			return
+		}
+		if username, err := ParseToken(tok, s.jwtSecret); err == nil {
+			ctx := context.WithValue(r.Context(), ctxKeyUsername, username)
+			next(w, r.WithContext(ctx))
+			return
+		}
+		keyHash := HashAPIKey(tok)
+		row, err := GetAPIKeyByHash(s.db, keyHash)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "服务器内部错误")
+			return
+		}
+		if row == nil {
+			// 不区分「JWT 过期」和「Key 不存在」：对外统一措辞，别给探测者额外线索
+			writeError(w, http.StatusUnauthorized, "未认证：需要有效的登录令牌或 API Key")
+			return
+		}
+		_ = UpdateAPIKeyLastUsed(s.db, row.ID)
+		ctx := context.WithValue(r.Context(), ctxKeyAPIKeyID, row.ID)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+// isAPIKeyRequest 判断这次请求是用 API Key 进来的（而不是 JWT）。
+// 导出接口用它决定要不要检查一次性票据：票据本质是「二次密码确认」，
+// 而 API Key 调用方压根没有交互式输密码的场合。
+func isAPIKeyRequest(r *http.Request) bool {
+	_, ok := r.Context().Value(ctxKeyAPIKeyID).(int64)
+	return ok
+}
+
 // requireAPIKey 拉取端鉴权中间件：校验 Authorization: Bearer <API_KEY>，
 // 仅用于 /api/config/raw；鉴权通过后顺手更新该 Key 的 last_used_at。
 func (s *Server) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {

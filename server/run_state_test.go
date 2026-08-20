@@ -303,21 +303,19 @@ func TestTabiAICookieTestWorksAfterStop(t *testing.T) {
 func TestRunStateAuthBoundaries(t *testing.T) {
 	srv := newTestServer(t)
 	jwt := loginToken(t, srv)
-	key := apiKeyToken(t, srv, jwt)
 
 	cases := []struct {
 		name, method, path, token string
 		want                      int
 	}{
-		// 上报三件事属于客户端，用 API Key
+		// 上报三件事是客户端专属，只认 API Key：JWT 来调说明用错了接口
 		{"start 用 JWT 应拒", http.MethodPost, "/api/run-state/start", jwt, http.StatusUnauthorized},
 		{"heartbeat 用 JWT 应拒", http.MethodPost, "/api/run-state/heartbeat", jwt, http.StatusUnauthorized},
 		{"stop 用 JWT 应拒", http.MethodPost, "/api/run-state/stop", jwt, http.StatusUnauthorized},
-		// 查询与强制解锁属于管理员，用 JWT
-		{"查询用 API Key 应拒", http.MethodGet, "/api/run-state", key, http.StatusUnauthorized},
-		{"强制解锁用 API Key 应拒", http.MethodPost, "/api/run-state/unlock", key, http.StatusUnauthorized},
+		// 无凭据一律拒
 		{"无凭据查询应拒", http.MethodGet, "/api/run-state", "", http.StatusUnauthorized},
 		{"无凭据上报应拒", http.MethodPost, "/api/run-state/start", "", http.StatusUnauthorized},
+		{"乱填 token 应拒", http.MethodGet, "/api/run-state", "not-a-real-token", http.StatusUnauthorized},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -326,5 +324,36 @@ func TestRunStateAuthBoundaries(t *testing.T) {
 				t.Fatalf("状态 = %d，期望 %d: %s", rr.Code, tc.want, rr.Body.String())
 			}
 		})
+	}
+}
+
+func TestRunStateQueryAndUnlockAcceptBothCredentials(t *testing.T) {
+	// 查询与强制解锁属于运维操作，JWT 与 API Key 都该放行：
+	// 脚本发现锁残留时要能自己解开，而它本来就能调被这把锁保护的检测接口，
+	// 所以放开不增加实际权限。
+	srv := newTestServer(t)
+	jwt := loginToken(t, srv)
+	key := apiKeyToken(t, srv, jwt)
+
+	for _, tc := range []struct{ name, token string }{
+		{"JWT", jwt},
+		{"API Key", key},
+	} {
+		t.Run(tc.name+" 可查询", func(t *testing.T) {
+			if rr := doReq(t, srv, http.MethodGet, "/api/run-state", tc.token, nil); rr.Code != http.StatusOK {
+				t.Fatalf("状态 = %d: %s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+
+	startRun(t, srv, key, "github-actions")
+	if !runStateOf(t, srv, jwt).Running {
+		t.Fatal("前置条件：应处于签到中")
+	}
+	if rr := doReq(t, srv, http.MethodPost, "/api/run-state/unlock", key, nil); rr.Code != http.StatusOK {
+		t.Fatalf("API Key 强制解锁应放行，实际 %d: %s", rr.Code, rr.Body.String())
+	}
+	if runStateOf(t, srv, jwt).Running {
+		t.Error("解锁后应已放开")
 	}
 }

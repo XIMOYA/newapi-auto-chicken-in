@@ -62,47 +62,54 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("POST /api/login", s.handleLogin)
 
-	mux.HandleFunc("GET /api/config", s.requireJWT(s.handleGetConfig))
-	mux.HandleFunc("GET /api/config/revision", s.requireJWT(s.handleConfigRevision))
-	mux.HandleFunc("PUT /api/config", s.requireJWT(s.handlePutConfig))
-	mux.HandleFunc("POST /api/config/import", s.requireJWT(s.handleImportConfig))
+	// 运维类端点一律双认证（JWT 或 API Key）：网页端行为不变，脚本也能直接用同一把
+	// API Key 干活，不必去模拟登录换 JWT。
+	mux.HandleFunc("GET /api/config", s.requireJWTOrAPIKey(s.handleGetConfig))
+	mux.HandleFunc("GET /api/config/revision", s.requireJWTOrAPIKey(s.handleConfigRevision))
+	mux.HandleFunc("PUT /api/config", s.requireJWTOrAPIKey(s.handlePutConfig))
 	mux.HandleFunc("GET /api/config/raw", s.requireAPIKey(s.handleRawConfig))
+	// 整份导入仍只认 JWT：它能一次覆盖包括 security 在内的所有段落，
+	// 属于控制平面而不是日常运维。要脚本改配置请用 PUT /api/config 或账号 ops。
+	mux.HandleFunc("POST /api/config/import", s.requireJWT(s.handleImportConfig))
 
 	// 账号级增量操作：多人同时编辑账号列表走这里，不走整份覆盖
-	mux.HandleFunc("POST /api/accounts/ops", s.requireJWT(s.handleAccountOps))
+	mux.HandleFunc("POST /api/accounts/ops", s.requireJWTOrAPIKey(s.handleAccountOps))
 
+	// API Key 的增删查只认 JWT：让一把 Key 能造出新 Key 等于永久提权，
+	// CI secrets 一旦泄露就再也收不回控制权。
 	mux.HandleFunc("GET /api/keys", s.requireJWT(s.handleListKeys))
 	mux.HandleFunc("POST /api/keys", s.requireJWT(s.handleCreateKey))
 	mux.HandleFunc("DELETE /api/keys/{id}", s.requireJWT(s.handleDeleteKey))
 
-	mux.HandleFunc("GET /api/export", s.requireJWT(s.handleExport))
+	// 导出双认证；API Key 调用免一次性票据（脚本没有交互输密码的场合，
+	// 详见 handleExport）。改密码仍只认 JWT —— 那是账号身份本身。
+	mux.HandleFunc("GET /api/export", s.requireJWTOrAPIKey(s.handleExport))
 	mux.HandleFunc("PUT /api/password", s.requireJWT(s.handlePassword))
 	mux.HandleFunc("POST /api/auth/verify-password", s.requireJWT(s.handleVerifyPassword))
 
 	// Cookie 可用性测试：站点 Cookie 与 TaBiAI 严格分开，检测在后台跑、前端轮询。
-	mux.HandleFunc("POST /api/cookie-tests/newapi", s.requireJWT(s.handleNewAPICookieTest))
-	mux.HandleFunc("POST /api/cookie-tests/tabiai", s.requireJWT(s.handleTabiAICookieTest))
-	mux.HandleFunc("GET /api/cookie-tests/status", s.requireJWT(s.handleCookieTestStatus))
-	mux.HandleFunc("POST /api/cookie-tests/stop", s.requireJWT(s.handleStopCookieTest))
+	mux.HandleFunc("POST /api/cookie-tests/newapi", s.requireJWTOrAPIKey(s.handleNewAPICookieTest))
+	mux.HandleFunc("POST /api/cookie-tests/tabiai", s.requireJWTOrAPIKey(s.handleTabiAICookieTest))
+	mux.HandleFunc("GET /api/cookie-tests/status", s.requireJWTOrAPIKey(s.handleCookieTestStatus))
+	mux.HandleFunc("POST /api/cookie-tests/stop", s.requireJWTOrAPIKey(s.handleStopCookieTest))
 
 	// TaBiAI 凭据维护：签发（GitHub OAuth 三步换 new_api_refresh）与回写（Python 侧轮转后同步）
-	mux.HandleFunc("POST /api/tabiai/issue-cookie", s.requireJWT(s.handleIssueTabiAICookie))
+	mux.HandleFunc("POST /api/tabiai/issue-cookie", s.requireJWTOrAPIKey(s.handleIssueTabiAICookie))
 	mux.HandleFunc("POST /api/accounts/{name}/refresh-cookie", s.requireAPIKey(s.handleWriteBackRefreshCookie))
 
 	// 签到运行状态：客户端用 API Key 上报开跑/心跳/收尾，网页端据此锁住高危凭据操作。
-	// 强制解锁走 JWT —— 那是管理员在界面上的决定，不该让持有 API Key 的客户端能做。
 	mux.HandleFunc("POST /api/run-state/start", s.requireAPIKey(s.handleRunStateStart))
 	mux.HandleFunc("POST /api/run-state/heartbeat", s.requireAPIKey(s.handleRunStateHeartbeat))
 	mux.HandleFunc("POST /api/run-state/stop", s.requireAPIKey(s.handleRunStateStop))
-	mux.HandleFunc("GET /api/run-state", s.requireJWT(s.handleGetRunState))
-	mux.HandleFunc("POST /api/run-state/unlock", s.requireJWT(s.handleRunStateUnlock))
+	mux.HandleFunc("GET /api/run-state", s.requireJWTOrAPIKey(s.handleGetRunState))
+	mux.HandleFunc("POST /api/run-state/unlock", s.requireJWTOrAPIKey(s.handleRunStateUnlock))
 
 	// 代理池管理
-	mux.HandleFunc("GET /api/proxies", s.requireJWT(s.handleListProxies))
+	mux.HandleFunc("GET /api/proxies", s.requireJWTOrAPIKey(s.handleListProxies))
 	mux.HandleFunc("GET /api/proxies/available", s.requireAPIKey(s.handleAvailableProxies))
-	mux.HandleFunc("GET /api/proxies/stats", s.requireJWT(s.handleProxyStats))
-	mux.HandleFunc("POST /api/proxies/refresh", s.requireJWT(s.handleRefreshProxies))
-	mux.HandleFunc("POST /api/proxies/speedtest", s.requireJWT(s.handleSpeedTestProxies))
+	mux.HandleFunc("GET /api/proxies/stats", s.requireJWTOrAPIKey(s.handleProxyStats))
+	mux.HandleFunc("POST /api/proxies/refresh", s.requireJWTOrAPIKey(s.handleRefreshProxies))
+	mux.HandleFunc("POST /api/proxies/speedtest", s.requireJWTOrAPIKey(s.handleSpeedTestProxies))
 
 	mux.Handle("/", s.staticHandler())
 	return securityHeaders(mux)
@@ -661,11 +668,16 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 // 单次使用、2 分钟过期、绑定用户。没有这层绑定的话，拿到 JWT 就能直接拉走全部
 // 明文凭据，前端那步密码确认等于装饰。
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
-	username, _ := r.Context().Value(ctxKeyUsername).(string)
-	if !s.exportTickets.consume(r.Header.Get("X-Export-Ticket"), username) {
-		writeError(w, http.StatusForbidden,
-			"导出需要先通过密码确认（票据缺失、已使用或已过期），请重新验证密码")
-		return
+	// API Key 调用免票据：票据的本质是「让坐在屏幕前的人再输一次密码」，
+	// 而脚本没有交互场合。持有 API Key 本身已是凭证，再要密码等于要求
+	// 把管理员密码也塞进 CI secrets，反而扩大了泄露面。
+	if !isAPIKeyRequest(r) {
+		username, _ := r.Context().Value(ctxKeyUsername).(string)
+		if !s.exportTickets.consume(r.Header.Get("X-Export-Ticket"), username) {
+			writeError(w, http.StatusForbidden,
+				"导出需要先通过密码确认（票据缺失、已使用或已过期），请重新验证密码")
+			return
+		}
 	}
 	cfg, _, err := LoadConfig(s.db)
 	if err != nil {
