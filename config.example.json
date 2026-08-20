@@ -29,7 +29,8 @@
     "refresh_minutes": 30,
     "save_limit": 0,
     "auto_test": true,
-    "remote_url": ""
+    "remote_url": "",
+    "report_feedback": true
   },
   "notify": {
     "email": {

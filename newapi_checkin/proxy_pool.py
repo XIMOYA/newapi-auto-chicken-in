@@ -77,6 +77,10 @@ class ProxyPoolConfig:
     remote_token: str = ""
     remote_token_header: str = "Authorization"
     remote_token_prefix: str = "Bearer"
+    # 跑完把每个代理的成败计数回传给平台（POST /api/proxies/feedback），下次预取时
+    # 服务器据此优选。关掉的话排序只剩服务器自测的延迟/测速，而那是服务器到代理的
+    # 链路，跟 Actions runner 那边能不能用不是一回事
+    report_feedback: bool = True
 
     @classmethod
     def from_raw(cls, raw: Optional[dict]) -> "ProxyPoolConfig":
@@ -101,6 +105,7 @@ class ProxyPoolConfig:
             remote_token=str(raw.get("remote_token") or "").strip(),
             remote_token_header=str(raw.get("remote_token_header") or "Authorization").strip() or "Authorization",
             remote_token_prefix=str(raw.get("remote_token_prefix") or "Bearer").strip(),
+            report_feedback=_as_bool(raw.get("report_feedback"), True),
         )
 
     def to_dict(self) -> dict:
@@ -116,6 +121,7 @@ class ProxyPoolConfig:
             "remote_token": self.remote_token,
             "remote_token_header": self.remote_token_header,
             "remote_token_prefix": self.remote_token_prefix,
+            "report_feedback": self.report_feedback,
         }
 
 
@@ -155,6 +161,10 @@ class ProxyPool:
         # 上一次 _test_many 真正测完的候选数（时间盒截断时小于候选总数），
         # 只用于日志口径：分母必须是「测完的」而不是「提交的」
         self._last_tested = 0
+        # 代理 -> {"ok": n, "net_fail": n, "block_fail": n}，跑完回传给平台做优选。
+        # 必须在失败当场记：_pooled_proxies 换过 IP 后只剩最新值，事后反推会漏掉
+        # 中途被换掉的那些坏代理，而它们恰恰是最该记下来的
+        self._stats: dict[str, dict[str, int]] = {}
         self._lock = threading.RLock()
         self.last_error = ""
 
@@ -190,14 +200,19 @@ class ProxyPool:
 
         return self._refresh_local(desired)
 
-    def _fetch_remote(self) -> Optional[list]:
-        """请求配置管理平台 /api/proxies/available，返回可用代理地址列表。"""
-        from curl_cffi import requests as cffi
-
+    def _auth_headers(self) -> dict:
+        """预取和回传共用的请求头（带上平台 API Key）。"""
         headers = {"Accept": "application/json, text/plain, */*"}
         if self.cfg.remote_token:
             prefix = self.cfg.remote_token_prefix.strip()
             headers[self.cfg.remote_token_header] = f"{prefix} {self.cfg.remote_token}".strip()
+        return headers
+
+    def _fetch_remote(self) -> Optional[list]:
+        """请求配置管理平台 /api/proxies/available，返回可用代理地址列表。"""
+        from curl_cffi import requests as cffi
+
+        headers = self._auth_headers()
         try:
             resp = cffi.get(
                 self.cfg.remote_url,
@@ -462,13 +477,97 @@ class ProxyPool:
         log.warn(f"代理池已无空闲 IP，改为共用 {proxy}（含本账号，该 IP 上共 {shared} 个账号在用）")
         return proxy
 
-    def mark_bad(self, proxy: Optional[str]) -> None:
-        """目标站点连不上时拉黑该代理，之后不再分配。"""
+    def mark_bad(self, proxy: Optional[str], reason: str = "net") -> None:
+        """目标站点连不上时拉黑该代理，之后不再分配。
+
+        reason 分「网络层连不上」(net) 和「连上了但被拦」(block)。对签到来说两者后果
+        一样都得换 IP，但分开回传后排查时能看出是代理死了，还是这个出口 IP 被目标站
+        盯上了 —— 后者换个同机房的 IP 往往还是被拦。
+        """
         if not proxy:
             return
         with self._lock:
             self._bad.add(proxy)
             self._share_count.pop(proxy, None)
+            self._bump(proxy, "block_fail" if reason == "block" else "net_fail")
+
+    def mark_ok(self, proxy: Optional[str]) -> None:
+        """经这个代理签到成功，记一笔供平台优选。"""
+        if not proxy:
+            return
+        with self._lock:
+            self._bump(proxy, "ok")
+
+    def _bump(self, proxy: str, field: str) -> None:
+        """给某个代理的计数加一。调用方必须已持有 _lock。"""
+        entry = self._stats.setdefault(proxy, {"ok": 0, "net_fail": 0, "block_fail": 0})
+        entry[field] = entry.get(field, 0) + 1
+
+    def _feedback_endpoint(self) -> str:
+        """按预取 URL 同源推导 /api/proxies/feedback。
+
+        remote_url 可能带 ?limit= 之类的查询串，所以只取 scheme+netloc 重新拼路径。
+        推不出来就不回传 —— 这是尽力而为的事，绝不能反过来影响签到。
+        """
+        from urllib.parse import urlsplit, urlunsplit
+
+        if not self.cfg.remote_url:
+            return ""
+        parts = urlsplit(self.cfg.remote_url)
+        if not parts.scheme or not parts.netloc:
+            return ""
+        return urlunsplit((parts.scheme, parts.netloc, "/api/proxies/feedback", "", ""))
+
+    def report_feedback(self, source: str = "github-actions") -> tuple:
+        """把本轮各代理的成败计数回传给平台。失败只返回原因，不抛异常。
+
+        平台那边只累加不覆盖，所以重复上报同一轮会把计数记重 —— 调用方保证一轮只调
+        一次（Runner 放在 run() 的 finally 里）。
+        """
+        if not self.cfg.report_feedback:
+            return False, "report_feedback 已关闭"
+        items = self.feedback_snapshot()
+        if not items:
+            return False, "本轮没有可回传的代理记录"
+        endpoint = self._feedback_endpoint()
+        if not endpoint:
+            return False, "无法确定回传地址（proxy_pool.remote_url 未配置或非法）"
+
+        from curl_cffi import requests as cffi
+
+        try:
+            resp = cffi.post(
+                endpoint,
+                headers={**self._auth_headers(), "Content-Type": "application/json"},
+                json={"source": source, "items": items},
+                timeout=self.cfg.timeout,
+                impersonate="chrome",
+                verify=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 网络库异常类型不固定
+            return False, f"{type(exc).__name__}: {exc}"[:160]
+        status = int(getattr(resp, "status_code", 0) or 0)
+        if status >= 400:
+            return False, f"HTTP {status}: {str(getattr(resp, 'text', '') or '')[:160]}"
+        return True, f"已回传 {len(items)} 条"
+
+    def feedback_snapshot(self) -> list:
+        """导出本次运行各代理的成败计数，形状与平台 /api/proxies/feedback 的 items 对齐。
+
+        故意不随 refresh 一起清：中途换过列表的话，之前那批代理的表现照样有参考价值。
+        这里导出的是「这轮用过的代理表现如何」，跟当前池里还剩谁无关。
+        """
+        with self._lock:
+            return [
+                {
+                    "addr": addr,
+                    "ok": c.get("ok", 0),
+                    "net_fail": c.get("net_fail", 0),
+                    "block_fail": c.get("block_fail", 0),
+                }
+                for addr, c in self._stats.items()
+                if c.get("ok", 0) or c.get("net_fail", 0) or c.get("block_fail", 0)
+            ]
 
     def has_available(self) -> bool:
         """还有没有「未拉黑」的代理可分配（含可共用的）。"""

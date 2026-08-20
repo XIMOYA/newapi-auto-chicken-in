@@ -1,7 +1,7 @@
 <!--
 web/src/views/ProxyPoolSettingsView.vue
 页面：代理池配置（纯配置编辑）
-职责：编辑 proxy_pool 模块（enabled/test_url/timeout/max_workers/max_proxies/ip_swap_limit/sources/后台刷新）
+职责：编辑 proxy_pool 模块（enabled/test_url/timeout/max_workers/max_proxies/ip_swap_limit/sources/后台刷新/回传开关）
 - sources 为动态列表（增删）
 - 代理列表 / 刷新 / 测速 已迁移到「代理管理」页（/proxies）
 数据来源：GET/PUT /api/config
@@ -81,6 +81,12 @@ web/src/views/ProxyPoolSettingsView.vue
             custom-tip="已设置（接口不回传明文），留空保持不变，输入新值可修改"
           />
         </n-form-item>
+        <n-form-item label="回传代理实测表现">
+          <n-switch v-model:value="form.report_feedback" />
+          <span class="switch-tip">
+            {{ form.report_feedback ? '跑完回传成败计数，下次预取优先给实测能用的' : '不回传（优选只能靠服务器自测的延迟/测速）' }}
+          </span>
+        </n-form-item>
       </n-form>
     </config-card>
   </div>
@@ -129,7 +135,8 @@ const form = reactive<ProxyPoolConfig>({
   remote_url: '',
   remote_token: '',
   remote_token_header: 'Authorization',
-  remote_token_prefix: 'Bearer'
+  remote_token_prefix: 'Bearer',
+  report_feedback: true
 })
 
 function initForm(cfg: AppConfig) {
@@ -149,6 +156,8 @@ function initForm(cfg: AppConfig) {
   originalRemoteToken.value = p.remote_token ?? ''
   form.remote_token_header = p.remote_token_header ?? 'Authorization'
   form.remote_token_prefix = p.remote_token_prefix ?? 'Bearer'
+  // 老配置里没这个键，缺省按开：表单不带上它的话，保存一次就会被 Go 解析成 false
+  form.report_feedback = p.report_feedback ?? true
   savedSnapshot.value = JSON.stringify(form)
 }
 

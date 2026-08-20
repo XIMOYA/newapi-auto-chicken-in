@@ -560,6 +560,14 @@ dispatch:
 	m.progress.Alive = aliveCount
 	m.progress.Tested = len(results)
 	m.mu.Unlock()
+
+	// 顺手清掉过期反馈：免费代理换得快，不清这张表只会一直涨。
+	// 清理失败不影响刷新结果，记一行日志就够。
+	if n, perr := m.PruneProxyFeedback(feedbackRetentionDays); perr != nil {
+		log.Printf("[proxy] 清理过期代理反馈失败: %v", perr)
+	} else if n > 0 {
+		log.Printf("[proxy] 清理 %d 条超过 %d 天未更新的代理反馈", n, feedbackRetentionDays)
+	}
 	return aliveCount, nil
 }
 
@@ -636,8 +644,41 @@ func (m *ProxyManager) replaceAll(entries []ProxyEntry) error {
 	return nil
 }
 
-// ListProxies 查询代理列表。aliveOnly=true 只返回可用；orderByLatency=true 按延迟排序。
+/*
+ListProxies 查询代理列表。aliveOnly=true 只返回可用。
+
+只要可用的，就是优选路径（Actions 预取、页面「只看可用」），走 listAliveRanked：
+先把全部存活代理取出来按 Actions 实测表现精排，再截断。把 LIMIT 交给 SQL 会先按
+测速/延迟砍掉一批，砍掉的里面可能正是实测最稳的那些。
+展示全部（含已死）时保持原来的 SQL 顺序，前端自己还会再排一次。
+*/
 func (m *ProxyManager) ListProxies(aliveOnly bool, limit int) ([]ProxyEntry, error) {
+	if aliveOnly {
+		return m.listAliveRanked(limit)
+	}
+	return m.queryProxies(false, limit)
+}
+
+// listAliveRanked 取全部存活代理，按反馈分档排序后再截断。
+func (m *ProxyManager) listAliveRanked(limit int) ([]ProxyEntry, error) {
+	entries, err := m.queryProxies(true, 0)
+	if err != nil {
+		return nil, err
+	}
+	if fb, ferr := m.FeedbackByAddr(); ferr != nil {
+		// 反馈读不出来不该让整个列表失败：退回 SQL 给的测速/延迟顺序，行为等同改造前
+		log.Printf("[proxy] 读取代理反馈失败，本次按测速/延迟排序: %v", ferr)
+	} else if len(fb) > 0 {
+		sortProxiesByFeedback(entries, fb)
+	}
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries, nil
+}
+
+// queryProxies 按 SQL 顺序取记录：存活优先 -> 测速降序 -> 延迟升序。
+func (m *ProxyManager) queryProxies(aliveOnly bool, limit int) ([]ProxyEntry, error) {
 	// limit <= 0 表示不限制：SQLite 里 LIMIT -1 就是「全部」
 	if limit <= 0 {
 		limit = -1

@@ -86,7 +86,10 @@ def test_source_ip_backoff_only_blocks_that_account(tmp_path, monkeypatch):
                 self._next += 1
                 return f"p{self._next}:80"
 
-        def mark_bad(self, _proxy):
+        def mark_bad(self, _proxy, reason="net"):
+            return None
+
+        def mark_ok(self, _proxy):
             return None
 
     runner._pool = Pool()

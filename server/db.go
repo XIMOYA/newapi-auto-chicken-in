@@ -123,6 +123,9 @@ func createSchema(db *sql.DB) error {
 	if err := createProxiesTable(db); err != nil {
 		return err
 	}
+	if err := createProxyFeedbackTable(db); err != nil {
+		return err
+	}
 	if err := createRunStateTable(db); err != nil {
 		return err
 	}

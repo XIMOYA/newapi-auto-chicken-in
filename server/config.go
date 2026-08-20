@@ -129,6 +129,10 @@ type ProxyPool struct {
 	RemoteToken       string `json:"remote_token"`
 	RemoteTokenHeader string `json:"remote_token_header"`
 	RemoteTokenPrefix string `json:"remote_token_prefix"`
+	// ReportFeedback：Actions 跑完是否把每个代理的成败计数回传（POST /api/proxies/feedback）。
+	// 关掉之后优选只剩服务器自测的延迟/测速，而那测的是本机到代理的链路，与 runner
+	// 在 Azure 那边的可达性并不是一回事。
+	ReportFeedback bool `json:"report_feedback"`
 }
 
 // Notify 通知配置。
@@ -220,6 +224,7 @@ func DefaultConfig() Config {
 			RemoteToken:       "",
 			RemoteTokenHeader: "Authorization",
 			RemoteTokenPrefix: "Bearer",
+			ReportFeedback:    true,
 		},
 		Notify: Notify{
 			Email: EmailConfig{

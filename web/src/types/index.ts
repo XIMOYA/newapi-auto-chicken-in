@@ -95,6 +95,8 @@ export interface ProxyPoolConfig {
   remote_token: string
   remote_token_header: string
   remote_token_prefix: string
+  /** Actions 跑完是否回传各代理的成败计数，供服务端优选排序 */
+  report_feedback: boolean
 }
 
 export interface NotifyEmailConfig {

@@ -172,6 +172,7 @@ class FakePool:
         self._queue = list(proxies)
         self._used = set()
         self._bad = set()
+        self.ok: list = []
 
     def acquire(self):
         for proxy in self._queue:
@@ -180,9 +181,13 @@ class FakePool:
                 return proxy
         return None
 
-    def mark_bad(self, proxy):
+    def mark_bad(self, proxy, reason="net"):
         if proxy:
             self._bad.add(proxy)
+
+    def mark_ok(self, proxy):
+        if proxy:
+            self.ok.append(proxy)
 
 
 def _make_runner(monkeypatch, tmp_path, pool_proxies=None, pool_enabled=True):

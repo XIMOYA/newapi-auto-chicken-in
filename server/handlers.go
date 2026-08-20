@@ -110,6 +110,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/proxies/stats", s.requireJWTOrAPIKey(s.handleProxyStats))
 	mux.HandleFunc("POST /api/proxies/refresh", s.requireJWTOrAPIKey(s.handleRefreshProxies))
 	mux.HandleFunc("POST /api/proxies/speedtest", s.requireJWTOrAPIKey(s.handleSpeedTestProxies))
+	// 客户端专用写入通道：Actions 跑完把每个代理的成败计数回传，供优选排序用。
+	// 归到「仅 API Key」和 run-state 上报一致——网页端没有调它的场合。
+	mux.HandleFunc("POST /api/proxies/feedback", s.requireAPIKey(s.handleProxyFeedback))
 
 	mux.Handle("/", s.staticHandler())
 	return securityHeaders(mux)
@@ -194,7 +197,7 @@ func clientIP(r *http.Request) string {
 // ---------------------------------------------------------------------------
 // 辅助
 // ---------------------------------------------------------------------------
-// handleConfigRevision GET /api/config/revision（JWT）—— 只返回乐观锁版本号。
+// handleConfigRevision GET /api/config/revision（JWT 或 API Key）—— 只返回乐观锁版本号。
 //
 // 供前端轮询做「多人编辑无感同步」：配置本身可能有几十 KB，而判断「有没有变」
 // 只需要一个整数。只查一行一列，可以放心用短间隔轮询。
@@ -211,7 +214,7 @@ func (s *Server) handleConfigRevision(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"revision": revision})
 }
 
-// handleGetConfig GET /api/config（JWT）—— 返回打码后的配置、更新时间与乐观锁版本号。
+// handleGetConfig GET /api/config（JWT 或 API Key）—— 返回打码后的配置、更新时间与乐观锁版本号。
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	cfg, updatedAt, revision, err := LoadConfigWithRevision(s.db)
 	if err != nil {
@@ -225,7 +228,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handlePutConfig PUT /api/config（JWT）—— 还原 "***" 占位符、校验后落库。
+// handlePutConfig PUT /api/config（JWT 或 API Key）—— 还原 "***" 占位符、校验后落库。
 //
 // 并发保护：请求带 revision 时走乐观锁，版本不一致返回 409 并回传当前最新配置，
 // 避免多人/多标签页各自用陈旧快照整份覆盖（曾导致别人刚填的 Cookie 被静默清空）。
@@ -521,12 +524,12 @@ func (s *Server) handleVerifyPassword(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleNewAPICookieTest POST /api/cookie-tests/newapi（JWT）—— 启动站点 Cookie 检测任务。
+// handleNewAPICookieTest POST /api/cookie-tests/newapi（JWT 或 API Key）—— 启动站点 Cookie 检测任务。
 func (s *Server) handleNewAPICookieTest(w http.ResponseWriter, r *http.Request) {
 	s.handleCookieTest(w, r, LoginMethodNewAPICookie)
 }
 
-// handleTabiAICookieTest POST /api/cookie-tests/tabiai（JWT）—— 启动 TaBiAI 凭据检测任务。
+// handleTabiAICookieTest POST /api/cookie-tests/tabiai（JWT 或 API Key）—— 启动 TaBiAI 凭据检测任务。
 //
 // 这个检测是一次真实的 refresh，会消耗一代 new_api_refresh。签到进程正在跑时两边
 // 都在推进代次，谁手里的旧了下次就会被判重放、整条会话被撤销，所以先拦一道。
@@ -562,12 +565,12 @@ func (s *Server) handleCookieTest(w http.ResponseWriter, r *http.Request, mode s
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": mode, "started": true})
 }
 
-// handleCookieTestStatus GET /api/cookie-tests/status（JWT）—— 当前任务进度与实时结果。
+// handleCookieTestStatus GET /api/cookie-tests/status（JWT 或 API Key）—— 当前任务进度与实时结果。
 func (s *Server) handleCookieTestStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.cookieTests.Snapshot())
 }
 
-// handleStopCookieTest POST /api/cookie-tests/stop（JWT）—— 请求停止当前任务（幂等）。
+// handleStopCookieTest POST /api/cookie-tests/stop（JWT 或 API Key）—— 请求停止当前任务（幂等）。
 func (s *Server) handleStopCookieTest(w http.ResponseWriter, r *http.Request) {
 	s.cookieTests.Stop()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -662,7 +665,7 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 // 导出 / 修改密码
 // ---------------------------------------------------------------------------
 
-// handleExport GET /api/export（JWT + 一次性票据）—— 返回完整明文配置的 JSON 字符串。
+// handleExport GET /api/export（JWT 需一次性票据 / API Key 免票据）—— 返回完整明文配置的 JSON 字符串。
 //
 // 除 JWT 外还要求 X-Export-Ticket：票据由 POST /api/auth/verify-password 签发，
 // 单次使用、2 分钟过期、绑定用户。没有这层绑定的话，拿到 JWT 就能直接拉走全部
@@ -734,8 +737,9 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 // 代理池管理接口
 // ---------------------------------------------------------------------------
 
-// handleListProxies GET /api/proxies（JWT）—— 代理列表（页面展示）。
+// handleListProxies GET /api/proxies（JWT 或 API Key）—— 代理列表（页面展示）。
 // 支持 ?alive=1 只返回可用、?limit=N 数量（0 = 不限制）、?source=xxx 按来源过滤。
+// 带 alive=1 时走优选排序（Actions 实测表现优先），与 /available 给客户端的顺序一致。
 func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
 	aliveOnly := r.URL.Query().Get("alive") == "1"
 	// 页面展示默认给 500 条够用；显式传 ?limit=0 才拉全量
@@ -774,7 +778,7 @@ func (s *Server) handleAvailableProxies(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// handleProxyStats GET /api/proxies/stats（JWT）—— 统计与最近刷新状态。
+// handleProxyStats GET /api/proxies/stats（JWT 或 API Key）—— 统计与最近刷新状态。
 func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
 	st, err := s.proxies.Stats()
 	if err != nil {
@@ -792,7 +796,7 @@ func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRefreshProxies POST /api/proxies/refresh（JWT）—— 手动触发一次刷新。
+// handleRefreshProxies POST /api/proxies/refresh（JWT 或 API Key）—— 手动触发一次刷新。
 func (s *Server) handleRefreshProxies(w http.ResponseWriter, r *http.Request) {
 	if s.proxies.IsRunning() {
 		writeError(w, http.StatusConflict, "代理池刷新或测速已在进行中")
@@ -815,7 +819,7 @@ func (s *Server) handleRefreshProxies(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "代理池刷新已开始"})
 }
 
-// handleSpeedTestProxies POST /api/proxies/speedtest（JWT）—— 对代理实测下载速度。
+// handleSpeedTestProxies POST /api/proxies/speedtest（JWT 或 API Key）—— 对代理实测下载速度。
 // body: {"proxies": ["ip:port", ...]}；proxies 为空 = 全部可用代理。
 // 返回 {"ok": true, "tested": N, "url": "..."}。
 func (s *Server) handleSpeedTestProxies(w http.ResponseWriter, r *http.Request) {
@@ -849,6 +853,48 @@ func (s *Server) handleSpeedTestProxies(w http.ResponseWriter, r *http.Request) 
 	}()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "tested": len(req.Proxies), "url": "https://speed.cloudflare.com/__down?bytes=1048576",
+	})
+}
+
+/*
+handleProxyFeedback POST /api/proxies/feedback（API Key）—— 客户端回传代理实测表现。
+
+body: {"source": "github-actions", "items": [{"addr":"ip:port","ok":1,"net_fail":0,"block_fail":0}]}
+返回 {"ok": true, "accepted": N, "skipped": M}
+
+放在「仅 API Key」这组，和 run-state 上报一致：这是客户端专用的写入通道，网页端没有
+调它的场合。计数只增不减，服务端不接受任何形式的覆盖或清零 —— 想重置就等 14 天过期。
+*/
+func (s *Server) handleProxyFeedback(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Source string              `json:"source"`
+		Items  []ProxyFeedbackItem `json:"items"`
+	}
+	if err := readJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法的 JSON")
+		return
+	}
+	if len(req.Items) == 0 {
+		writeError(w, http.StatusBadRequest, "items 不能为空")
+		return
+	}
+	if len(req.Items) > maxFeedbackItems {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("items 条数超过上限 %d", maxFeedbackItems))
+		return
+	}
+	accepted, skipped, err := s.proxies.RecordProxyFeedback(req.Items)
+	if err != nil {
+		log.Printf("[proxy] 写入代理反馈失败: %v", err)
+		writeError(w, http.StatusInternalServerError, "写入代理反馈失败")
+		return
+	}
+	source := strings.TrimSpace(req.Source)
+	if source == "" {
+		source = "unknown"
+	}
+	log.Printf("[proxy] 收到代理反馈（来源 %s）: 收下 %d 条，丢弃 %d 条", source, accepted, skipped)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "accepted": accepted, "skipped": skipped,
 	})
 }
 

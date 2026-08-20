@@ -290,7 +290,7 @@ class TestNetworkErrorSwapsIP:
         )
         swaps = []
 
-        def slow_network_swap(_account):
+        def slow_network_swap(_account, reason="net"):
             swaps.append(1)
             if len(swaps) == 1:
                 clock.now += 2
@@ -320,7 +320,7 @@ class TestNetworkErrorSwapsIP:
             lambda acct, record: (calls.append(1), _row(acct.name, results.pop(0)))[1],
         )
 
-        def slow_waf_swap(_account):
+        def slow_waf_swap(_account, reason="net"):
             clock.now += 2
             return True
 
@@ -448,13 +448,17 @@ class _EndlessPool:
     def __init__(self):
         self.n = 0
         self.bad: list = []
+        self.ok: list = []
 
     def acquire(self):
         self.n += 1
         return f"p{self.n}:80"
 
-    def mark_bad(self, proxy):
+    def mark_bad(self, proxy, reason="net"):
         self.bad.append(proxy)
+
+    def mark_ok(self, proxy):
+        self.ok.append(proxy)
 
 
 class TestBrowserConcurrency:
@@ -690,7 +694,10 @@ class TestShieldRetriesWithoutNewIP:
             def acquire(self):
                 return None
 
-            def mark_bad(self, proxy):
+            def mark_bad(self, proxy, reason="net"):
+                pass
+
+            def mark_ok(self, proxy):
                 pass
 
         runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
@@ -841,7 +848,7 @@ class TestUnlimitedRetriesWhenDeadlineOff:
         """换不到新 IP 仍然跳过：不限时不等于在同一个坏出口上空转。"""
         runner = _make_runner(tmp_path, monkeypatch, use_browser=True)
         calls = self._wire(runner, monkeypatch, [api.NETWORK_ERROR])
-        monkeypatch.setattr(runner, "_swap_pooled_proxy", lambda _a: False)
+        monkeypatch.setattr(runner, "_swap_pooled_proxy", lambda _a, reason="net": False)
         row = runner._run_account(runner.cfg.accounts[0])
         assert row.status == "skipped"
         assert len(calls) == 1

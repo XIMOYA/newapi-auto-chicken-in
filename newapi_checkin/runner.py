@@ -186,14 +186,14 @@ class Runner:
         else:
             log.err("代理池里没有任何可用代理，且已要求必须走代理")
 
-    def _swap_proxy(self, account: Account) -> Optional[str]:
+    def _swap_proxy(self, account: Account, reason: str = "net") -> Optional[str]:
         """换一个新代理。拿不到替代品时保留原代理，绝不清空成直连。"""
         if self._pool is None:
             return None
         with self._state_lock:
             old = self._pooled_proxies.get(account.name)
         if old:
-            self._pool.mark_bad(old)
+            self._pool.mark_bad(old, reason)
         # 先拿到替代品再切换：拿不到就继续用原来的，宁可重试失败也不直连
         proxy = self._pool.acquire()
         if proxy:
@@ -373,6 +373,10 @@ class Runner:
         finally:
             # 先解锁再收资源：网页端多锁一会儿没损失，但漏解锁要等 5 分钟过期
             self._stop_run_report()
+            # 代理表现回传：单独一步，不搭 _stop_run_report 的车 —— 那个函数只在运行锁
+            # 激活时才真发请求（锁只有「config_sync 启用且本轮含 tabiai 账号」时才拿），
+            # 搭车会让纯站点 Cookie 的轮次整份丢掉反馈
+            self._report_proxy_feedback()
             # 释放懒加载创建的 AI 客户端（含各线程的 curl session），
             # 避免 daemon 长跑或多轮执行时泄漏资源。
             self._close_ai()
@@ -624,15 +628,53 @@ class Runner:
         with self._state_lock:
             self._browser_attempts[account.name] = 0
 
-        return self._run_account_with_retries(account, record)
+        row = self._run_account_with_retries(account, record)
+        self._record_proxy_success(account, row)
+        return row
 
-    def _swap_pooled_proxy(self, account: Account) -> bool:
-        """只换「由代理池分配」的代理；手动配置的代理原样保留。"""
+    def _record_proxy_success(self, account: Account, row: log.SummaryRow) -> None:
+        """账号跑完且成了，给它当时用的池内代理记一笔。
+
+        只补成功这一个方向：失败已经在 _swap_proxy 换 IP 时当场记过了。中途换过 IP 的
+        话，成功记在最后那个代理名下，前面失败的几个各自记在自己名下，正好是我们想让
+        平台看到的因果。手动配置的代理不记 —— 它不参与池子的优选排序。
+        """
+        if self._pool is None or row.status not in log.OK_STATUSES:
+            return
+        with self._state_lock:
+            proxy = self._pooled_proxies.get(account.name)
+        if proxy:
+            self._pool.mark_ok(proxy)
+
+    def _report_proxy_feedback(self) -> None:
+        """把本轮各代理的成败计数回传给平台，供下次预取时优选。
+
+        整段都是尽力而为：没配预取地址、关了开关、网络不通，一律只留一行 debug。
+        回传失败绝不能改变退出码 —— 签到已经跑完了，统计没送出去不该算这轮失败。
+        """
+        if self._pool is None:
+            return
+        try:
+            ok, detail = self._pool.report_feedback()
+        except Exception as exc:  # noqa: BLE001 - 回传异常不能拖垮收尾
+            log.debug(f"代理反馈回传异常: {type(exc).__name__}: {exc}")
+            return
+        if ok:
+            log.debug(f"代理反馈已回传：{detail}")
+        else:
+            log.debug(f"代理反馈未回传：{detail}")
+
+    def _swap_pooled_proxy(self, account: Account, reason: str = "net") -> bool:
+        """只换「由代理池分配」的代理；手动配置的代理原样保留。
+
+        reason 一路传到 mark_bad，用来区分「代理本身不通」和「出口 IP 被目标站拦」，
+        跑完回传给平台后优选才知道该怎么给这个 IP 降权。
+        """
         with self._state_lock:
             from_pool = account.name in self._pooled_proxies
         if not from_pool:
             return False
-        return self._swap_proxy(account) is not None
+        return self._swap_proxy(account, reason) is not None
 
     def _skip_after_failure(self, account: Account, row: log.SummaryRow,
                             reason: str) -> log.SummaryRow:
@@ -712,7 +754,7 @@ class Runner:
             if row.status in _SOURCE_IP_RETRYABLE:
                 if exhausted:
                     return self._give_up_on_deadline(row, shield_rounds)
-                if source_swaps < SOURCE_IP_SWAP_LIMIT and self._swap_pooled_proxy(account):
+                if source_swaps < SOURCE_IP_SWAP_LIMIT and self._swap_pooled_proxy(account, "block"):
                     source_swaps += 1
                     swapped_total += 1
                     label = "WAF 硬封禁" if row.status == api.WAF_BLOCKED else "源站返回失败"
@@ -737,7 +779,8 @@ class Runner:
                 shield_rounds += 1
                 # 换不到新 IP 也继续：Turnstile 未必是 IP 问题，重开浏览器本身
                 # 就有机会拿到 token，没理由因为池子空了就白扔一个账号
-                swapped = self._swap_pooled_proxy(account)
+                # 记 block：盾把请求拦下来说明代理是通的，问题在这个出口 IP 的声誉
+                swapped = self._swap_pooled_proxy(account, "block")
                 if swapped:
                     swapped_total += 1
                 backoff = min(SHIELD_RETRY_BACKOFF_MAX, 5 * shield_rounds)
