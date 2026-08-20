@@ -2,7 +2,7 @@
 web/src/layouts/AdminLayout.vue
 布局：管理后台主框架
 职责：
-- 深蓝色侧边栏导航（配置总览/AI/浏览器/HTTP/全局默认/代理池/邮件通知/API Key/导出）
+- 深蓝色侧边栏导航（配置总览/AI/浏览器/HTTP/全局默认/代理池/邮件通知/API Key/导出/API 文档）
 - 顶部栏：当前页面标题 + 用户名下拉（修改密码/退出登录）
 - 首次进入时拉取 GET /api/config 初始化 config store
 - 常驻轮询 GET /api/config/revision：版本号变了就静默换上最新配置，让别人的改动
@@ -91,6 +91,7 @@ import {
   MailOutline,
   KeyOutline,
   DownloadOutline,
+  DocumentTextOutline,
   CheckmarkCircleOutline,
   RocketOutline,
   CubeOutline,
@@ -128,7 +129,8 @@ const menuOptions: MenuOption[] = [
   { label: '代理管理', key: '/proxies', icon: renderIcon(LayersOutline) },
   { label: '邮件通知', key: '/settings/notify', icon: renderIcon(MailOutline) },
   { label: 'API Key 管理', key: '/keys', icon: renderIcon(KeyOutline) },
-  { label: '导出配置', key: '/export', icon: renderIcon(DownloadOutline) }
+  { label: '导出配置', key: '/export', icon: renderIcon(DownloadOutline) },
+  { label: 'API 文档', key: '/api-doc', icon: renderIcon(DocumentTextOutline) }
 ]
 
 const activeKey = computed(() => {

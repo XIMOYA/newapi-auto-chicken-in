@@ -86,6 +86,12 @@ const routes: RouteRecordRaw[] = [
         name: 'export',
         component: () => import('@/views/ExportView.vue'),
         meta: { title: '配置导出' }
+      },
+      {
+        path: 'api-doc',
+        name: 'api-doc',
+        component: () => import('@/views/ApiDocView.vue'),
+        meta: { title: 'API 文档' }
       }
     ]
   },
