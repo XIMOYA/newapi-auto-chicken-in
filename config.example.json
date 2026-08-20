@@ -30,7 +30,10 @@
     "save_limit": 0,
     "auto_test": true,
     "remote_url": "",
-    "report_feedback": true
+    "report_feedback": true,
+    "preflight_check": true,
+    "preflight_limit": 60,
+    "preflight_seconds": 15
   },
   "notify": {
     "email": {

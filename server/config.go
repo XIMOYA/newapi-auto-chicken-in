@@ -133,6 +133,11 @@ type ProxyPool struct {
 	// 关掉之后优选只剩服务器自测的延迟/测速，而那测的是本机到代理的链路，与 runner
 	// 在 Azure 那边的可达性并不是一回事。
 	ReportFeedback bool `json:"report_feedback"`
+	// 开跑前自筛：客户端拉到预取列表后先在本机快测一遍，当场剔掉连不上的再用。
+	// 打的仍是 TestURL，不碰目标站点；PreflightSeconds 是整体时间盒，到点就收手。
+	PreflightCheck   bool `json:"preflight_check"`
+	PreflightLimit   int  `json:"preflight_limit"`
+	PreflightSeconds int  `json:"preflight_seconds"`
 }
 
 // Notify 通知配置。
@@ -225,6 +230,9 @@ func DefaultConfig() Config {
 			RemoteTokenHeader: "Authorization",
 			RemoteTokenPrefix: "Bearer",
 			ReportFeedback:    true,
+			PreflightCheck:    true,
+			PreflightLimit:    60,
+			PreflightSeconds:  15,
 		},
 		Notify: Notify{
 			Email: EmailConfig{

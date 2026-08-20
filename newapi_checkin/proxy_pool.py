@@ -81,6 +81,11 @@ class ProxyPoolConfig:
     # 服务器据此优选。关掉的话排序只剩服务器自测的延迟/测速，而那是服务器到代理的
     # 链路，跟 Actions runner 那边能不能用不是一回事
     report_feedback: bool = True
+    # 开跑前自筛：平台给的顺序是「过去在别的 runner 上」的表现，而免费代理几小时就大批
+    # 失效。签到前在本机快测一遍，当场把连不上的剔掉，省得每个账号各自踩一遍再换 IP
+    preflight_check: bool = True
+    preflight_limit: int = 60      # 只测前多少个（列表已按优选排过，后面的本来也轮不到）
+    preflight_seconds: int = 15    # 整体时间盒；超时就用已有结论，不为了测全拖慢签到
 
     @classmethod
     def from_raw(cls, raw: Optional[dict]) -> "ProxyPoolConfig":
@@ -106,6 +111,9 @@ class ProxyPoolConfig:
             remote_token_header=str(raw.get("remote_token_header") or "Authorization").strip() or "Authorization",
             remote_token_prefix=str(raw.get("remote_token_prefix") or "Bearer").strip(),
             report_feedback=_as_bool(raw.get("report_feedback"), True),
+            preflight_check=_as_bool(raw.get("preflight_check"), True),
+            preflight_limit=max(0, min(500, _as_int(raw.get("preflight_limit"), 60))),
+            preflight_seconds=max(1, min(120, _as_int(raw.get("preflight_seconds"), 15))),
         )
 
     def to_dict(self) -> dict:
@@ -122,6 +130,9 @@ class ProxyPoolConfig:
             "remote_token_header": self.remote_token_header,
             "remote_token_prefix": self.remote_token_prefix,
             "report_feedback": self.report_feedback,
+            "preflight_check": self.preflight_check,
+            "preflight_limit": self.preflight_limit,
+            "preflight_seconds": self.preflight_seconds,
         }
 
 
@@ -195,6 +206,11 @@ class ProxyPool:
                     # 把新代理误判成已被多账号占用，破坏均衡。
                     self._share_count.clear()
                 log.ok(f"代理池就绪（服务器预取）: {len(remote)} 个可用代理")
+                dropped = self.preflight()
+                if dropped:
+                    log.warn(f"开跑前自筛剔除 {dropped} 个当场连不上的代理，"
+                             f"剩 {self.available_count()} 个可用")
+                    return self.available_count()
                 return len(remote)
             log.warn(f"服务器代理池预取失败/为空，降级本地抓取: {self.last_error or 'remote_url 无返回'}")
 
@@ -425,6 +441,59 @@ class ProxyPool:
         """当前还能独占分配的代理数量（未使用且未拉黑）。"""
         with self._lock:
             return sum(1 for p in self._available if p not in self._used and p not in self._bad)
+
+    def preflight(self) -> int:
+        """开跑前自筛：在本机快测预取来的代理，当场剔掉连不上的，返回剔除数量。
+
+        为什么服务器测过还要再测：服务器测的是它自己到代理的链路，而真正用代理的是
+        Actions runner；加上免费代理几小时就大批失效，平台给的历史表现只能说明「过去
+        能用」。这里花十几秒把当场就死的挑出来，比让每个账号各自撞一次再换 IP 便宜。
+
+        只测前 preflight_limit 个 —— 列表已按优选排过，后面的本来也轮不到。剔除走
+        mark_bad("net")：既让 acquire 自然跳过，又把结论记进本轮统计跑完回传，平台
+        下次排序就知道这些出口在 runner 这边不通。
+
+        时间盒到点就收手，没拿到结论的一律保留：把「没测到」当成「不通」会误删好代理。
+        探测打的仍然是配置里的 test_url，不碰目标站点。
+        """
+        if not self.cfg.preflight_check or self.cfg.preflight_limit <= 0:
+            return 0
+        with self._lock:
+            candidates = [p for p in self._available if p not in self._bad][: self.cfg.preflight_limit]
+        if not candidates:
+            return 0
+
+        deadline = time.monotonic() + self.cfg.preflight_seconds
+        workers = max(1, min(self.cfg.max_workers, len(candidates)))
+        verdicts: dict[str, bool] = {}
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="preflight")
+        futures = {pool.submit(self._test_one, proxy): proxy for proxy in candidates}
+        try:
+            for future in as_completed(futures, timeout=max(0.1, deadline - time.monotonic())):
+                proxy = futures[future]
+                try:
+                    verdicts[proxy] = future.result() is not None
+                except Exception:  # noqa: BLE001 - 探测异常一律按不通
+                    verdicts[proxy] = False
+        except FuturesTimeout:
+            log.debug(f"开跑前自筛到达 {self.cfg.preflight_seconds}s 时间盒，"
+                      f"已有结论 {len(verdicts)}/{len(candidates)} 条")
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        dead = [proxy for proxy, ok in verdicts.items() if not ok]
+        if not dead:
+            return 0
+        if len(dead) == len(verdicts):
+            # 安全阀：一个都没通过意味着更可能是本机链路或 test_url 本身有问题，而不是
+            # 平台给的代理全死了。这时候剔光会让所有账号无代理可用被直接跳过，宁可原样
+            # 交给签到流程去试，让 mark_bad 逐个淘汰
+            log.warn(f"开跑前自筛：{len(dead)} 个候选无一测通，更像本机到 {self.cfg.test_url} "
+                     f"的链路或该地址本身有问题，放弃自筛结果，照旧交给签到流程逐个淘汰")
+            return 0
+        for proxy in dead:
+            self.mark_bad(proxy, "net")
+        return len(dead)
 
     def _test_one(self, proxy: str) -> Optional[float]:
         """测通单个代理。成功返回探测耗时（秒，用于按延迟排序），失败返回 None。"""

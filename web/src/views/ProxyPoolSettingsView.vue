@@ -87,6 +87,20 @@ web/src/views/ProxyPoolSettingsView.vue
             {{ form.report_feedback ? '跑完回传成败计数，下次预取优先给实测能用的' : '不回传（优选只能靠服务器自测的延迟/测速）' }}
           </span>
         </n-form-item>
+        <n-form-item label="开跑前自筛">
+          <n-switch v-model:value="form.preflight_check" />
+          <span class="switch-tip">
+            {{ form.preflight_check ? '签到前在 Actions 本机快测一遍，当场剔掉连不上的' : '直接用平台给的列表' }}
+          </span>
+        </n-form-item>
+        <n-form-item v-if="form.preflight_check" label="自筛测试条数">
+          <n-input-number v-model:value="form.preflight_limit" :min="0" :max="500" class="num-input" />
+          <span class="switch-tip">只测列表最前面的这些条；0 = 不自筛</span>
+        </n-form-item>
+        <n-form-item v-if="form.preflight_check" label="自筛时间上限（秒）">
+          <n-input-number v-model:value="form.preflight_seconds" :min="1" :max="120" class="num-input" />
+          <span class="switch-tip">到点就用已有结论，没测到的照旧保留，不会因为超时误删</span>
+        </n-form-item>
       </n-form>
     </config-card>
   </div>
@@ -136,7 +150,10 @@ const form = reactive<ProxyPoolConfig>({
   remote_token: '',
   remote_token_header: 'Authorization',
   remote_token_prefix: 'Bearer',
-  report_feedback: true
+  report_feedback: true,
+  preflight_check: true,
+  preflight_limit: 60,
+  preflight_seconds: 15
 })
 
 function initForm(cfg: AppConfig) {
@@ -158,6 +175,9 @@ function initForm(cfg: AppConfig) {
   form.remote_token_prefix = p.remote_token_prefix ?? 'Bearer'
   // 老配置里没这个键，缺省按开：表单不带上它的话，保存一次就会被 Go 解析成 false
   form.report_feedback = p.report_feedback ?? true
+  form.preflight_check = p.preflight_check ?? true
+  form.preflight_limit = p.preflight_limit ?? 60
+  form.preflight_seconds = p.preflight_seconds ?? 15
   savedSnapshot.value = JSON.stringify(form)
 }
 

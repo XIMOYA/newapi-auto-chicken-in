@@ -11,6 +11,8 @@ from newapi_checkin.proxy_pool import ProxyPool, ProxyPoolConfig
 
 
 def _pool(**kwargs) -> ProxyPool:
+    # 自筛默认关掉：这些用例只关心计数与上报，开着会让 refresh 真去探测网络
+    kwargs.setdefault("preflight_check", False)
     cfg = ProxyPoolConfig(
         enabled=True,
         remote_url=kwargs.pop("remote_url", "https://cfg.example.com/api/proxies/available"),
@@ -253,3 +255,105 @@ class TestRunnerWiring:
 
         monkeypatch.setattr(runner._pool, "report_feedback", boom, raising=False)
         assert runner.run() == 0
+
+
+class TestPreflight:
+    """开跑前自筛：只剔当场测出来不通的，没测到的一律留着。"""
+
+    @staticmethod
+    def _ready_pool(monkeypatch, verdicts, **cfg):
+        """造一个已经预取好列表的池，_test_one 按 verdicts 给结论。
+
+        verdicts[proxy] 为 None 表示不通，数字表示延迟（秒）；缺 key 的代理当不通处理。
+        """
+        cfg.setdefault("preflight_check", True)
+        pool = _pool(**cfg)
+        pool._fetch_remote = lambda: list(verdicts.keys())
+        monkeypatch.setattr(pool, "_test_one", lambda proxy: verdicts.get(proxy))
+        return pool
+
+    def test_drops_only_dead_ones(self, monkeypatch):
+        pool = self._ready_pool(monkeypatch, {"live:80": 0.2, "dead:80": None, "live2:80": 0.3})
+        assert pool.refresh() == 2
+        assert pool.available_count() == 2
+        assert pool.acquire() == "live:80"
+        assert pool.acquire() == "live2:80"
+        assert pool.acquire() == "live:80"  # 只剩共用，dead 绝不会被分配
+
+    def test_dead_ones_go_into_feedback(self, monkeypatch):
+        """自筛结论要计入本轮统计，跑完回传给平台——这是它除了当场救火之外的价值。"""
+        pool = self._ready_pool(monkeypatch, {"dead:80": None, "live:80": 0.1})
+        pool.refresh()
+        assert pool.feedback_snapshot() == [
+            {"addr": "dead:80", "ok": 0, "net_fail": 1, "block_fail": 0}
+        ]
+
+    def test_switch_off_skips_testing(self, monkeypatch):
+        probed = []
+        pool = _pool(preflight_check=False)
+        pool._fetch_remote = lambda: ["dead:80", "live:80"]
+        monkeypatch.setattr(pool, "_test_one", lambda proxy: probed.append(proxy))
+        assert pool.refresh() == 2
+        assert probed == []
+        assert pool.available_count() == 2
+
+    def test_zero_limit_skips_testing(self, monkeypatch):
+        probed = []
+        pool = _pool(preflight_check=True, preflight_limit=0)
+        pool._fetch_remote = lambda: ["dead:80"]
+        monkeypatch.setattr(pool, "_test_one", lambda proxy: probed.append(proxy))
+        pool.refresh()
+        assert probed == []
+
+    def test_limit_caps_how_many_get_probed(self, monkeypatch):
+        probed = []
+
+        def probe(proxy):
+            probed.append(proxy)
+            # 让首个测通：否则「全败」会触发安全阀，剔除不生效，就测不到 limit 的效果了
+            return 0.1 if proxy == "a:80" else None
+
+        pool = _pool(preflight_check=True, preflight_limit=2)
+        pool._fetch_remote = lambda: ["a:80", "b:80", "c:80", "d:80"]
+        monkeypatch.setattr(pool, "_test_one", probe)
+        pool.refresh()
+        assert probed == ["a:80", "b:80"]
+        # 只测了前两个：b 被剔除，没测到的 c、d 照旧可用
+        assert pool.available_count() == 3
+
+    def test_probe_exception_counts_as_dead(self, monkeypatch):
+        def probe(proxy):
+            if proxy == "boom:80":
+                raise RuntimeError("socket 炸了")
+            return 0.2
+
+        pool = _pool(preflight_check=True)
+        pool._fetch_remote = lambda: ["boom:80", "fine:80"]
+        monkeypatch.setattr(pool, "_test_one", probe)
+        pool.refresh()
+        assert pool.available_count() == 1
+        assert pool.acquire() == "fine:80"
+
+    def test_preflight_is_noop_without_candidates(self, monkeypatch):
+        pool = _pool(preflight_check=True)
+        assert pool.preflight() == 0
+
+    def test_all_dead_is_treated_as_local_problem(self, monkeypatch):
+        """一个都没通过时放弃自筛结果。
+
+        更可能是本机到 test_url 的链路挂了或那个地址本身不可达，而不是平台给的代理
+        集体暴死。真剔光的话所有账号都会因为「无可用代理」被跳过 —— 那是一整轮白跑，
+        比带着几个可疑代理去试要糟得多。
+        """
+        pool = self._ready_pool(monkeypatch, {"a:80": None, "b:80": None, "c:80": None})
+        assert pool.refresh() == 3
+        assert pool.available_count() == 3
+        # 既然没采纳结论，就不该往反馈里记这几笔，免得污染平台的排序
+        assert pool.feedback_snapshot() == []
+
+    def test_partial_failure_still_drops(self, monkeypatch):
+        """只要有一个测通，说明本机链路是好的，剔除照常生效。"""
+        pool = self._ready_pool(monkeypatch, {"a:80": None, "b:80": None, "ok:80": 0.2})
+        assert pool.refresh() == 1
+        assert pool.available_count() == 1
+        assert pool.acquire() == "ok:80"

@@ -530,6 +530,7 @@ class TestRemotePrefetchIsUncapped:
         pool = ProxyPool(ProxyPoolConfig(
             remote_url="https://cfg.example.com/api/proxies/available",
             max_proxies=100,          # 已废弃字段，不该再截断任何东西
+            preflight_check=False,    # 这组只看「收下多少条」，自筛会真去探测网络
         ))
         pool._fetch_remote = lambda: list(addrs)   # 绕开真实 HTTP
         return pool

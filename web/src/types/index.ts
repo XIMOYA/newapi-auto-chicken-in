@@ -97,6 +97,12 @@ export interface ProxyPoolConfig {
   remote_token_prefix: string
   /** Actions 跑完是否回传各代理的成败计数，供服务端优选排序 */
   report_feedback: boolean
+  /** 开跑前在客户端本机快测一遍预取列表，剔掉当场连不上的 */
+  preflight_check: boolean
+  /** 自筛只测前多少个（列表已按优选排序） */
+  preflight_limit: number
+  /** 自筛整体时间盒（秒），到点就用已有结论 */
+  preflight_seconds: number
 }
 
 export interface NotifyEmailConfig {
