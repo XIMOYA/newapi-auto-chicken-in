@@ -527,6 +527,19 @@ dispatch:
 	// 4) 排序：alive 在前，按延迟升序；dead 在后
 	sortProxies(results)
 
+	/*
+		沿用上一轮的测速值：refresh 只测连通性和延迟，构造出来的 ProxyEntry 里
+		SpeedBps 是零值，而 replaceAll 是清表重插 —— 不把旧值带过来的话，页面上
+		手动测速的成果每刷新一次就被抹平一次，开了后台刷新等于白测。
+		只给这轮仍然测通的代理沿用：死掉的代理留着旧速度没有意义。
+	*/
+	if speeds, serr := m.speedByAddr(); serr != nil {
+		log.Printf("[proxy] 读取旧测速值失败，本轮 speed_bps 将重置为 0: %v", serr)
+	} else if len(speeds) > 0 {
+		kept := applyKnownSpeeds(results, speeds)
+		log.Printf("[proxy] 沿用上一轮测速值 %d 条（旧库有 %d 条测过速）", kept, len(speeds))
+	}
+
 	// 5) 截断保存：只在显式配了 saveLimit 时截断；不限制时全量落库
 	if !unlimited && len(results) > saveLimit {
 		results = results[:saveLimit]
@@ -553,6 +566,44 @@ dispatch:
 // REFRESH_ABSOLUTE_MAX 刷新的绝对上限：只防极端卡死，正常情况下由
 // 「达到 saveLimit 提前停」或「测完全部候选」结束，不会走到这里。
 const REFRESH_ABSOLUTE_MAX = 20 * time.Minute
+
+// speedByAddr 取当前库里已测过速的代理，addr -> speed_bps。
+// 供刷新时把上一轮的测速结果带到新记录上（refresh 自己不测速）。
+func (m *ProxyManager) speedByAddr() (map[string]int64, error) {
+	rows, err := m.db.Query(`SELECT addr, speed_bps FROM proxies WHERE speed_bps > 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int64)
+	for rows.Next() {
+		var addr string
+		var speed int64
+		if err := rows.Scan(&addr, &speed); err != nil {
+			return nil, err
+		}
+		out[addr] = speed
+	}
+	return out, rows.Err()
+}
+
+/*
+applyKnownSpeeds 把已知测速值填回这轮刷新结果，返回填了多少条。
+只认存活的代理：这轮都没测通，留着上一轮的速度只会让它在排序里插到前面去。
+*/
+func applyKnownSpeeds(results []ProxyEntry, speeds map[string]int64) int {
+	kept := 0
+	for i := range results {
+		if !results[i].Alive {
+			continue
+		}
+		if s, ok := speeds[results[i].Addr]; ok && s > 0 {
+			results[i].SpeedBps = s
+			kept++
+		}
+	}
+	return kept
+}
 
 // replaceAll 清空 proxies 表并写入新结果（单事务）。
 func (m *ProxyManager) replaceAll(entries []ProxyEntry) error {

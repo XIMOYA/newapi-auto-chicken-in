@@ -134,3 +134,103 @@ func TestProxyManager_AvailableOrderedByQuality(t *testing.T) {
 		t.Fatalf("available 排序错误（应速度优先）: %v", addrs)
 	}
 }
+
+// 测速值只对这轮仍然存活的代理沿用，缺失或为 0 的一律不动
+func TestApplyKnownSpeeds(t *testing.T) {
+	results := []ProxyEntry{
+		{Addr: "alive:80", Alive: true},
+		{Addr: "dead:80", Alive: false},
+		{Addr: "unmeasured:80", Alive: true},
+		{Addr: "zero:80", Alive: true},
+	}
+	speeds := map[string]int64{
+		"alive:80": 3_000_000,
+		"dead:80":  9_000_000,
+		"zero:80":  0,
+	}
+	if kept := applyKnownSpeeds(results, speeds); kept != 1 {
+		t.Fatalf("kept = %d, want 1", kept)
+	}
+	if results[0].SpeedBps != 3_000_000 {
+		t.Errorf("存活代理应沿用旧测速值, got %d", results[0].SpeedBps)
+	}
+	if results[1].SpeedBps != 0 {
+		t.Errorf("已死代理不该沿用旧测速值, got %d", results[1].SpeedBps)
+	}
+	if results[2].SpeedBps != 0 || results[3].SpeedBps != 0 {
+		t.Errorf("没有旧值或旧值为 0 时不该改动: %d %d", results[2].SpeedBps, results[3].SpeedBps)
+	}
+}
+
+func TestSpeedByAddrOnlyReturnsMeasured(t *testing.T) {
+	srv := newTestServer(t)
+	entries := []ProxyEntry{
+		{Source: "s1", Addr: "measured:80", Alive: true, SpeedBps: 1_500_000, LastChecked: "now", LastAliveAt: "now"},
+		{Source: "s1", Addr: "untested:80", Alive: true, SpeedBps: 0, LastChecked: "now", LastAliveAt: "now"},
+	}
+	if err := srv.proxies.replaceAll(entries); err != nil {
+		t.Fatalf("replaceAll: %v", err)
+	}
+	speeds, err := srv.proxies.speedByAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(speeds) != 1 || speeds["measured:80"] != 1_500_000 {
+		t.Fatalf("speedByAddr = %v, want 仅 measured:80", speeds)
+	}
+}
+
+/*
+走一遍刷新真正的落库路径：refresh 构造的记录不带测速值，replaceAll 又是清表重插，
+所以必须靠 speedByAddr + applyKnownSpeeds 把上一轮的成果接过来。这条挂了就意味着
+开着后台刷新时，页面上手动测速白测。
+*/
+func TestSpeedSurvivesRefreshReplace(t *testing.T) {
+	srv := newTestServer(t)
+	measured := []ProxyEntry{
+		{Source: "s1", Addr: "keep:80", LatencyMs: 40, Alive: true, SpeedBps: 2_500_000, LastChecked: "t1", LastAliveAt: "t1"},
+		{Source: "s1", Addr: "gone:80", LatencyMs: 60, Alive: true, SpeedBps: 900_000, LastChecked: "t1", LastAliveAt: "t1"},
+	}
+	if err := srv.proxies.replaceAll(measured); err != nil {
+		t.Fatalf("首轮 replaceAll: %v", err)
+	}
+
+	// 模拟下一轮刷新：keep 仍然测通、gone 这轮没抓到、newcomer 是新来的，都不带测速值
+	refreshed := []ProxyEntry{
+		{Source: "s1", Addr: "keep:80", LatencyMs: 45, Alive: true, LastChecked: "t2", LastAliveAt: "t2"},
+		{Source: "s2", Addr: "newcomer:80", LatencyMs: 20, Alive: true, LastChecked: "t2", LastAliveAt: "t2"},
+	}
+	speeds, err := srv.proxies.speedByAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyKnownSpeeds(refreshed, speeds)
+	if err := srv.proxies.replaceAll(refreshed); err != nil {
+		t.Fatalf("二轮 replaceAll: %v", err)
+	}
+
+	got, err := srv.proxies.ListProxies(true, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byAddr := map[string]ProxyEntry{}
+	for _, e := range got {
+		byAddr[e.Addr] = e
+	}
+	if byAddr["keep:80"].SpeedBps != 2_500_000 {
+		t.Errorf("keep:80 测速值应跨刷新保留, got %d", byAddr["keep:80"].SpeedBps)
+	}
+	if byAddr["keep:80"].LatencyMs != 45 {
+		t.Errorf("延迟应更新为本轮实测值, got %d", byAddr["keep:80"].LatencyMs)
+	}
+	if byAddr["newcomer:80"].SpeedBps != 0 {
+		t.Errorf("新代理没测过速就该是 0, got %d", byAddr["newcomer:80"].SpeedBps)
+	}
+	if _, still := byAddr["gone:80"]; still {
+		t.Error("这轮没抓到的代理不该留在库里")
+	}
+	// 测速值带过来之后，排序结果也得跟着变：keep 有速度，newcomer 只有低延迟
+	if addrs := srv.proxies.AvailableAddrs(10); len(addrs) != 2 || addrs[0] != "keep:80" {
+		t.Errorf("有测速值的应排在前面, got %v", addrs)
+	}
+}
