@@ -119,7 +119,7 @@ func applyAccountOps(cfg *Config, ops []AccountOp) ([]string, error) {
 	return skipped, nil
 }
 
-// handleAccountOps POST /api/accounts/ops（JWT）—— 按账号名重放增量操作。
+// handleAccountOps POST /api/accounts/ops（JWT 或 API Key）—— 按账号名重放增量操作。
 //
 // 与 PUT /api/config 的区别：这里不接受整份快照、不做 revision 比对，
 // 而是在服务端读到的**最新**配置上重放操作。多人同时加不同账号因此都能成功。

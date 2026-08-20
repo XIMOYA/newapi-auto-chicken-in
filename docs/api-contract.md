@@ -8,7 +8,9 @@
 - 基础路径：`/api`
 - 鉴权方式：
   - 管理端：`Authorization: Bearer <JWT>`（登录后获得）
-  - 拉取端：`Authorization: Bearer <API_KEY>`（仅 `/api/config/raw`）
+  - 拉取端：`Authorization: Bearer <API_KEY>`，客户端专用通道：`/api/config/raw`、
+    `/api/proxies/available`、`/api/proxies/feedback`、`/api/accounts/{name}/refresh-cookie`、
+    `/api/run-state/start|heartbeat|stop`（这几个只认 API Key，JWT 调返回 401）
 - 错误码：401 未认证 / 403 无权限 / 400 参数错误 / 404 不存在 / 500 服务器错误
 - 配置对象结构 = 完整 config JSON（含 `accounts` / `sites` / `ai` / `browser` / `http` / `defaults` / `proxy_pool` / `notify` / `config_sync` / `security` 顶层键），见 `config.example.json` 为基底
 
@@ -40,7 +42,7 @@
 
 ## 3. 获取配置（管理端，敏感打码）
 
-`GET /api/config` （JWT）
+`GET /api/config` （JWT 或 API Key）
 
 响应（200）：
 ```json
@@ -71,7 +73,7 @@
 
 ## 3.1 获取配置版本号（轻量）
 
-`GET /api/config/revision` （JWT）
+`GET /api/config/revision` （JWT 或 API Key）
 
 响应（200）：`{ "revision": 13 }`
 
@@ -83,7 +85,7 @@
 
 ## 4. 保存配置（管理端）
 
-`PUT /api/config` （JWT）
+`PUT /api/config` （JWT 或 API Key）
 
 请求体：
 ```json
@@ -125,7 +127,7 @@
 
 ## 4.1 账号增量操作（管理端，推荐）
 
-`POST /api/accounts/ops` （JWT）
+`POST /api/accounts/ops` （JWT 或 API Key）
 
 请求体：
 ```json
@@ -205,7 +207,7 @@
 ### 删除
 `DELETE /api/keys/{id}` → `{ "ok": true }`
 
-## 7. 导出（JWT + 一次性票据）
+## 7. 导出（JWT 需一次性票据 / API Key 免票据）
 
 `GET /api/export`
 
@@ -238,7 +240,7 @@
 响应（200）：`{ "ok": true }`
 错误（400）：`{ "error": "旧密码错误" }` 或 `{ "error": "新密码至少 8 个字符" }`
 
-## 9. Cookie 可用性测试（JWT）
+## 9. Cookie 可用性测试（JWT 或 API Key）
 
 站点 Cookie 与 TaBiAI 凭据使用两个独立的**启动**接口，共用一个后台任务与一套状态/停止接口。前端只提交账号名称，后端从数据库读取明文凭据；响应不会返回 Cookie 或 token。
 
@@ -332,6 +334,70 @@
 
 状态含义：`valid` 有效、`invalid` 凭据失效、`abnormal` 源站层面的异常响应、`skipped` 未配置对应 Cookie 或被手动停止、`pending` 排队中、`running` 本轮检测中。
 
+## 10. 代理池实测反馈（Actions 用）
+
+`POST /api/proxies/feedback`（**API Key** 认证，不是 JWT；与 `/api/run-state/*`、`/api/proxies/available` 同组）
+
+客户端跑完签到后回传本轮每个代理的成败计数，服务端据此做优选排序。
+
+请求体：
+```json
+{
+  "source": "github-actions",
+  "items": [
+    { "addr": "1.2.3.4:8080", "ok": 2, "net_fail": 1, "block_fail": 0 }
+  ]
+}
+```
+
+响应（200）：`{ "ok": true, "accepted": 1, "skipped": 0 }`
+错误（400）：`{ "error": "请求体不是合法的 JSON" }` / `{ "error": "items 不能为空" }` / `{ "error": "items 条数超过上限 2000" }`
+错误（500）：`{ "error": "写入代理反馈失败" }`
+
+- `source` 可选，缺省或空白时服务端日志里记为 `unknown`；`items` 必填且非空，条数上限 2000
+- `ok` = 经该代理签到成功次数；`net_fail` = 网络层连不上；`block_fail` = 连得上但被目标站/盾拦下
+- 计数**只增不减**，服务端不接受覆盖或清零；同一轮重复上报会把计数记重，客户端保证一轮只调一次
+- 被丢弃（计入 `skipped`）的条目：地址为空/超过 255 字符/含空白/缺端口/多个冒号、任一计数为负、三项计数全为 0
+- 同一次请求里同一个 `addr` 出现多次，先在服务端合并再落库
+- 数据存独立表 `proxy_feedback`（`addr` 主键 + 三项计数 + `last_ok_at` / `last_fail_at` / `updated_at`），
+  不随代理刷新被清空；超过 **14 天**没再更新的行会在下一次刷新时被清理
+
+### 优选排序（影响 `GET /api/proxies?alive=1` 与 `GET /api/proxies/available`）
+
+原来是 SQL 里 `ORDER BY alive DESC, speed_bps DESC, latency_ms ASC`。现在存活优先，然后按 Actions 实测表现分四档，同档内才回落到测速和延迟：
+
+| 档位 | 判定 |
+|---|---|
+| 实测能成 | 有反馈，`ok > 0` 且失败次数不超过成功次数 |
+| 还没试过 | 没有反馈记录，或计数全为 0 |
+| 时好时坏 | `ok > 0` 但失败次数超过成功次数；或只失败过一次（样本不足，不判死） |
+| 试过全败 | `ok == 0` 且总次数 ≥ 2 |
+
+- 同档内依次比：净成功数（`ok` 减失败）降序 → `speed_bps` 降序 → `latency_ms` 升序 → `addr` 字典序（保证顺序稳定）
+- 失败次数把 `net_fail` 和 `block_fail` 一起算：对签到来说两者都得换 IP
+- `limit` 现在在**精排之后**才截断。以前交给 SQL LIMIT 会先按测速砍掉一批，砍掉的可能正是实测最稳的
+- 反馈表为空或读取出错时退回原来的测速/延迟顺序；展示含 dead 的全量列表（不带 `alive=1`）仍是 SQL 顺序
+- 服务端 Cookie 检测取代理也走这个列表（`AvailableAddrs`），所以它也会优先拿到实测能成的出口
+
+为什么反馈档压在测速之前：服务器测出来的快慢是它自己网络位置的快慢，而代理真正被用在 Actions runner（Azure 网络）那边，两边对同一个免费代理的可达性经常不是一回事。
+
+### `proxy_pool` 新增字段（客户端消费，平台只负责存取下发）
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `report_feedback` | bool | `true` | 跑完是否回传各代理成败计数（`POST /api/proxies/feedback`） |
+| `preflight_check` | bool | `true` | 签到前在客户端本机快测一遍预取列表，剔掉当场连不上的 |
+| `preflight_limit` | int | `60` | 自筛只测列表最前面多少条；`0` = 不自筛。Python 侧夹到 0..500 |
+| `preflight_seconds` | int | `15` | 自筛整体时间盒（秒），到点就用已有结论。Python 侧夹到 1..120 |
+
+自筛探测打的仍是 `proxy_pool.test_url`，不碰目标站点。两个语义要点：
+
+- 时间盒内没拿到结论的代理**照旧保留**，不会因为超时被误删（把「没测到」当成「不通」会误删好代理）
+- 安全阀：候选全军覆没（一个都没测通）时**放弃整个自筛结果**，也不记进反馈。那更可能是本机到
+  `test_url` 的链路断了或该地址不可达，而不是代理集体暴死；真剔光会让所有账号因「无可用代理」被跳过
+
+被剔掉的代理按 `net_fail` 记进本轮反馈，平台下次排序就知道这些出口在 runner 那边不通。
+
 ---
 
 ## 账号登录字段
@@ -384,7 +450,7 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
 `POST /api/run-state/start`（**API Key**）请求体 `{ "source": "GitHub Actions（me/repo）" }`
 `POST /api/run-state/heartbeat`（**API Key**）响应 `{ "ok": true, "running": true }`
 `POST /api/run-state/stop`（**API Key**）响应 `{ "ok": true }`
-`GET /api/run-state`（JWT）响应：
+`GET /api/run-state`（JWT 或 API Key）响应：
 ```json
 {
   "running": true,
@@ -395,7 +461,7 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
   "heartbeat_seconds": 60
 }
 ```
-`POST /api/run-state/unlock`（JWT）响应 `{ "ok": true }` —— 管理员强制解锁。
+`POST /api/run-state/unlock`（JWT 或 API Key）响应 `{ "ok": true }` —— 管理员强制解锁。
 
 为什么要它：网页端的 TaBiAI 凭据检测**本身就是一次真 refresh**，签到进程同时也在
 推进代次。两边一撞，谁手里的代次旧了下次就会被判重放，整条会话被撤销
@@ -419,7 +485,7 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
 ### 签发凭据
 
 
-`POST /api/tabiai/issue-cookie`（JWT）
+`POST /api/tabiai/issue-cookie`（JWT 或 API Key）
 
 请求体：`{ "account_name": "TaBiAI" }`
 
@@ -496,7 +562,7 @@ tabiai 账号会就地判 `turnstile_required` 失败，整轮白跑。
   "browser": { "driver": "camoufox", "headless": "virtual", "humanize": true, "timeout": 60, "keep_artifacts_on_fail": true, "locale": "zh-CN", "window": [1280, 800], "executable_path": null },
   "http": { "impersonate": "chrome", "timeout": 20, "verify": true },
   "defaults": { "retry": 2, "interval_seconds": [3, 8] },
-  "proxy_pool": { "enabled": false, "test_url": "https://api.ipify.org", "timeout": 8, "max_workers": 25, "max_proxies": 250, "ip_swap_limit": 10, "sources": [], "refresh_minutes": 30, "save_limit": 0, "auto_test": true, "remote_url": "", "remote_token": "", "remote_token_header": "Authorization", "remote_token_prefix": "Bearer" },
+  "proxy_pool": { "enabled": false, "test_url": "https://api.ipify.org", "timeout": 8, "max_workers": 25, "max_proxies": 250, "ip_swap_limit": 10, "sources": [], "refresh_minutes": 30, "save_limit": 0, "auto_test": true, "remote_url": "", "remote_token": "", "remote_token_header": "Authorization", "remote_token_prefix": "Bearer", "report_feedback": true, "preflight_check": true, "preflight_limit": 60, "preflight_seconds": 15 },
   "notify": { "email": { "enabled": false, "smtp_host": "smtp.aliyun.com", "smtp_port": 465, "use_ssl": true, "username": "", "password": "", "from_addr": "", "to_addrs": [], "subject_prefix": "NewAPI 签到日报", "timeout": 20 } },
   "config_sync": { "enabled": false, "url": "", "method": "GET", "token": "", "token_header": "Authorization", "token_prefix": "Bearer", "headers": {}, "body": null, "response_field": "", "timeout": 20, "auto_before_checkin": true },
   "security": { "encryption_enabled": false, "config_key": "", "encrypted_file": "data/config.encrypted.json" }

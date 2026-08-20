@@ -8,7 +8,7 @@
 | 服务 | newapi-config-server（单二进制，前端已嵌入） |
 | Base URL | `http(s)://<你的部署地址>`，接口一律 `/api/...` 前缀 |
 | 数据库 | SQLite，默认 `./data/config.db` |
-| 端点总数 | 30 |
+| 端点总数 | 31 |
 | 认证 | JWT（管理员）/ API Key（自动化）/ 二者任一（运维类） |
 | 响应类型 | `application/json; charset=utf-8` |
 
@@ -50,7 +50,7 @@ Authorization: Bearer <JWT 或 API Key>
 | 范围 | 端点 | 说明 |
 | --- | --- | --- |
 | **双认证**<br>JWT 或 API Key | `GET /api/config`<br>`GET /api/config/revision`<br>`PUT /api/config`<br>`GET /api/export`<br>`POST /api/accounts/ops`<br>`POST /api/cookie-tests/newapi`<br>`POST /api/cookie-tests/tabiai`<br>`GET /api/cookie-tests/status`<br>`POST /api/cookie-tests/stop`<br>`POST /api/tabiai/issue-cookie`<br>`GET /api/run-state`<br>`POST /api/run-state/unlock`<br>`GET /api/proxies`<br>`GET /api/proxies/stats`<br>`POST /api/proxies/refresh`<br>`POST /api/proxies/speedtest` | 日常运维。脚本用一把 API Key 就能干完，不必模拟登录换 JWT |
-| **仅 API Key** | `GET /api/config/raw`<br>`GET /api/proxies/available`<br>`POST /api/accounts/{name}/refresh-cookie`<br>`POST /api/run-state/start`<br>`POST /api/run-state/heartbeat`<br>`POST /api/run-state/stop` | 客户端专用通道。JWT 调这些会 401 |
+| **仅 API Key** | `GET /api/config/raw`<br>`GET /api/proxies/available`<br>`POST /api/proxies/feedback`<br>`POST /api/accounts/{name}/refresh-cookie`<br>`POST /api/run-state/start`<br>`POST /api/run-state/heartbeat`<br>`POST /api/run-state/stop` | 客户端专用通道。JWT 调这些会 401 |
 | **仅 JWT** | `POST /api/config/import`<br>`GET /api/keys`<br>`POST /api/keys`<br>`DELETE /api/keys/{id}`<br>`PUT /api/password`<br>`POST /api/auth/verify-password` | 控制平面。一把躺在 CI secrets 里的 Key 若能改密码或造新 Key，泄露就等于永久失守 |
 | **无需认证** | `GET /api/health`<br>`POST /api/login` | |
 
@@ -556,7 +556,14 @@ Actions 有 6 小时硬上限，超时是被平台强杀，客户端没有机会
 | last_alive_at | string | 最近一次可用时间（dead 行会省略该字段） |
 | speed_bps | int64 | 实测下载字节每秒，0 = 未测速 |
 
-排序：`alive DESC, speed_bps DESC, latency_ms ASC`。**500** `查询代理列表失败`。
+排序看有没有带 `alive=1`：
+
+- 带 `alive=1` 走[优选排序](#优选排序实测表现分四档) —— 存活优先，再按 Actions 实测表现分四档，
+  同档内才回落到测速与延迟。此时 `limit` 在**精排之后**才截断
+- 不带 `alive=1`（展示含 dead 的全量）保持 SQL 顺序 `alive DESC, speed_bps DESC, latency_ms ASC`，
+  前端拿到后自己还会再排一次
+
+**500** `查询代理列表失败`。
 
 ### GET /api/proxies/available
 
@@ -568,8 +575,9 @@ Actions 有 6 小时硬上限，超时是被平台强杀，客户端没有机会
 
 **200** `{ "proxies": ["1.2.3.4:8080"], "count": 1, "checked_at": "..." }`
 
-只含 `alive` 的条目。`checked_at` 是最近一次刷新或测速的完成时间，从未跑过为 `""`。
-无错误分支：查库失败时返回 `{"proxies": null, "count": 0}`。
+只含 `alive` 的条目，顺序就是[优选排序](#优选排序实测表现分四档)（与 `GET /api/proxies?alive=1` 同一套），
+客户端从前往后取即可；`limit` 在**精排之后**才截断。`checked_at` 是最近一次刷新或测速的完成时间，
+从未跑过为 `""`。无错误分支：查库失败时返回 `{"proxies": null, "count": 0}`。
 
 ### GET /api/proxies/stats
 
@@ -612,10 +620,18 @@ Actions 有 6 小时硬上限，超时是被平台强杀，客户端没有机会
 | 409 | `代理池刷新或测速已在进行中` |
 | 500 | `服务器内部错误` |
 
-立即返回，刷新在后台跑：抓源 → 按源轮转去重 → 并发测通 → 排序 → 清表重写。
+立即返回，刷新在后台跑：抓源 → 按源轮转去重 → 并发测通 → 排序 → 沿用上一轮测速值 → 清表重写。
 并发数取 `proxy_pool.max_workers`（<=0 则 25）；`sources` 为空时用 6 个内置默认源；
 `save_limit > 0` 时可用数达标即提前收手并截断，`<=0` 表示测完全部候选、全量落库。
 绝对上限 20 分钟。进度只能通过 `GET /api/proxies/stats` 轮询。
+
+两件容易被忽略的收尾动作：
+
+- **测速值跨刷新保留**：刷新自己只测连通性和延迟，落库前会把库里 `speed_bps > 0` 的旧值按 `addr`
+  捞回来填进新记录，所以页面上手动测速的成果不会被下一次刷新清零。只给这轮仍然测通的代理沿用 ——
+  都没测通还留着旧速度，只会让死代理在排序里插到前面
+- **顺手清理过期反馈**：删掉 `proxy_feedback` 里超过 **14 天**没再更新的行。反馈存在独立表，
+  不随 `proxies` 清表被抹掉，所以需要单独有个过期出口，免得随免费代理无限膨胀
 
 ### POST /api/proxies/speedtest
 
@@ -639,7 +655,78 @@ Actions 有 6 小时硬上限，超时是被平台强杀，客户端没有机会
 
 后台跑，独立 120 秒 context（不随 HTTP 请求取消）。单条超时取 `proxy_pool.timeout`
 （<=0 则 15 秒），并发 8，只对库中 `alive` 且落在前 2000 条内的代理测。
-结果写入 `speed_bps`。与刷新共用互斥位。
+结果写入 `speed_bps`，刷新时会被沿用而不是清零（见上）。与刷新共用互斥位。
+
+### POST /api/proxies/feedback
+
+**仅 API Key**。GitHub Actions 客户端跑完签到后回传本轮每个代理的成败计数，
+服务端据此做[优选排序](#优选排序实测表现分四档)。客户端是否回传由 `proxy_pool.report_feedback` 决定。
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| source | string | 否 | 谁在上报，只进服务端日志；缺省或全空白记为 `unknown` |
+| items | array | 是 | 非空，最多 **2000** 条（`maxFeedbackItems`） |
+| items[].addr | string | 是 | `host:port` |
+| items[].ok | int | 否 | 经该代理签到成功的次数 |
+| items[].net_fail | int | 否 | 网络层连不上（代理本身不通） |
+| items[].block_fail | int | 否 | 连得上但被目标站 / 盾拦下（出口 IP 声誉问题） |
+
+```json
+{
+  "source": "github-actions",
+  "items": [
+    {"addr": "1.2.3.4:8080", "ok": 2, "net_fail": 1, "block_fail": 0}
+  ]
+}
+```
+
+**200** `{ "ok": true, "accepted": 1, "skipped": 0 }` —— `accepted` 收下几条，`skipped` 丢了几条。
+
+| 状态码 | 文案 |
+| --- | --- |
+| 400 | `请求体不是合法的 JSON` / `items 不能为空` / `items 条数超过上限 2000` |
+| 500 | `写入代理反馈失败` |
+
+语义要点（这里最容易搞错）：
+
+- **计数只增不减**，服务端不接受覆盖也不接受清零。同一轮重复上报会把计数记重，
+  客户端必须保证一轮只调一次；想重置只能等 14 天过期被清掉
+- 被丢弃（计入 `skipped`）的条目：地址为空 / 超过 255 字符 / 含空白 / 缺端口 / 有多个冒号、
+  任一计数为负、三项计数全为 0
+- 同一次请求里同一个 `addr` 出现多次，先在服务端合并再落库，`accepted` 数的是合并后的条数
+- 地址只做形状校验，不要求已经存在于 `proxies` 表：上游源里出现过域名形式的代理，
+  客户端能用就该能记，排序时对不上号的行自然不影响任何结果
+- 数据存独立表 `proxy_feedback`（字段见[附录 A](#proxyfeedback)），**不随代理刷新被清空**；
+  超过 **14 天**没再更新的行会在下一次刷新时被清理
+
+### 优选排序：实测表现分四档
+
+`GET /api/proxies?alive=1` 与 `GET /api/proxies/available` 共用这套顺序：
+存活优先 → Actions 实测表现分档 → 净成功数 → 测速 → 延迟 → `addr`。
+
+档位（`server/proxy_feedback.go` 的 `rankOf`，越靠前越先被分配给账号）：
+
+| 档位 | 判定 |
+| --- | --- |
+| 实测能成 | 有反馈，`ok > 0` 且失败次数不超过成功次数 |
+| 还没试过 | 没有反馈记录，或计数全为 0 |
+| 时好时坏 | `ok > 0` 但失败次数超过成功次数；或只失败过一次（样本不足，不判死） |
+| 试过全败 | `ok == 0` 且总次数 ≥ 2 |
+
+同档内依次比：净成功数（`ok` 减失败）降序 → `speed_bps` 降序 → `latency_ms` 升序 →
+`addr` 字典序。最后一级只为顺序稳定 —— 每次请求返回的顺序抖来抖去，多账号并发分配会踩到
+不同代理，出了问题也难复现。
+
+失败次数把 `net_fail` 与 `block_fail` 一起算：对签到来说连不上和被拦都得换 IP。
+分档而不是直接按失败率排，是因为样本量差得太远 —— 只失败过一次和失败二十次的失败率都是
+100%，前者很可能只是当时网络抖了一下。
+
+反馈档位压在测速和延迟之前：服务器测出来的快慢是它自己网络位置的快慢，而代理真正被用在
+Actions runner（Azure 网络）那边，两边对同一个免费代理的可达性经常不是一回事。
+
+两个边界：`limit` 在**精排之后**才截断（交给 SQL `LIMIT` 会先按测速砍掉一批，砍掉的可能
+正是实测最稳的那些）；反馈表还是空的、或读取反馈出错时退回原来的测速 / 延迟顺序，不让整个
+列表跟着失败。
 
 ## 8. API Key 管理
 
@@ -773,7 +860,7 @@ CI secrets 一旦泄露就再也收不回控制权。
 | browser | object | `driver` `headless` `humanize` `timeout` `keep_artifacts_on_fail` `locale` `window` `executable_path` |
 | http | object | `impersonate` `timeout` `verify`（检测请求也复用） |
 | defaults | object | `retry` `interval_seconds` |
-| proxy_pool | object | 代理池抓取/测通/刷新参数 + Actions 预取的 `remote_*` 透传字段 |
+| proxy_pool | object | 代理池抓取/测通/刷新参数 + Actions 预取的 `remote_*` 透传字段 + 客户端侧的回传与自筛开关 |
 | notify | object | 目前只有 `email` 一个子段（SMTP 全套） |
 | config_sync | object | 从远端拉配置：`url` `method` `token` `token_header` `headers` `body` `response_field` 等 |
 | security | object | `encryption_enabled` `config_key` `encrypted_file` |
@@ -783,6 +870,50 @@ CI secrets 一旦泄露就再也收不回控制权。
 是 Python 客户端的本机配置，Go 的 Config 结构体没有对应成员，
 通过 `PUT /api/config` 或导入提交会被静默丢弃。它是机器级设置（`cdp_url` 指向本机端口），
 本来就不该由平台下发。
+
+### ProxyFeedback
+
+`proxy_feedback` 表一行 = 一个代理在 Actions 侧的累计表现，由
+[`POST /api/proxies/feedback`](#post-apiproxiesfeedback) 累加写入，
+供[优选排序](#优选排序实测表现分四档)分档。它不出现在任何配置里，也不随 `GET /api/config` 下发。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| addr | string | `host:port`，**主键** |
+| ok | int | 经它签到成功的累计次数 |
+| net_fail | int | 网络层连不上的累计次数 |
+| block_fail | int | 连得上但被目标站 / 盾拦下的累计次数 |
+| last_ok_at | string | 最近一次成功时间；从没成过为空 |
+| last_fail_at | string | 最近一次失败时间；从没失败过为空 |
+| updated_at | string | 最近一次被上报的时间，过期清理按它算 |
+
+- 三项计数只累加，没有覆盖或清零的入口
+- `last_ok_at` / `last_fail_at` 只在对应方向真有增量时才更新，一次纯失败的上报不会把
+  「上次成功是什么时候」冲掉
+- 单独一张表而不是给 `proxies` 加列：`proxies` 每次刷新都被清表重插，计数放进去会跟着抹掉；
+  而且一个代理从上游列表消失几天后又回来，它过去的表现仍然有参考价值
+- 唯一的过期出口是刷新时清掉 `updated_at` 超过 14 天的行
+
+### proxy_pool 的客户端侧开关
+
+这四个字段存在平台上、经 `GET /api/config/raw` 下发，但**只有 Python 客户端消费**，
+Go 侧除了存取之外不读它们 —— 在网页端改完不会影响服务器自己的刷新和测速行为。
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| report_feedback | bool | `true` | 跑完是否回传各代理成败计数（`POST /api/proxies/feedback`） |
+| preflight_check | bool | `true` | 签到前在客户端本机快测一遍预取列表，剔掉当场连不上的 |
+| preflight_limit | int | `60` | 自筛只测列表最前面多少条；`0` = 不自筛。Python 侧夹到 0..500 |
+| preflight_seconds | int | `15` | 自筛整体时间盒（秒），到点就用已有结论。Python 侧夹到 1..120 |
+
+自筛探测打的仍是 `proxy_pool.test_url`，不碰目标站点。两个语义要点：
+
+- 时间盒内没拿到结论的代理**照旧保留**，不会因为超时被误删 —— 把「没测到」当成「不通」会误删好代理
+- 安全阀：候选**全军覆没**（一个都没测通）时放弃整个自筛结果，也不记进反馈。那更可能是本机到
+  `test_url` 的链路断了或该地址本身不可达，而不是代理集体暴死；真剔光会让所有账号因
+  「无可用代理」被跳过，一整轮白跑
+
+被剔掉的代理按 `net_fail` 记进本轮反馈，所以平台下次排序就知道这些出口在 runner 那边不通。
 
 ## 附录 B：校验错误文案
 
@@ -808,15 +939,11 @@ CI secrets 一旦泄露就再也收不回控制权。
 
 阅读源码时容易被注释带偏的地方，本文按**实际实现**记录：
 
-1. `POST /api/tabiai/issue-cookie` 的源码注释写「（JWT）」，实际是双认证
-2. 代理类端点注释都写「（JWT）」，实际 `/api/proxies`、`/api/proxies/stats`、
-   `/api/proxies/refresh`、`/api/proxies/speedtest` 是双认证，
-   而 `/api/proxies/available` 是**仅 API Key**
-3. `GET /api/proxies` 的注释宣称支持 `?source=xxx` 按来源过滤，**代码里没有读该参数**
-4. `CookieTestStatus.last_error` 字段存在，但当前没有任何写入路径，恒为 `""`
-5. `POST /api/cookie-tests/*` 在 runner 内部还有一处竞态二次判定，
+1. `GET /api/proxies` 的注释宣称支持 `?source=xxx` 按来源过滤，**代码里没有读该参数**
+2. `CookieTestStatus.last_error` 字段存在，但当前没有任何写入路径，恒为 `""`
+3. `POST /api/cookie-tests/*` 在 runner 内部还有一处竞态二次判定，
    文案同为 `已有 Cookie 检测任务在进行中` 但状态码是 **400 而非 409**
-6. Config 没有 `tabiai` 段（见附录 A 末尾）
+4. Config 没有 `tabiai` 段（见附录 A 末尾）
 
 ## 附录 D：常见任务
 
@@ -889,6 +1016,19 @@ curl -s "$BASE/api/export" -H "$AUTH" | jq -r '.json' > backup-$(date +%F).json
 ```bash
 curl -s "$BASE/api/proxies/available?limit=20" -H "$AUTH" | jq -r '.proxies[]'
 ```
+
+返回顺序已经是优选排序，从前往后取就行。
+
+**回传这批代理好不好用（下次预取的顺序据此调整）**
+
+```bash
+curl -X POST "$BASE/api/proxies/feedback" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"source":"my-script","items":[
+        {"addr":"1.2.3.4:8080","ok":2,"net_fail":0,"block_fail":0},
+        {"addr":"5.6.7.8:3128","ok":0,"net_fail":1,"block_fail":0}]}'
+```
+
+计数只增不减，一轮跑完只调一次 —— 重复上报会把同一轮记重。
 
 **刷新代理池并等它跑完**
 

@@ -202,7 +202,7 @@ func (s *Server) handleRunStateStop(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// handleGetRunState GET /api/run-state（JWT）—— 前端查询锁状态。
+// handleGetRunState GET /api/run-state（JWT 或 API Key）—— 前端查询锁状态。
 func (s *Server) handleGetRunState(w http.ResponseWriter, r *http.Request) {
 	state, err := LoadRunState(s.db)
 	if err != nil {
@@ -212,7 +212,7 @@ func (s *Server) handleGetRunState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, state)
 }
 
-// handleRunStateUnlock POST /api/run-state/unlock（JWT）—— 管理员强制解锁。
+// handleRunStateUnlock POST /api/run-state/unlock（JWT 或 API Key）—— 管理员强制解锁。
 //
 // 留这个出口是因为心跳机制本身也可能出岔子（客户端时钟错、上报地址配错），
 // 没有它就只能等 5 分钟或者改库。代价是能手滑绕过保护，所以前端要给足警示。

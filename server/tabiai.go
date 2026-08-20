@@ -103,7 +103,7 @@ func (s *Server) handleWriteBackRefreshCookie(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// handleIssueTabiAICookie POST /api/tabiai/issue-cookie（JWT）
+// handleIssueTabiAICookie POST /api/tabiai/issue-cookie（JWT 或 API Key）
 // 用账号里保存的 GitHub user_session 走三步 OAuth，为该账号签发一条全新的 new_api_refresh。
 func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request) {
 	// 签发会换出一条全新的 sid，签到进程手里那条当场作废。跑签到时必须拦住，
