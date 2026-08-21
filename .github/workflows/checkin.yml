@@ -73,7 +73,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
       total: ${{ steps.plan.outputs.total }}
       count: ${{ steps.plan.outputs.count }}
     steps:
@@ -115,23 +114,31 @@ jobs:
           python - <<'PY'
           import json, os, pathlib
           plan = json.loads(pathlib.Path("data/shard-plan.json").read_text(encoding="utf-8"))
-          # 矩阵里**只放分片序号**，绝不放账号名：账号名是从 secret 解出来的配置里取的，
-          # GitHub 判定 job output「可能含 secret」时会整个跳过该 output，下游拿到空串，
-          # fromJson('') 直接报 empty input。名单由每个 job 用 --shard 在内部自己算。
-          matrix = list(range(1, plan["total"] + 1))
+          # MAX_SHARDS 必须与下面 matrix 的字面量长度一致。片数被夹到上限时每片会多跑
+          # 几个账号，但绝不能让 total 超过 matrix 长度 —— 多出来的分片没有 job 去跑，
+          # 那部分账号会被静默漏签。
+          MAX_SHARDS = 8
+          total = min(plan["total"], MAX_SHARDS)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write("matrix=" + json.dumps(matrix) + "\n")
-              fh.write(f"total={plan['total']}\n")
+              fh.write(f"total={total}\n")
               fh.write(f"count={plan['count']}\n")
-          print(f"::notice::{plan['count']} 个启用账号，切成 {plan['total']} 个分片")
+          note = f"{plan['count']} 个启用账号，切成 {total} 个分片"
+          if plan["total"] > MAX_SHARDS:
+              note += f"（按每片 {os.environ.get('SHARD_SIZE', '?')} 个本应 {plan['total']} 片，" \
+                      f"已夹到上限 {MAX_SHARDS}，每片会多跑一些）"
+          print(f"::notice::{note}")
+          # 诊断用：output 被 GitHub 判「可能含 secret」跳过时，这行日志能直接对照
+          print(f"::notice::plan outputs -> total={total} count={plan['count']}")
           PY
+        env:
+          SHARD_SIZE: ${{ inputs.shard_size || '30' }}
 
   # ---------------------------------------------------------------------- #
   # 第二段：按分片并行签到
   # ---------------------------------------------------------------------- #
   checkin:
     needs: plan
-    # 一个账号都没启用时 matrix 会是空数组，GitHub 会直接把 job 判为失败，先挡掉
+    # 一个账号都没启用时整个 checkin 不必展开
     if: needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
     name: 签到分片 ${{ matrix.shard }}/${{ needs.plan.outputs.total }}
@@ -143,12 +150,22 @@ jobs:
       # 一个分片挂了不影响其余分片：账号之间本来就没有依赖关系
       fail-fast: false
       matrix:
-        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+        # 写死字面量，不从 plan 的 output 取。
+        #
+        # GitHub 会把 job output 判为「可能含 secret」而**整个跳过**，日志里只留一行
+        # Skip output '<name>' since it may contain secret；下游拿到空串，
+        # fromJson('') 报 empty input。实测连 [1, 2, 3] 这种纯序号数组也照样被拦，
+        # 所以矩阵干脆不走 output 这条路。
+        #
+        # 长度必须与 plan 里的 MAX_SHARDS 一致。超出实际片数的 job 靠下面每步的 if
+        # 跳过，几秒就结束；实际片数由 plan 夹到上限，不会有账号漏在 8 片之外。
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
       - name: 安装系统依赖（Camoufox/Firefox 运行库 + 中文字体）
+        if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') }}
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
@@ -157,15 +174,18 @@ jobs:
             fonts-liberation fonts-noto-cjk ca-certificates
 
       - name: 安装 Python
+        if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: 安装 Python 依赖（精简版，不含 PySide6 GUI）
+        if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') }}
         run: pip install -r requirements-ci.txt
 
       - name: 恢复 Camoufox 浏览器缓存（约几百 MB，命中后秒级恢复）
+        if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') }}
         id: camoufox-cache
         uses: actions/cache@v4
         with:
@@ -175,7 +195,7 @@ jobs:
           key: camoufox-${{ runner.os }}-${{ hashFiles('requirements-ci.txt') }}
 
       - name: 下载 Camoufox 浏览器（仅首次或依赖升级时）
-        if: steps.camoufox-cache.outputs.cache-hit != 'true'
+        if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') && steps.camoufox-cache.outputs.cache-hit != 'true' }}
         run: python -m camoufox fetch
 
       # 注意：公共仓库的 Actions 缓存对外可读，这里刻意【不缓存】data/sessions.json
@@ -183,6 +203,7 @@ jobs:
       # 都会重新过盾，缓存价值有限，放弃缓存换取安全。
 
       - name: 写入配置（来自 GitHub Secrets）
+        if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') }}
         env:
           CONFIG_JSON_B64: ${{ secrets.CONFIG_JSON_B64 }}
           CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
@@ -206,6 +227,7 @@ jobs:
           PY
 
       - name: 开始签到（headless 真无头 + 固定 6 账号并发 + 3 浏览器并发）
+        if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') }}
         # 两级并发管的不是一回事：
         #   账号级并发固定为 6，HTTP 快路径主要等待网络，保证整轮吞吐稳定；
         #   浏览器实例固定为 3，不再按 runner 的 CPU 核数动态计算，避免排队时
