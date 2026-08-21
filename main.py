@@ -51,8 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--shard", metavar="I/N",
-        help="告诉平台自己是第 I 个分片（共 N 片），只领属于本片的代理；"
-             "几个 job 并行时避免同一个出口 IP 被分给多个账号",
+        help="本进程是第 I 个分片（共 N 片）：只跑分到自己名下的那批账号，"
+             "并只向平台领属于本片的代理。几个 job 并行时用它切分，"
+             "避免重复签到与同一出口 IP 被多个账号共用",
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="只验证当前登录方式的凭据与连通性，不执行签到")
@@ -157,6 +158,27 @@ def _parse_shard(raw) -> tuple:
     return index, total
 
 
+def _shard_account_names(cfg, args, shard: tuple) -> list:
+    """按分片切出本 job 该跑的账号名。
+
+    切法是连续块：先按 --account（若给了）过滤，再把剩下的均分成 N 份取第 I 份，
+    块大小 = ceil(总数 / N)。各片不重叠、合起来覆盖全部。
+
+    为什么不让 plan job 把名单直接发下来：账号名来自 secret 解出的配置，GitHub 会判定
+    job output「可能含 secret」而**整个跳过**该 output，下游 fromJson('') 就报
+    empty input。所以 output 里只放数字，名单由各 job 在内部自己算。
+
+    这也意味着 plan 与各 job 的切法不必一致 —— plan 只负责算出「要开几个 job」，
+    只要这里切出来的各片不重叠且覆盖全部，结果就是对的。
+    """
+    index, total = shard
+    names = [a.name for a in cfg.select(_split_accounts(args.account))]
+    if total <= 1 or not names:
+        return names
+    chunk = -(-len(names) // total)  # 向上取整
+    return names[(index - 1) * chunk: index * chunk]
+
+
 def _maybe_sync_remote_config(cfg) -> None:
     """签到前同步远程配置；失败只降级用本地配置，绝不中断签到。
 
@@ -215,6 +237,21 @@ def main(argv=None) -> int:
     if args.shard_plan is not None:
         return _write_shard_plan(cfg, args, args.shard_plan)
 
+    # 按分片挑出本进程该跑的账号。放在远程同步之后：平台上刚加的账号要能被切进来
+    shard_names = None
+    if shard is not None:
+        try:
+            shard_names = _shard_account_names(cfg, args, shard)
+        except ConfigError as exc:
+            log.err(str(exc))
+            return 2
+        if not shard_names:
+            # 分片数多于账号数时靠后的片会是空的。空名单不能往下传：account_names
+            # 为空等于「不过滤」，会让这个 job 把所有账号又跑一遍
+            log.warn(f"第 {shard[0]}/{shard[1]} 片没有分到账号，本次无需签到")
+            return 0
+        log.info(f"分片 {shard[0]}/{shard[1]}：本片 {len(shard_names)} 个账号")
+
     # CLI 覆盖配置
     if args.manual and args.headless:
         log.err("--manual 与 --headless 不能同时使用：人工验证需要可交互显示")
@@ -244,7 +281,7 @@ def main(argv=None) -> int:
         log.debug("AI: 未启用")
 
     options = RunOptions(
-        account_names=_split_accounts(args.account),
+        account_names=shard_names if shard_names is not None else _split_accounts(args.account),
         dry_run=args.dry_run,
         headful=args.headful,
         manual=args.manual,

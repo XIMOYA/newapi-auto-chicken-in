@@ -94,20 +94,103 @@ class TestRunOptionsWiring:
 
         def fake_runner(cfg, options):
             captured["shard"] = options.proxy_shard
+            captured["accounts"] = options.account_names
             return SimpleNamespace(run=lambda: 0)
 
+        # 带 4 个账号：--shard 现在也要据此切出本片名单，配置里没有账号会直接返回 0
+        accs = [SimpleNamespace(name=f"A{i}", enabled=True) for i in range(1, 5)]
         monkeypatch.setattr(main, "load_config", lambda _p: SimpleNamespace(
             migrated_from=None, source=None,
+            accounts=accs,
+            select=lambda picked=None: accs if not picked else [a for a in accs if a.name in set(picked)],
             browser=SimpleNamespace(headless="virtual", driver="camoufox", humanize=False),
             http=SimpleNamespace(impersonate="chrome"),
             ai=SimpleNamespace(enabled=False),
             config_sync=SimpleNamespace(enabled=False),
         ))
         monkeypatch.setattr(main, "Runner", fake_runner)
-        assert main.main(["--shard", "2/7", "--headless"]) == 0
-        assert captured["shard"] == (2, 7)
+        assert main.main(["--shard", "2/2", "--headless"]) == 0
+        assert captured["shard"] == (2, 2)
+        # 第 2 片拿后一半
+        assert captured["accounts"] == ["A3", "A4"]
+
+    def test_empty_shard_exits_without_running(self, monkeypatch):
+        """空片必须直接退出：账号名单为空等于「不过滤」，会让这个 job 把全部账号又跑一遍。"""
+        started = []
+        accs = [SimpleNamespace(name="A1", enabled=True)]
+        monkeypatch.setattr(main, "load_config", lambda _p: SimpleNamespace(
+            migrated_from=None, source=None,
+            accounts=accs,
+            select=lambda picked=None: accs if not picked else [a for a in accs if a.name in set(picked)],
+            browser=SimpleNamespace(headless="virtual", driver="camoufox", humanize=False),
+            http=SimpleNamespace(impersonate="chrome"),
+            ai=SimpleNamespace(enabled=False),
+            config_sync=SimpleNamespace(enabled=False),
+        ))
+        monkeypatch.setattr(main, "Runner",
+                            lambda cfg, options: SimpleNamespace(run=lambda: started.append(1) or 0))
+        assert main.main(["--shard", "3/3", "--headless"]) == 0
+        assert started == []
 
     def test_default_is_none(self):
         from newapi_checkin.runner import RunOptions
 
         assert RunOptions().proxy_shard is None
+
+
+class TestAccountSharding:
+    """--shard 同时决定「本片跑哪些账号」。
+
+    账号名不能经 job output 传递：它来自 secret 解出的配置，GitHub 会判定 output
+    「可能含 secret」而整个跳过，下游 fromJson('') 就报 empty input。所以名单由各 job
+    自己切，切法必须自洽 —— 各片不重叠、合起来覆盖全部，否则会漏签或重复签。
+    """
+
+    @staticmethod
+    def _cfg(n):
+        accs = [SimpleNamespace(name=f"A{i}", enabled=True) for i in range(1, n + 1)]
+
+        def select(picked=None):
+            if not picked:
+                return accs
+            wanted = set(picked)
+            return [a for a in accs if a.name in wanted]
+
+        return SimpleNamespace(accounts=accs, select=select)
+
+    def _split(self, count, total):
+        args = SimpleNamespace(account=None)
+        return [main._shard_account_names(self._cfg(count), args, (i, total))
+                for i in range(1, total + 1)]
+
+    @pytest.mark.parametrize("count,total,sizes", [
+        (64, 3, [22, 22, 20]),
+        (60, 3, [20, 20, 20]),
+        (64, 5, [13, 13, 13, 13, 12]),
+        (5, 2, [3, 2]),
+        (1, 1, [1]),
+    ])
+    def test_split_sizes(self, count, total, sizes):
+        assert [len(p) for p in self._split(count, total)] == sizes
+
+    @pytest.mark.parametrize("count,total", [(64, 3), (97, 7), (10, 4), (1, 1)])
+    def test_covers_all_without_overlap(self, count, total):
+        parts = self._split(count, total)
+        flat = [n for p in parts for n in p]
+        assert len(flat) == count            # 不漏
+        assert len(set(flat)) == count       # 不重
+        assert flat == [f"A{i}" for i in range(1, count + 1)]  # 顺序也保持
+
+    def test_more_shards_than_accounts_yields_empty_tail(self):
+        parts = self._split(2, 3)
+        assert [len(p) for p in parts] == [1, 1, 0]
+
+    def test_account_filter_applies_before_sharding(self):
+        """--account 与 --shard 一起用时，先过滤再切分。"""
+        args = SimpleNamespace(account=["A1,A2,A3,A4"])
+        parts = [main._shard_account_names(self._cfg(10), args, (i, 2)) for i in (1, 2)]
+        assert parts == [["A1", "A2"], ["A3", "A4"]]
+
+    def test_single_shard_returns_everything(self):
+        args = SimpleNamespace(account=None)
+        assert len(main._shard_account_names(self._cfg(7), args, (1, 1))) == 7

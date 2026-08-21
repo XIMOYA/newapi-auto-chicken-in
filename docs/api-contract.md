@@ -393,6 +393,7 @@ Actions 每 30 个账号拆一个 job 并行跑时，几个 job 拿到同一份�
 - 各片互不重叠，合起来正好覆盖全量
 - 参数写错（`0/3`、`4/3`、`abc`、缺分母、总片数 ≤ 0）返回 **400**，不静默当作不分片 —— 客户端会误以为自己独占一批代理
 - 客户端侧是 `python main.py --shard I/N`，workflow 由 matrix 分片号自动传入
+- `--shard` 在客户端同时决定「跑哪些账号」：账号名不能经 job output 传递（来自 secret 解出的配置，GitHub 会判定 output 可能含 secret 而整个跳过，下游 `fromJson('')` 报 empty input），所以 matrix 只放序号，名单由各 job 按连续块自己切
 
 ### `GET /api/proxies` 的 `?source=xxx`
 

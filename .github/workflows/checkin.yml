@@ -115,9 +115,12 @@ jobs:
           python - <<'PY'
           import json, os, pathlib
           plan = json.loads(pathlib.Path("data/shard-plan.json").read_text(encoding="utf-8"))
-          # ensure_ascii=True：矩阵要过 GitHub 的 fromJson，非 ASCII 账号名转义后更稳
+          # 矩阵里**只放分片序号**，绝不放账号名：账号名是从 secret 解出来的配置里取的，
+          # GitHub 判定 job output「可能含 secret」时会整个跳过该 output，下游拿到空串，
+          # fromJson('') 直接报 empty input。名单由每个 job 用 --shard 在内部自己算。
+          matrix = list(range(1, plan["total"] + 1))
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write("matrix=" + json.dumps(plan["shards"]) + "\n")
+              fh.write("matrix=" + json.dumps(matrix) + "\n")
               fh.write(f"total={plan['total']}\n")
               fh.write(f"count={plan['count']}\n")
           print(f"::notice::{plan['count']} 个启用账号，切成 {plan['total']} 个分片")
@@ -131,7 +134,7 @@ jobs:
     # 一个账号都没启用时 matrix 会是空数组，GitHub 会直接把 job 判为失败，先挡掉
     if: needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
-    name: 签到分片 ${{ matrix.shard.index }}/${{ needs.plan.outputs.total }}
+    name: 签到分片 ${{ matrix.shard }}/${{ needs.plan.outputs.total }}
     # 不设 timeout-minutes：走 GitHub 的默认值 360 分钟（6 小时，也是平台硬上限）。
     # 真正控制总时长的是程序里的「单账号时间盒」ACCOUNT_DEADLINE_SECONDS：
     # 盾类失败会不限次数地换 IP + 重开浏览器重试，直到该账号的时间盒用尽，
@@ -209,17 +212,13 @@ jobs:
         #   在不同运行环境之间出现并发抖动。公开库 runner 是 4 vCPU/16GB，
         #   过 Turnstile 吃 CPU，开到 4 个反而会互相抢核拖慢每个实例。
         #
-        # --account 收的是 plan job 分好的这一片账号名。各分片名单互不重叠，
-        # 所以几个 job 并行不会重复签同一个账号。
-        #
-        # --shard 让平台只发属于本片的代理：不带的话几个 job 拿到的是同一份按优选排好
-        # 的列表、又都从头取，最优的那几个出口 IP 会被同时分给不同账号。
-        env:
-          SHARD_ACCOUNTS: ${{ matrix.shard.accounts }}
+        # --shard 一个参数管两件事：挑出本片该跑的账号，以及只向平台领本片的代理。
+        # 账号名不经 job output 传递 —— 它来自 secret 解出的配置，GitHub 会判定 output
+        # 「可能含 secret」而整个跳过，下游 fromJson('') 直接报错。所以这里只传序号，
+        # 名单由客户端按同一规则自己切（连续块，各片不重叠且覆盖全部）。
         run: |
           python main.py --headless --parallel 6 --browser-parallel 3 -v \
-            --account "$SHARD_ACCOUNTS" \
-            --shard "${{ matrix.shard.index }}/${{ needs.plan.outputs.total }}" \
+            --shard "${{ matrix.shard }}/${{ needs.plan.outputs.total }}" \
             ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: 上传排障截图与页面快照（仅失败时）
@@ -227,7 +226,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           # 带上分片号：几个分片同时上传，同名 artifact 会互相覆盖
-          name: checkin-shots-${{ matrix.shard.index }}
+          name: checkin-shots-${{ matrix.shard }}
           path: data/shots
           if-no-files-found: ignore
           retention-days: 7

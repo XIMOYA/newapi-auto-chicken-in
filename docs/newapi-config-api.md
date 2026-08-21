@@ -618,6 +618,11 @@ Actions 每 30 个账号拆一个 job 并行跑时，几个 job 拿到的是同�
 客户端会以为自己领到的是独占的一批，实际上和别的 job 撞了，这种错必须在第一次调用就暴露。
 客户端侧对应 `python main.py --shard I/N`，workflow 里由 matrix 的分片号自动传入。
 
+`--shard` 在客户端管两件事：挑出本片该跑的账号，以及只领本片的代理。账号名单**不经
+job output 传递** —— 它来自 secret 解出的配置，GitHub 判定 output「可能含 secret」时会
+整个跳过该输出，下游 `fromJson('')` 直接报 empty input。所以 matrix 里只放分片序号，
+名单由每个 job 按同一规则自己切（连续块，各片不重叠且合起来覆盖全部）。
+
 ### GET /api/proxies/stats
 
 双认证。无参数。
