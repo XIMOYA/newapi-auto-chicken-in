@@ -23,8 +23,10 @@ from .logger import SummaryRow
 # 文件格式版本。以后加字段时靠它判断兼容性，读到未来的版本只 WARN 不炸
 SCHEMA_VERSION = 1
 # SummaryRow 的字段白名单：反序列化只认这几个，多出来的字段直接丢。
-# balance/quota_per_unit 必须在列表里 —— 少一个，分片汇总出来的邮件额度列就全是 -
-_ROW_FIELDS = ("name", "status", "strategy", "detail", "quota", "balance", "quota_per_unit")
+# balance/quota_per_unit 必须在列表里 —— 少一个，分片汇总出来的邮件额度列就全是 -；
+# site 少了则底部的分站点总览会把所有账号并成一堆
+_ROW_FIELDS = ("name", "status", "strategy", "detail", "quota", "balance",
+               "quota_per_unit", "site")
 
 
 def _row_to_dict(row) -> dict:

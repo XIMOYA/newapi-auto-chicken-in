@@ -273,6 +273,9 @@ class SummaryRow:
     balance: object = None
     # 站点的额度换算率。None 表示按默认值算（不同 fork 的 quota_per_unit 不一定相同）
     quota_per_unit: object = None
+    # 账号所属站点的 base_url。邮件底部要按站点把余额并起来、配上各站自己的定价表，
+    # 光有账号名分不出哪个是哪个站
+    site: str = ""
 
 
 def _as_money(raw, unit: int) -> Optional[str]:

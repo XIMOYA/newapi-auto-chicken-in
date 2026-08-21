@@ -164,9 +164,85 @@ def _section_title(text: str, accent: str = "#1E3A8A") -> str:
     )
 
 
+def _quota_site_block(site, group: Optional[str]) -> str:
+    """渲染一个站点的额度小节：标题行 + 每个模型的单价与可发次数。"""
+    head_right = f"合计 ${site.total_usd:.2f}"
+    if site.accounts:
+        head_right += f" · {site.known}/{site.accounts} 个账号已知余额"
+    warn = ""
+    if not site.complete:
+        # 说清楚这不是全部：有账号没查到余额，总额和次数都是保守下限
+        warn = (
+            "<div style='padding:8px 16px;font-size:11px;color:#92400e;"
+            "background:#fffbeb;'>有账号没查到余额，下面的合计与次数是<b>下限</b>，"
+            "实际可用量更高</div>"
+        )
+
+    rows = site.rows(group)
+    if not rows:
+        body = ("<div style='padding:10px 16px;font-size:12px;color:#94a3b8;'>"
+                "定价表暂不可用，只汇总了余额</div>")
+    else:
+        cells = []
+        for idx, (name, unit, calls) in enumerate(rows):
+            stripe = "background:#ffffff;" if idx % 2 == 0 else "background:#fcfdfe;"
+            cells.append(
+                "<tr>"
+                f"<td style='padding:8px 16px;font-size:12px;color:#334155;"
+                f"border-top:1px solid #f1f5f9;{stripe}'>{_esc(name)}</td>"
+                f"<td style='padding:8px 16px;font-size:12px;color:#64748b;text-align:right;"
+                f"font-variant-numeric:tabular-nums;border-top:1px solid #f1f5f9;{stripe}'>"
+                f"{_esc(unit)}</td>"
+                f"<td style='padding:8px 16px;font-size:13px;color:#1f2937;font-weight:600;"
+                f"text-align:right;font-variant-numeric:tabular-nums;"
+                f"border-top:1px solid #f1f5f9;{stripe}'>{_esc(calls)}</td>"
+                "</tr>"
+            )
+        body = ("<table role='presentation' style='width:100%;border-collapse:collapse;'>"
+                + "".join(cells) + "</table>")
+
+    return (
+        "<div style='margin:12px 0;border:1px solid #e2e8f0;border-radius:8px;"
+        "overflow:hidden;'>"
+        "<div style='padding:10px 16px;background:#f1f5f9;font-size:12px;"
+        "font-weight:700;color:#1e3a8a;'>"
+        f"{_esc(site.label)}"
+        "<span style='float:right;font-weight:600;color:#334155;"
+        f"font-variant-numeric:tabular-nums;'>{_esc(head_right)}</span></div>"
+        + warn + body + "</div>"
+    )
+
+
+def build_quota_overview(site_quotas: list, group: Optional[str] = None) -> str:
+    """邮件底部的额度总览：按站点分组，各站小计 + 每个模型能发多少次，末尾全局合计。
+
+    次数只对「按次计费」的模型成立（New API 的 quota_type=1，model_price 就是每次
+    单价）。按 token 计费的模型没有「一次」的价格，那种只标计费方式，不编数字。
+    """
+    if not site_quotas:
+        return ""
+    blocks = [_quota_site_block(s, group) for s in site_quotas]
+    grand = sum(s.total_usd for s in site_quotas)
+    all_complete = all(s.complete for s in site_quotas)
+    total_line = (
+        "<div style='margin:14px 0 4px;padding:12px 16px;background:#1e3a8a;"
+        "border-radius:8px;color:#ffffff;font-size:13px;font-weight:700;'>"
+        "全部站点合计"
+        "<span style='float:right;font-variant-numeric:tabular-nums;'>"
+        f"${grand:.2f}{'' if all_complete else ' 起'}</span></div>"
+    )
+    note = (
+        "<div style='margin:6px 0 0;font-size:11px;color:#94a3b8;line-height:1.6;'>"
+        "单价与可发次数取自各站点 /api/pricing 的实时数据（每轮重新拉取），"
+        "按默认分组价格计算；只统计模型名含 opus 的模型。</div>"
+    )
+    return _section_title("额度总览（按站点）") + "".join(blocks) + total_line + note
+
+
 def build_report_html(rows: list, *, date_str: str, run_context: str = "GitHub Actions",
                       beijing_time: str = "", dry_run: bool = False,
-                      extra_note: str = "", note_level: str = "info") -> str:
+                      extra_note: str = "", note_level: str = "info",
+                      quota_overview: str = "") -> str:
     """把汇总行渲染成一封好看的 HTML 邮件（Executive Dashboard 风格）。"""
     total = len(rows)
     ok_count = sum(1 for r in rows if r.status in OK_STATUSES)
@@ -325,6 +401,7 @@ def build_report_html(rows: list, *, date_str: str, run_context: str = "GitHub A
     {note_html}
     {_section_title("签到明细", accent="#3b82f6")}
     {table}
+    {quota_overview}
   </div>
 
   <div style="padding:18px 32px 26px;color:#94a3b8;font-size:11px;text-align:center;border-top:1px solid #f1f5f9;letter-spacing:.5px;">
@@ -396,7 +473,7 @@ class EmailNotifier:
 
 def send_report(email_cfg: EmailNotifyConfig, rows: list, *, dry_run: bool = False,
                 run_context: str = "GitHub Actions", extra_note: str = "",
-                note_level: str = "info") -> tuple:
+                note_level: str = "info", quota_overview: str = "") -> tuple:
     """把汇总行拼成主题 + HTML 并发出，返回 (是否发成功, 邮件主题)。
 
     两个调用方共用这一份：一是 Runner 跑完一轮自己发，二是 Actions 分片跑完由汇总
@@ -423,5 +500,6 @@ def send_report(email_cfg: EmailNotifyConfig, rows: list, *, dry_run: bool = Fal
         dry_run=dry_run,
         extra_note=extra_note,
         note_level=note_level,
+        quota_overview=quota_overview,
     )
     return EmailNotifier(email_cfg).send(subject, html), subject

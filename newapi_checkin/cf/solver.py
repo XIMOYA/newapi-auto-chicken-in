@@ -632,8 +632,42 @@ def _checkin_in_page(driver: BrowserDriver, account: Account,
         if result.kind == api.UNKNOWN and status >= 400:
             last = result
             continue
+        if result.kind in (api.SUCCESS, api.ALREADY_DONE):
+            # S4 走到这里说明 HTTP 快路径被盾拦死了，余额只能在页内顺手查一次。
+            # 不查的话这条路的账号在邮件里永远是「-」
+            result.balance = _page_fetch_balance(driver, account, headers)
         return result
     return last
+
+
+def _page_fetch_balance(driver: BrowserDriver, account: Account,
+                        headers: dict) -> Optional[float]:
+    """页内 GET /api/user/self，只为拿 data.quota（账户剩余额度）。
+
+    走的是和签到同一个页内 fetch 通道：同一个浏览器上下文、同一份 cookie 和指纹，
+    刚过的盾也还在，所以这一发几乎不会被拦。
+
+    刻意不读页面 DOM 上那个余额数字：站点是 React SPA，卡片结构和 class 名随前端
+    版本变（chunk 名都带 hash），一次发版就可能读空；data.quota 是后端契约，稳得多。
+
+    任何失败都返回 None —— 余额是邮件里多一列，不能让它影响签到结论。
+    """
+    try:
+        raw = driver.fetch_in_page(account.base_url + SELF_PATH, "GET", dict(headers))
+    except Exception as exc:  # noqa: BLE001 - 页内脚本异常一律降级
+        log.debug(f"页内查余额异常，跳过: {type(exc).__name__}: {exc}")
+        return None
+    if not raw.get("ok"):
+        log.debug(f"页内查余额失败: {str(raw.get('body'))[:120]}")
+        return None
+    status, body, resp_headers, data = _parse_raw(raw)
+    if detect.analyze(status, resp_headers, body).blocked:
+        log.debug("页内查余额被盾拦下，跳过")
+        return None
+    result = api.classify_self(status, data, body[:160])
+    if result.balance is None:
+        log.debug(f"页内 self 未给出余额（{result.kind}: {result.message[:80]}）")
+    return result.balance
 
 
 # --------------------------------------------------------------------------- #
@@ -791,9 +825,14 @@ def _tabiai_checkin_in_page(driver: BrowserDriver, cfg: Config, account: Account
         return None
 
     log.debug(f"页内已换到 Bearer token（user_id={uid}）")
+    # 业务接口只认 Bearer，查余额也走同一副头
+    bearer_headers = {"Accept": "application/json, text/plain, */*",
+                      "Authorization": f"Bearer {token}"}
     if _tabiai_page_already_checked(driver, account, token) is True:
         result = api.ApiResult(api.ALREADY_DONE, message="今日已签到",
                               path=TABIAI_CHECKIN_PATH, user_id=uid)
+        # 已签到这条路奖励额度本来就是空的，余额是额度列唯一能显示的东西
+        result.balance = _page_fetch_balance(driver, account, bearer_headers)
         return SolveOutcome(True, "S4", cf=cf, api_result=result,
                             detail=f"过盾于 {strategy}，页内查得今日已签到")
 
@@ -813,6 +852,8 @@ def _tabiai_checkin_in_page(driver: BrowserDriver, cfg: Config, account: Account
     if result.user_id is None:
         result.user_id = uid
     if result.kind in (api.SUCCESS, api.ALREADY_DONE):
+        # 签到刚成功，余额已经变了，必须现在查才是最新的
+        result.balance = _page_fetch_balance(driver, account, bearer_headers)
         return SolveOutcome(True, "S4", cf=cf, api_result=result,
                             detail=f"过盾于 {strategy}，签到在浏览器上下文内完成")
     if result.kind == api.NETWORK_ERROR:

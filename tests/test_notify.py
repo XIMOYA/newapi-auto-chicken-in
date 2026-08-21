@@ -391,3 +391,53 @@ class TestSendReport:
     def test_info_note_stays_quiet(self, captured):
         nt.send_report(self._cfg(), [make_row()], extra_note="共 3 片已合并")
         assert "#b45309" not in captured["html"]
+
+
+# --------------------------------------------------------------------------- #
+# 额度总览：按站点分组的余额与可发次数
+# --------------------------------------------------------------------------- #
+
+
+class TestQuotaOverview:
+    def _site(self, **kw):
+        from newapi_checkin.pricing import ModelPrice, PricingTable, SiteQuota
+
+        table = PricingTable(
+            models=[ModelPrice("claude-opus-4-8", 1, 0.2),
+                    ModelPrice("claude-opus-5", 1, 0.3)],
+            group_ratio={"default": 1},
+        )
+        base = {"site": "https://gorouter.app", "label": "gorouter.app",
+                "accounts": 2, "known": 2, "total_usd": 17.34, "table": table}
+        base.update(kw)
+        return SiteQuota(**base)
+
+    def test_empty_returns_empty_string(self):
+        assert nt.build_quota_overview([]) == ""
+
+    def test_renders_site_and_calls(self):
+        html = nt.build_quota_overview([self._site()])
+        assert "额度总览" in html and "gorouter.app" in html
+        assert "合计 $17.34" in html
+        assert "86 次" in html and "57 次" in html      # 17.34/0.2、17.34/0.3
+
+    def test_grand_total_across_sites(self):
+        html = nt.build_quota_overview([
+            self._site(), self._site(site="https://tabitoken.com",
+                                     label="tabitoken.com", total_usd=2.0),
+        ])
+        assert "全部站点合计" in html and "$19.34" in html
+
+    def test_incomplete_marks_lower_bound(self):
+        """有账号没查到余额时必须说清这是下限，别让人以为就这么多。"""
+        html = nt.build_quota_overview([self._site(accounts=3, known=2)])
+        assert "下限" in html and "起" in html
+
+    def test_missing_table_still_shows_balance(self):
+        html = nt.build_quota_overview([self._site(table=None)])
+        assert "定价表暂不可用" in html and "$17.34" in html
+
+    def test_overview_lands_in_report(self):
+        html = nt.build_report_html([make_row()], date_str="2026-08-21",
+                                    quota_overview="<div>MARKER</div>")
+        assert "MARKER" in html

@@ -501,7 +501,24 @@ class Runner:
         except Exception as exc:  # noqa: BLE001 - 落盘不能拖垮签到
             log.warn(f"本片结果落盘失败: {type(exc).__name__}: {exc}")
 
+    def _build_quota_overview(self) -> str:
+        """拼邮件底部的额度总览。拉不到定价就返回空串，正文照发。
+
+        定价每轮实时拉（站点会调价），同一站点只拉一次。失败绝不冒泡 —— 少一段总览
+        比丢一封结果邮件强得多。
+        """
+        try:
+            from .notify import build_quota_overview
+            from .pricing import summarize_by_site
+
+            sites = summarize_by_site(self.summary.rows, self.cfg.http)
+            return build_quota_overview(sites)
+        except Exception as exc:  # noqa: BLE001 - 总览是附加信息
+            log.debug(f"额度总览生成失败，本封邮件省略: {type(exc).__name__}: {exc}")
+            return ""
+
     def _send_notification(self) -> None:
+
         """把本轮汇总表以 HTML 邮件发出。未配置/发送失败均降级为 WARN。
 
         Actions 分片并行时这里不发：每片各发一封会把一天的结果拆成好几封邮件，
@@ -520,6 +537,7 @@ class Runner:
                 email_cfg, self.summary.rows,
                 dry_run=self.options.dry_run,
                 run_context="GitHub Actions" if not self.options.manual else "本地/桌面",
+                quota_overview=self._build_quota_overview(),
             )
             if sent:
                 log.ok(f"结果邮件已发送到 {len(email_cfg.to_addrs)} 个收件人: {subject}")
@@ -710,7 +728,8 @@ class Runner:
         # balance/quota_per_unit 照原样带走：这一行只是换个状态和说明，
         # 之前已经查到的额度信息不该在这里丢掉
         return log.SummaryRow(account.name, "skipped", row.strategy, detail, row.quota,
-                              balance=row.balance, quota_per_unit=row.quota_per_unit)
+                              balance=row.balance, quota_per_unit=row.quota_per_unit,
+                              site=row.site or account.base_url)
 
     def _give_up_on_deadline(self, row: log.SummaryRow, shield_rounds: int) -> log.SummaryRow:
         """时间盒耗尽：关掉该账号的全部重试，带着当前结果收工。
@@ -1209,6 +1228,8 @@ class Runner:
                     return api.ApiResult(
                         api.SUCCESS, path=result.path, status=result.status,
                         user_id=result.user_id,
+                        # self 刚查过，余额就在手上，零额外请求就能显示
+                        balance=result.balance,
                         message=f"dry-run 连通正常（id={result.user_id}，未执行签到）",
                     )
 
@@ -1269,4 +1290,5 @@ class Runner:
             balance=result.balance,
             # 换算率跟着行走：几个站点混在一封邮件里时，每行要按自己站点的比例换算
             quota_per_unit=self.store.get(account.slug).quota_per_unit,
+            site=account.base_url,
         )

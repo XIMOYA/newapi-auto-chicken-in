@@ -215,13 +215,31 @@ def _maybe_sync_remote_config(cfg) -> None:
         log.warn(f"远程配置同步异常，继续使用本地配置: {type(exc).__name__}: {exc}")
 
 
+def _merged_quota_overview(cfg, rows: list) -> str:
+    """汇总发信时的额度总览。定价拉不到就返回空串，邮件正文照发。
+
+    分片各自只看得见自己那几个账号，按站点合并余额这件事只能在这里做 —— 这也是
+    汇总 job 存在的意义之一。
+    """
+    from newapi_checkin.notify import build_quota_overview
+    from newapi_checkin.pricing import summarize_by_site
+
+    try:
+        return build_quota_overview(summarize_by_site(rows, cfg.http))
+    except Exception as exc:  # noqa: BLE001 - 总览是附加信息，不能拖垮发信
+        log.debug(f"额度总览生成失败，本封邮件省略: {type(exc).__name__}: {exc}")
+        return ""
+
+
 def _send_merged_report(cfg, directory) -> int:
+
     """把各分片落盘的结果合并成一封邮件发出（Actions 汇总 job 的入口）。
 
     退出码只反映「邮件有没有发出去」：缺片不算这一步的错，缺的那个分片 job 自己
     已经是红的了，这里只负责把缺片写进邮件正文，不再重复报警。
     """
-    from newapi_checkin.notify import send_report
+    from newapi_checkin.notify import build_quota_overview, send_report
+    from newapi_checkin.pricing import summarize_by_site
     from newapi_checkin.shard_report import merge_shard_summaries
 
     merged = merge_shard_summaries(directory)
@@ -250,6 +268,7 @@ def _send_merged_report(cfg, directory) -> int:
         extra_note=merged.note(),
         # 缺片是「上表不是全部账号」，必须显眼；齐了就只是背景说明
         note_level="info" if merged.complete else "warn",
+        quota_overview=_merged_quota_overview(cfg, merged.rows),
     )
     if sent:
         log.ok(f"汇总邮件已发送到 {len(email_cfg.to_addrs)} 个收件人: {subject}")

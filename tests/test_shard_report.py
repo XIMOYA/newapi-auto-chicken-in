@@ -19,9 +19,9 @@ from newapi_checkin.logger import SummaryRow
 
 
 def row(name="A", status="success", strategy="S1", detail="", quota=None,
-        balance=None, quota_per_unit=None):
+        balance=None, quota_per_unit=None, site=""):
     return SummaryRow(name, status, strategy, detail, quota,
-                      balance=balance, quota_per_unit=quota_per_unit)
+                      balance=balance, quota_per_unit=quota_per_unit, site=site)
 
 
 def write(tmp_path, rel, rows, *, shard=None, dry_run=False):
@@ -72,6 +72,13 @@ class TestDump:
         """余额 0 是「没钱了」，不能在序列化时被当成空值丢掉。"""
         write(tmp_path, "s.json", [row(name="A", balance=0)], shard=(1, 1))
         assert sr.merge_shard_summaries(tmp_path).rows[0].balance == 0
+
+    def test_site_survives_round_trip(self, tmp_path):
+        """site 丢了，汇总邮件底部就没法按站点把余额分开算次数。"""
+        write(tmp_path, "s1.json", [row(name="Go", site="https://gorouter.app")], shard=(1, 2))
+        write(tmp_path, "s2.json", [row(name="Tabi", site="https://tabitoken.com")], shard=(2, 2))
+        sites = [r.site for r in sr.merge_shard_summaries(tmp_path).rows]
+        assert sites == ["https://gorouter.app", "https://tabitoken.com"]
 
 
 # --------------------------------------------------------------------------- #

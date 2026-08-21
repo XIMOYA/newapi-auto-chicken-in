@@ -548,7 +548,7 @@ class TestImageCaptcha:
 
 BASE = "https://site.example.com"
 SELF_OK = {"ok": True, "status": 200, "headers": {},
-           "body": '{"success":true,"data":{"id":42,"username":"kiro"}}'}
+           "body": '{"success":true,"data":{"id":42,"username":"kiro","quota":6170000}}'}
 CHECKIN_404 = {"ok": True, "status": 404, "headers": {},
                "body": '{"success":false,"message":"not found"}'}
 CHECKIN_OK = {"ok": True, "status": 200, "headers": {},
@@ -622,16 +622,43 @@ class TestCheckinInPage:
             assert result.kind == api.TURNSTILE_REQUIRED
             result = solver._checkin_in_page(driver, account, token)
         assert result.kind == api.SUCCESS
-        assert page.fetch_calls[-1][1].endswith("?turnstile=token-from-official-widget")
+        # 签到成功后还会页内查一次余额，所以最后一次 fetch 不再是签到，按 URL 找它
+        urls = [u for _, u, _ in page.fetch_calls]
+        assert any(u.endswith("?turnstile=token-from-official-widget") for u in urls)
 
-    def test_known_user_id_skips_self(self, wired):
+    def test_known_user_id_skips_self_before_checkin(self, wired):
+        """user_id 已知就不该为了拿 id 而查 self；签到之后为查余额再请求一次是另一回事。"""
         page = FakePage([NORMAL], fetches=ALL_FETCHES)
         _, account, driver = build(page)
         account.user_id = 42
         with driver:
             result = solver._checkin_in_page(driver, account)
         assert result.kind == api.SUCCESS
-        assert f"{BASE}/api/user/self" not in [u for _, u, _ in page.fetch_calls]
+        urls = [u for _, u, _ in page.fetch_calls]
+        self_url = f"{BASE}/api/user/self"
+        # self 只出现在签到之后（查余额），签到之前一次都没有
+        assert urls.index(self_url) > urls.index(f"{BASE}/api/user/checkin")
+        assert urls.count(self_url) == 1
+
+    def test_balance_attached_in_page(self, wired):
+        """S4 的余额必须页内查出来，否则这条路的账号在邮件里永远是「-」。"""
+        page = FakePage([NORMAL], fetches=ALL_FETCHES)
+        _, account, driver = build(page)
+        account.user_id = 42
+        with driver:
+            result = solver._checkin_in_page(driver, account)
+        assert result.balance == 6170000
+
+    def test_balance_failure_does_not_break_page_checkin(self, wired):
+        """页内查余额失败只让余额缺失，不能把签成功的结论弄坏。"""
+        fetches = dict(ALL_FETCHES)
+        fetches[f"{BASE}/api/user/self"] = {"ok": False, "status": 0, "body": "boom"}
+        page = FakePage([NORMAL], fetches=fetches)
+        _, account, driver = build(page)
+        account.user_id = 42
+        with driver:
+            result = solver._checkin_in_page(driver, account)
+        assert result.kind == api.SUCCESS and result.balance is None
 
     def test_challenge_inside_page_is_reported(self, wired):
         page = FakePage([NORMAL], fetches={f"{BASE}/api/user/self": CF_IN_PAGE})
@@ -783,7 +810,9 @@ class TestSolverRun:
         assert outcome.ok is True
         assert outcome.api_result.kind == api.SUCCESS
         assert outcome.strategy == "S4"
-        assert page.fetch_calls[-1][1].endswith("?turnstile=token-from-mounted-widget")
+        # 签到之后还有一次页内查余额，所以按 URL 找签到那一发而不是取最后一次
+        urls = [u for _, u, _ in page.fetch_calls]
+        assert any(u.endswith("?turnstile=token-from-mounted-widget") for u in urls)
 
     def test_missing_page_token_is_reported_as_failure(self, wired):
         fetches = {
