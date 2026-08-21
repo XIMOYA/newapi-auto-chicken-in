@@ -173,3 +173,121 @@ class TestSummarizeBySite:
             fetcher=self._fetcher({"https://gorouter.app": payload}))[0]
         name, unit, calls = site.rows("default")[0]
         assert "按 token 计费" in unit and calls == "—"
+
+
+class TestProxyFault:
+    """代理的错和别的错要分得开：前者换代理接着来，后者只给有限次数。"""
+
+    def _exc(self, code=None, text="boom"):
+        exc = RuntimeError(text)
+        if code is not None:
+            exc.code = code
+        return exc
+
+    def test_no_proxy_is_never_proxy_fault(self):
+        assert pr.is_proxy_fault(self._exc(7), None) is False
+        assert pr.is_proxy_fault(self._exc(7), "") is False
+
+    @pytest.mark.parametrize("code", [5, 7, 97, 28, 56])
+    def test_network_codes_are_proxy_fault(self, code):
+        assert pr.is_proxy_fault(self._exc(code), "http://1.2.3.4:8080") is True
+
+    def test_text_fallback(self):
+        """老版本 curl_cffi 可能没有 code，报错文本里带 proxy 也算。"""
+        exc = RuntimeError("Failed to connect to x over proxy 1.2.3.4")
+        assert pr.is_proxy_fault(exc, "http://1.2.3.4:8080") is True
+
+    def test_unrelated_error_is_not_proxy_fault(self):
+        assert pr.is_proxy_fault(self._exc(None, "JSON 解析失败"),
+                                 "http://1.2.3.4:8080") is False
+
+
+class TestResilientFetch:
+    def _patch(self, monkeypatch, sequence):
+        """把 _fetch_once 换成按脚本返回的假实现，记录每次用的代理。"""
+        used = []
+
+        def fake(base, http, proxy, mf):
+            used.append(proxy)
+            return sequence.pop(0) if sequence else (None, False)
+
+        monkeypatch.setattr(pr, "_fetch_once", fake)
+        return used
+
+    def _pool(self, items):
+        pool = list(items)
+        marked = []
+
+        def provider(bad=None):
+            if bad:
+                marked.append(bad)
+            return pool.pop(0) if pool else None
+
+        return provider, marked
+
+    def test_success_first_try(self, monkeypatch):
+        self._patch(monkeypatch, [("表", False)])
+        assert pr.fetch_pricing_resilient("https://x.com", None) == "表"
+
+    def test_proxy_fault_swaps_until_pool_dry(self, monkeypatch):
+        """代理问题不限次数 —— 池里掏不出新代理才是终点。"""
+        used = self._patch(monkeypatch, [(None, True)] * 10)
+        provider, marked = self._pool(["p1", "p2", "p3"])
+        assert pr.fetch_pricing_resilient("https://x.com", None,
+                                          proxy_provider=provider) is None
+        assert used == ["p1", "p2", "p3"]      # 三个都试过
+        assert marked == ["p1", "p2", "p3"]    # 且都标了坏
+
+    def test_non_proxy_fault_capped_at_five(self, monkeypatch):
+        used = self._patch(monkeypatch, [(None, False)] * 10)
+        assert pr.fetch_pricing_resilient("https://x.com", None) is None
+        assert len(used) == pr.MAX_NON_PROXY_ATTEMPTS
+
+    def test_custom_cap(self, monkeypatch):
+        used = self._patch(monkeypatch, [(None, False)] * 10)
+        pr.fetch_pricing_resilient("https://x.com", None, max_non_proxy_attempts=2)
+        assert len(used) == 2
+
+    def test_proxy_swaps_do_not_consume_the_cap(self, monkeypatch):
+        """换代理不该吃掉那 5 次非代理配额，否则代理一抖就没机会了。"""
+        seq = [(None, True), (None, True), (None, False), ("表", False)]
+        used = self._patch(monkeypatch, seq)
+        provider, _ = self._pool(["a", "b", "c", "d"])
+        assert pr.fetch_pricing_resilient("https://x.com", None,
+                                          proxy_provider=provider) == "表"
+        assert len(used) == 4
+
+    def test_no_provider_means_direct(self, monkeypatch):
+        used = self._patch(monkeypatch, [(None, True), ("表", False)])
+        # 没有 provider 时代理问题也只能按普通失败算，不会卡死
+        assert pr.fetch_pricing_resilient("https://x.com", None) == "表"
+        assert used == [None, None]
+
+    def test_provider_exception_falls_back_to_direct(self, monkeypatch):
+        used = self._patch(monkeypatch, [("表", False)])
+
+        def boom(bad=None):
+            raise RuntimeError("池挂了")
+
+        assert pr.fetch_pricing_resilient("https://x.com", None,
+                                          proxy_provider=boom) == "表"
+        assert used == [None]
+
+    def test_same_proxy_returned_stops_loop(self, monkeypatch):
+        """provider 一直返回同一个代理时必须停，不能原地打转。"""
+        self._patch(monkeypatch, [(None, True)] * 10)
+        assert pr.fetch_pricing_resilient("https://x.com", None,
+                                          proxy_provider=lambda bad=None: "same") is None
+
+    def test_summarize_passes_proxy_provider_through(self, monkeypatch):
+        """定价请求必须带上代理，否则 Actions 的机房 IP 很容易被盾挡在门外。"""
+        seen = {}
+
+        def fake(base, http_cfg, *, proxy_provider=None, model_filter=None):
+            seen["provider"] = proxy_provider
+            return None
+
+        monkeypatch.setattr(pr, "fetch_pricing_resilient", fake)
+        provider = lambda bad=None: "http://1.2.3.4:8080"  # noqa: E731
+        pr.summarize_by_site([row("A", balance=1)], None, proxy_provider=provider)
+        assert seen["provider"] is provider

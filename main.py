@@ -215,6 +215,35 @@ def _maybe_sync_remote_config(cfg) -> None:
         log.warn(f"远程配置同步异常，继续使用本地配置: {type(exc).__name__}: {exc}")
 
 
+def _pricing_proxy_provider(cfg):
+    """汇总发信时拉定价用的取代理回调。
+
+    这一步跑在独立的 notify job 里，没有签到时那份已 refresh 的代理池，所以自己
+    建一个。只要少量代理够用（定价接口每个站点就拉一次），desired 给小值免得为了
+    一封邮件把整池探一遍。代理池没启用或一个都探不到就返回 None，直连去拉。
+    """
+    pool_cfg = getattr(cfg, "proxy_pool", None)
+    if pool_cfg is None or not getattr(pool_cfg, "enabled", False):
+        return None
+    try:
+        from newapi_checkin.proxy_pool import ProxyPool
+
+        pool = ProxyPool(pool_cfg)
+        if pool.refresh(desired=5) <= 0:
+            log.debug("代理池没探到可用代理，定价表改为直连拉取")
+            return None
+    except Exception as exc:  # noqa: BLE001 - 代理是可降级项
+        log.debug(f"汇总发信初始化代理池失败，改直连: {type(exc).__name__}: {exc}")
+        return None
+
+    def provider(bad=None):
+        if bad:
+            pool.mark_bad(bad, "net")
+        return pool.acquire()
+
+    return provider
+
+
 def _merged_quota_overview(cfg, rows: list) -> str:
     """汇总发信时的额度总览。定价拉不到就返回空串，邮件正文照发。
 
@@ -225,7 +254,9 @@ def _merged_quota_overview(cfg, rows: list) -> str:
     from newapi_checkin.pricing import summarize_by_site
 
     try:
-        return build_quota_overview(summarize_by_site(rows, cfg.http))
+        sites = summarize_by_site(rows, cfg.http,
+                                  proxy_provider=_pricing_proxy_provider(cfg))
+        return build_quota_overview(sites)
     except Exception as exc:  # noqa: BLE001 - 总览是附加信息，不能拖垮发信
         log.debug(f"额度总览生成失败，本封邮件省略: {type(exc).__name__}: {exc}")
         return ""

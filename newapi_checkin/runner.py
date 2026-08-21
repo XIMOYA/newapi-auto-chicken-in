@@ -501,6 +501,23 @@ class Runner:
         except Exception as exc:  # noqa: BLE001 - 落盘不能拖垮签到
             log.warn(f"本片结果落盘失败: {type(exc).__name__}: {exc}")
 
+    def _pricing_proxy_provider(self):
+        """给拉定价表用的取代理回调。没有代理池就返回 None（直连）。
+
+        签到已经把池 refresh 过了，这里直接领现成的，不额外触发探测。
+        代理坏了就 mark_bad 再领下一个 —— 和签到失败换 IP 走同一套账本，
+        坏代理的反馈最后会一起回传给平台优选。
+        """
+        if self._pool is None:
+            return None
+
+        def provider(bad: Optional[str] = None) -> Optional[str]:
+            if bad:
+                self._pool.mark_bad(bad, "net")
+            return self._pool.acquire()
+
+        return provider
+
     def _build_quota_overview(self) -> str:
         """拼邮件底部的额度总览。拉不到定价就返回空串，正文照发。
 
@@ -511,7 +528,8 @@ class Runner:
             from .notify import build_quota_overview
             from .pricing import summarize_by_site
 
-            sites = summarize_by_site(self.summary.rows, self.cfg.http)
+            sites = summarize_by_site(self.summary.rows, self.cfg.http,
+                                      proxy_provider=self._pricing_proxy_provider())
             return build_quota_overview(sites)
         except Exception as exc:  # noqa: BLE001 - 总览是附加信息
             log.debug(f"额度总览生成失败，本封邮件省略: {type(exc).__name__}: {exc}")

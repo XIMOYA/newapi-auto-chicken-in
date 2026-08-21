@@ -32,6 +32,48 @@ QUOTA_TYPE_PER_CALL = 1
 QUOTA_TYPE_PER_TOKEN = 0
 # 默认只关心 opus 系列。匹配模型名的子串，不区分大小写
 DEFAULT_MODEL_FILTER = ("opus",)
+# 非代理原因失败时最多重试几次。代理原因不受这个数限制，换一个继续
+MAX_NON_PROXY_ATTEMPTS = 5
+
+
+def _proxy_error_codes() -> frozenset:
+    """带代理时基本都指向代理本身的 libcurl 错误码。
+
+    用 CurlECode 常量而不是写死数字：版本升级时数字可能变，名字不会。取不到
+    常量表（老版本 curl_cffi）就退回空集合，那时只靠错误信息里的关键词判断。
+    """
+    try:
+        from curl_cffi.const import CurlECode as C
+    except Exception:  # noqa: BLE001 - 拿不到就降级
+        return frozenset()
+    names = ("COULDNT_RESOLVE_PROXY", "COULDNT_CONNECT", "PROXY", "SEND_ERROR",
+             "RECV_ERROR", "SSL_CONNECT_ERROR", "OPERATION_TIMEDOUT",
+             "GOT_NOTHING", "PARTIAL_FILE", "NO_CONNECTION_AVAILABLE")
+    return frozenset(int(getattr(C, n)) for n in names if hasattr(C, n))
+
+
+_PROXY_ERROR_CODES = _proxy_error_codes()
+
+
+def is_proxy_fault(exc: Exception, proxy: Optional[str]) -> bool:
+    """这次失败该不该记在代理头上。
+
+    判定口径：没走代理就一定不是代理的错。走了代理时，网络层错误（解析不到代理、
+    连不上、隧道建不起来、传输被打断、超时）都算代理问题 —— 从客户端分不清
+    「代理死了」和「目标站不通」，而带代理时前者概率高得多。目标站自己的问题会
+    表现成 HTTP 状态码或非 JSON 响应，压根走不到这个异常分支。
+    """
+    if not proxy:
+        return False
+    code = getattr(exc, "code", None)
+    if code is not None:
+        try:
+            if int(code) in _PROXY_ERROR_CODES:
+                return True
+        except (TypeError, ValueError):
+            pass
+    # 兜底看错误文本：curl 的报错里带代理时会明确写 over proxy / proxy CONNECT
+    return "proxy" in f"{exc}".lower()
 
 
 @dataclass
@@ -141,9 +183,19 @@ def fetch_pricing(base_url: str, http_cfg, proxy: Optional[str] = None,
     接口不需要鉴权，但裸请求会吃 Cloudflare 的闭门羹，所以照 S1 那套带上
     impersonate 指纹。代理跟着账号走：站点可能只对特定出口 IP 放行。
     """
+    table, _fault = _fetch_once(base_url, http_cfg, proxy, model_filter)
+    return table
+
+
+def _fetch_once(base_url: str, http_cfg, proxy: Optional[str],
+                model_filter) -> tuple:
+    """拉一次，返回 (定价表或 None, 是否算代理的错)。
+
+    第二个返回值决定上层怎么重试：代理的错换个代理接着来，别的错只给有限次数。
+    """
     base = (base_url or "").rstrip("/")
     if not base:
-        return None
+        return None, False
     try:
         with cffi.Session(
             impersonate=getattr(http_cfg, "impersonate", None) or "chrome",
@@ -156,20 +208,68 @@ def fetch_pricing(base_url: str, http_cfg, proxy: Optional[str] = None,
                 "Referer": sanitize_header_value(base + "/"),
             })
     except Exception as exc:  # noqa: BLE001 - 拉定价失败只影响总览那一段
-        log.debug(f"拉定价表失败 {base}: {type(exc).__name__}: {exc}")
-        return None
+        fault = is_proxy_fault(exc, proxy)
+        log.debug(f"拉定价表失败 {base}（{'代理问题' if fault else '非代理问题'}）: "
+                  f"{type(exc).__name__}: {exc}")
+        return None, fault
 
     if resp.status_code != 200:
         log.debug(f"拉定价表 {base} 返回 HTTP {resp.status_code}")
-        return None
+        return None, False
     try:
         payload = resp.json()
     except Exception as exc:  # noqa: BLE001 - 被盾拦时返回的是 HTML
         log.debug(f"定价表 {base} 不是 JSON: {type(exc).__name__}: {exc}")
-        return None
+        return None, False
     table = parse_pricing(payload, model_filter)
-    log.debug(f"定价表 {base}: 命中 {len(table.models)} 个模型")
-    return table
+    log.debug(f"定价表 {base}: 命中 {len(table.models)} 个模型"
+              + (f"（经 {proxy}）" if proxy else "（直连）"))
+    return table, False
+
+
+def fetch_pricing_resilient(base_url: str, http_cfg, *, proxy_provider=None,
+                            max_non_proxy_attempts: int = MAX_NON_PROXY_ATTEMPTS,
+                            model_filter=DEFAULT_MODEL_FILTER) -> Optional[PricingTable]:
+    """带重试地拉定价表。
+
+    两种失败分开对待：
+      - 代理的错：换一个代理接着来，不计次数。池里掏不出新代理时自然停下 ——
+        代理是有限的，这就是「无限更换」的天然终点。
+      - 别的错（HTTP 非 200、非 JSON、被盾、解析不出模型）：最多 max_non_proxy_attempts
+        次。这类错换代理也大概率一样，多试只是浪费时间。
+
+    proxy_provider(bad=None) -> Optional[str]：给 None 表示要个可用代理，给 bad
+    表示这个代理不行了、标坏并换一个。传 None 就是不走代理直连。
+    """
+    proxy = None
+    if proxy_provider is not None:
+        try:
+            proxy = proxy_provider()
+        except Exception as exc:  # noqa: BLE001 - 拿不到代理就直连试试
+            log.debug(f"取定价请求用的代理失败，改直连: {type(exc).__name__}: {exc}")
+
+    swaps, others = 0, 0
+    while True:
+        table, proxy_fault = _fetch_once(base_url, http_cfg, proxy, model_filter)
+        if table is not None:
+            return table
+        if proxy_fault and proxy_provider is not None:
+            try:
+                new_proxy = proxy_provider(proxy)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(f"换代理失败，停止重试: {type(exc).__name__}: {exc}")
+                return None
+            if not new_proxy or new_proxy == proxy:
+                log.debug(f"拉 {base_url} 的定价表：池里已无其他可用代理，放弃")
+                return None
+            swaps += 1
+            proxy = new_proxy
+            log.debug(f"拉定价表换用代理 {new_proxy}（第 {swaps} 次更换）")
+            continue
+        others += 1
+        if others >= max_non_proxy_attempts:
+            log.debug(f"拉 {base_url} 的定价表失败 {others} 次（非代理原因），放弃")
+            return None
 
 
 @dataclass
@@ -217,18 +317,21 @@ def _site_label(base_url: str) -> str:
 
 
 def summarize_by_site(rows: list, http_cfg, *, model_filter=DEFAULT_MODEL_FILTER,
-                      fetcher=None) -> list:
+                      fetcher=None, proxy_provider=None) -> list:
     """按站点把余额并起来，并为每个站点实时拉一次定价表。
 
     定价每轮都重新拉：站点随时可能调价，拿旧价格算出来的次数是假的。同一站点的多个
     账号只拉一次（域名去重），不会因为账号多而重复打接口。
 
-    fetcher 参数是给测试注入假实现用的，默认走真实 fetch_pricing。
+    proxy_provider 透传给 fetch_pricing_resilient：定价接口和签到一样吃 Cloudflare，
+    走代理能显著提高成功率，代理坏了就换一个接着来。
+
+    fetcher 参数是给测试注入假实现用的，默认走带重试的真实拉取。
     """
     from .config import DEFAULT_QUOTA_PER_UNIT
 
-    fetch = fetcher or (lambda base: fetch_pricing(base, http_cfg,
-                                                   model_filter=model_filter))
+    fetch = fetcher or (lambda base: fetch_pricing_resilient(
+        base, http_cfg, proxy_provider=proxy_provider, model_filter=model_filter))
     buckets: dict = {}
     for r in rows:
         site = (getattr(r, "site", "") or "").rstrip("/")
