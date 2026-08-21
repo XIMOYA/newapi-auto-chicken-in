@@ -166,7 +166,7 @@ def _section_title(text: str, accent: str = "#1E3A8A") -> str:
 
 def build_report_html(rows: list, *, date_str: str, run_context: str = "GitHub Actions",
                       beijing_time: str = "", dry_run: bool = False,
-                      extra_note: str = "") -> str:
+                      extra_note: str = "", note_level: str = "info") -> str:
     """把汇总行渲染成一封好看的 HTML 邮件（Executive Dashboard 风格）。"""
     total = len(rows)
     ok_count = sum(1 for r in rows if r.status in OK_STATUSES)
@@ -291,10 +291,22 @@ def build_report_html(rows: list, *, date_str: str, run_context: str = "GitHub A
             f"<b>需要关注</b>：{names}{more} 未能成功签到，请查看运行日志排查。</div>"
         )
 
-    note_html = (
-        f"<div style='margin:14px 0;padding:10px 14px;background:#f8fafc;border-radius:6px;"
-        f"font-size:12px;color:#64748b;'>{_esc(extra_note)}</div>" if extra_note else ""
-    )
+    # extra_note 分两档：info 是灰色小字（"由 3 个分片合并"这类背景说明），
+    # warn 是橙色警示块（缺片这类「上表不是全部账号」的情况）。缺片用灰字太容易被
+    # 划过去，而那恰恰是最需要被看见的一行。
+    if not extra_note:
+        note_html = ""
+    elif note_level == "warn":
+        note_html = (
+            "<div style='margin:16px 0;padding:12px 16px;background:#fffbeb;"
+            "border-left:4px solid #b45309;border-radius:6px;font-size:13px;"
+            f"color:#92400e;line-height:1.6;'>{_esc(extra_note)}</div>"
+        )
+    else:
+        note_html = (
+            "<div style='margin:14px 0;padding:10px 14px;background:#f8fafc;"
+            f"border-radius:6px;font-size:12px;color:#64748b;'>{_esc(extra_note)}</div>"
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -378,3 +390,36 @@ class EmailNotifier:
                 server.quit()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def send_report(email_cfg: EmailNotifyConfig, rows: list, *, dry_run: bool = False,
+                run_context: str = "GitHub Actions", extra_note: str = "",
+                note_level: str = "info") -> tuple:
+    """把汇总行拼成主题 + HTML 并发出，返回 (是否发成功, 邮件主题)。
+
+    两个调用方共用这一份：一是 Runner 跑完一轮自己发，二是 Actions 分片跑完由汇总
+    入口合并各片结果统一发。主题规则、KPI 口径、模板都只有一份实现，不会出现两条
+    路发出来的邮件长得不一样。
+
+    主题一并返回是为了让调用方把它写进日志 —— 排查「邮件到底发出去没有」时，
+    日志里的主题能直接和收件箱对照。未配置 enabled 时返回 (False, "")，
+    那是「没开这个功能」，不是失败。
+    """
+    if not email_cfg.enabled:
+        return False, ""
+    now = beijing_now()
+    failed = sum(1 for r in rows if r.status not in OK_STATUSES and r.status != "skipped")
+    subject = build_subject(
+        email_cfg.subject_prefix, now.strftime(_DATE_FORMAT),
+        failed_count=failed, dry_run=dry_run,
+    )
+    html = build_report_html(
+        rows,
+        date_str=now.strftime(_DATE_FORMAT),
+        run_context=run_context,
+        beijing_time=now.strftime("%Y-%m-%d %H:%M"),
+        dry_run=dry_run,
+        extra_note=extra_note,
+        note_level=note_level,
+    )
+    return EmailNotifier(email_cfg).send(subject, html), subject

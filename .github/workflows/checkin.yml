@@ -238,10 +238,25 @@ jobs:
         # 账号名不经 job output 传递 —— 它来自 secret 解出的配置，GitHub 会判定 output
         # 「可能含 secret」而整个跳过，下游 fromJson('') 直接报错。所以这里只传序号，
         # 名单由客户端按同一规则自己切（连续块，各片不重叠且覆盖全部）。
+        #
+        # --summary-out 让本片把结果写成 JSON 而**不自己发邮件**：几片各发一封会把
+        # 一天的结果拆成好几封信，改由下面的 notify job 合并成一封。
         run: |
           python main.py --headless --parallel 6 --browser-parallel 3 -v \
             --shard "${{ matrix.shard }}/${{ needs.plan.outputs.total }}" \
+            --summary-out "data/summary/shard-${{ matrix.shard }}.json" \
             ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      # always()：签到步骤失败（有账号没签上、退出码非 0）时结果照样要进汇总邮件。
+      # 只有分片本身被跳过时才不上传 —— 那种 job 压根没跑，没有结果可言。
+      - name: 上传本片结果（供汇总发信）
+        if: ${{ always() && matrix.shard <= fromJson(needs.plan.outputs.total || '0') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkin-summary-${{ matrix.shard }}
+          path: data/summary
+          if-no-files-found: warn
+          retention-days: 3
 
       - name: 上传排障截图与页面快照（仅失败时）
         if: failure()
@@ -252,3 +267,70 @@ jobs:
           path: data/shots
           if-no-files-found: ignore
           retention-days: 7
+
+  # ---------------------------------------------------------------------- #
+  # 第三段：把各分片的结果合并成一封邮件
+  #
+  # 单独开一个 job 而不是让某一片发信：任何一片都只看得见自己那几个账号，
+  # 谁来发都是残缺的。分片结果只能走 artifact 传 —— job output 里带账号名会被
+  # GitHub 判「可能含 secret」而整个跳过（matrix 就是这么踩过坑的）。
+  # ---------------------------------------------------------------------- #
+  notify:
+    needs: [plan, checkin]
+    # always()：有分片失败时更需要这封信。plan 都没跑出账号时才真的没必要发
+    if: ${{ always() && needs.plan.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    name: 汇总发信
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # 装的还是那份 requirements-ci.txt：main.py 顶层就 import 了 runner，
+      # 只为发信单开一份精简依赖清单不值得，pip 缓存命中后这步很快。
+      - name: 安装 Python 依赖
+        run: pip install -r requirements-ci.txt
+
+      # continue-on-error：所有分片都没上传成功时这步会报 no artifacts found，
+      # 但那种情况下面的发信步骤自己会打印「没有可汇总的结果」并正常退出，
+      # 不该让整个 job 卡死在下载上。
+      - name: 下载各分片结果
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: checkin-summary-*
+          path: data/summary-merged
+
+      - name: 写入配置（来自 GitHub Secrets）
+        env:
+          CONFIG_JSON_B64: ${{ secrets.CONFIG_JSON_B64 }}
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+        run: |
+          if [ -n "$CONFIG_JSON_B64" ]; then
+            printf '%s' "$CONFIG_JSON_B64" | base64 --decode > config.json
+            CONFIG_SOURCE="CONFIG_JSON_B64"
+          elif [ -n "$CONFIG_JSON" ]; then
+            printf '%s' "$CONFIG_JSON" > config.json
+            CONFIG_SOURCE="CONFIG_JSON（兼容旧配置，建议迁移到 CONFIG_JSON_B64）"
+          else
+            echo "::error::未设置 CONFIG_JSON_B64 secret。请添加完整 config.json 的 base64 文本；旧 CONFIG_JSON 仍兼容"
+            exit 2
+          fi
+          python - "$CONFIG_SOURCE" <<'PY'
+          import json, pathlib, sys
+          path = pathlib.Path("config.json")
+          raw = path.read_text(encoding="utf-8")
+          json.loads(raw)  # 先校验是合法 JSON，避免写入坏配置
+          print(f"config.json 已写入（来源 {sys.argv[1]}，校验通过）")
+          PY
+
+      # 缺片不会让这步失败，只会写进邮件正文；真正失败只有「邮件没发出去」。
+      # download-artifact 会按 artifact 名各套一层目录，--send-summary 是递归读的。
+      - name: 合并各分片结果并发一封邮件
+        run: python main.py --send-summary data/summary-merged -v

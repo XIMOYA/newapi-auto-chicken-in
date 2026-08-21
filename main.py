@@ -12,6 +12,8 @@
     python main.py --parallel 6       账号级并行度（自动签到固定 6，人工模式 1）
     python main.py --browser-parallel 3   浏览器实例并发上限（自动签到固定 3）
     python main.py --shard-plan 30    只算分片名单：每 30 个账号一片，写 data/shard-plan.json
+    python main.py --summary-out data/summary/shard-1.json  本片结果落盘，且不自己发邮件
+    python main.py --send-summary data/summary   合并各片结果，只发一封汇总邮件
     python main.py -v                 详细日志
 
 退出码：0 全部成功 / 1 有失败 / 2 配置错误 / 130 被中断
@@ -54,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="本进程是第 I 个分片（共 N 片）：只跑分到自己名下的那批账号，"
              "并只向平台领属于本片的代理。几个 job 并行时用它切分，"
              "避免重复签到与同一出口 IP 被多个账号共用",
+    )
+    parser.add_argument(
+        "--summary-out", metavar="PATH",
+        help="签到完把本片汇总结果写成 JSON 到 PATH，并且**不再由本进程发邮件**；"
+             "配合 --send-summary 让多个分片只发一封合并后的邮件",
+    )
+    parser.add_argument(
+        "--send-summary", metavar="DIR",
+        help="不签到：递归读 DIR 下各分片的结果 JSON，合并成一封邮件发出。"
+             "缺片会在邮件里明确标注，不会静默少人",
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="只验证当前登录方式的凭据与连通性，不执行签到")
@@ -203,6 +215,49 @@ def _maybe_sync_remote_config(cfg) -> None:
         log.warn(f"远程配置同步异常，继续使用本地配置: {type(exc).__name__}: {exc}")
 
 
+def _send_merged_report(cfg, directory) -> int:
+    """把各分片落盘的结果合并成一封邮件发出（Actions 汇总 job 的入口）。
+
+    退出码只反映「邮件有没有发出去」：缺片不算这一步的错，缺的那个分片 job 自己
+    已经是红的了，这里只负责把缺片写进邮件正文，不再重复报警。
+    """
+    from newapi_checkin.notify import send_report
+    from newapi_checkin.shard_report import merge_shard_summaries
+
+    merged = merge_shard_summaries(directory)
+    if not merged.rows:
+        log.warn("没有任何可汇总的账号结果，跳过发信")
+        return 0
+
+    # 汇总日志里也打一遍完整表格：邮件万一发失败，结果还能在 Actions 日志里查到
+    summary = log.Summary()
+    summary.rows.extend(merged.rows)
+    summary.render()
+    if merged.complete:
+        log.ok(f"已合并 {merged.expected} 个分片、共 {len(merged.rows)} 个账号的结果")
+    else:
+        log.warn(f"预期 {merged.expected} 片，实到 {len(merged.present)} 片"
+                 f"（缺第 {'、'.join(str(i) for i in merged.missing)} 片）")
+
+    email_cfg = cfg.notify.email
+    if not email_cfg.enabled:
+        log.warn("邮件通知未启用（notify.email.enabled=false），只打印汇总不发信")
+        return 0
+    sent, subject = send_report(
+        email_cfg, merged.rows,
+        dry_run=merged.dry_run,
+        run_context="GitHub Actions",
+        extra_note=merged.note(),
+        # 缺片是「上表不是全部账号」，必须显眼；齐了就只是背景说明
+        note_level="info" if merged.complete else "warn",
+    )
+    if sent:
+        log.ok(f"汇总邮件已发送到 {len(email_cfg.to_addrs)} 个收件人: {subject}")
+        return 0
+    log.err("汇总邮件发送失败")
+    return 1
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     log.setup(verbose=args.verbose, log_dir=LOGS_DIR)
@@ -236,6 +291,11 @@ def main(argv=None) -> int:
     # 分片计划：只算名单不签到，放在远程同步之后，保证与真正开跑时看到的是同一份账号
     if args.shard_plan is not None:
         return _write_shard_plan(cfg, args, args.shard_plan)
+
+    # 汇总发信：只读各片落盘的结果拼一封邮件，不签到也不碰浏览器。
+    # 同样放在远程同步之后 —— SMTP 配置也可能是从远程配置平台拉下来的
+    if args.send_summary:
+        return _send_merged_report(cfg, args.send_summary)
 
     # 按分片挑出本进程该跑的账号。放在远程同步之后：平台上刚加的账号要能被切进来
     shard_names = None
@@ -295,6 +355,7 @@ def main(argv=None) -> int:
         parallelism_explicit=args.parallel is not None and not args.manual,
         browser_parallelism=args.browser_parallel or 0,
         proxy_shard=shard,
+        summary_out=args.summary_out,
     )
 
     try:

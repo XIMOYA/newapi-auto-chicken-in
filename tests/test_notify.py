@@ -274,3 +274,63 @@ class TestNotifierSend:
                                    username="u", password="p", from_addr="f", to_addrs=["t"])
         assert nt.EmailNotifier(cfg).send("s", "html") is True
         assert used_starttls == [True]
+
+
+# --------------------------------------------------------------------------- #
+# send_report：Runner 和 Actions 汇总 job 共用的那一份组装+发送入口
+# --------------------------------------------------------------------------- #
+
+
+class TestSendReport:
+    def _cfg(self, enabled=True):
+        return nt.EmailNotifyConfig(
+            enabled=enabled, smtp_host="smtp.aliyun.com", smtp_port=465, use_ssl=True,
+            username="u", password="p", from_addr="f@aliyun.com", to_addrs=["t@qq.com"],
+        )
+
+    @pytest.fixture()
+    def captured(self, monkeypatch):
+        """截下最终要发的主题与 HTML，不碰 smtplib。"""
+        box = {}
+
+        def fake_send(self, subject, html):
+            box["subject"], box["html"] = subject, html
+            return True
+
+        monkeypatch.setattr(nt.EmailNotifier, "send", fake_send)
+        return box
+
+    def test_disabled_is_not_a_failure(self, captured):
+        assert nt.send_report(self._cfg(enabled=False), [make_row()]) == (False, "")
+        assert captured == {}
+
+    def test_returns_subject_for_logging(self, captured):
+        sent, subject = nt.send_report(self._cfg(), [make_row()])
+        assert sent is True
+        assert subject == captured["subject"] and subject
+
+    def test_failed_rows_mark_subject(self, captured):
+        _, subject = nt.send_report(self._cfg(), [make_row(status="failed")])
+        assert subject.startswith("[失败] ")
+
+    def test_skipped_is_not_counted_as_failure(self, captured):
+        """跳过不算失败，主题不该挂 [失败]（与 Summary.failed 口径一致）。"""
+        _, subject = nt.send_report(self._cfg(), [make_row(status="skipped")])
+        assert not subject.startswith("[失败] ")
+
+    def test_dry_run_marks_subject(self, captured):
+        _, subject = nt.send_report(self._cfg(), [make_row()], dry_run=True)
+        assert "连通性检查" in subject
+
+    def test_extra_note_lands_in_html(self, captured):
+        nt.send_report(self._cfg(), [make_row()], extra_note="缺第 2 片")
+        assert "缺第 2 片" in captured["html"]
+
+    def test_warn_note_uses_amber_block(self, captured):
+        """缺片提示要走橙色警示块，灰色小字会被划过去。"""
+        nt.send_report(self._cfg(), [make_row()], extra_note="缺第 2 片", note_level="warn")
+        assert "#fffbeb" in captured["html"] and "border-left:4px solid #b45309" in captured["html"]
+
+    def test_info_note_stays_quiet(self, captured):
+        nt.send_report(self._cfg(), [make_row()], extra_note="共 3 片已合并")
+        assert "#b45309" not in captured["html"]

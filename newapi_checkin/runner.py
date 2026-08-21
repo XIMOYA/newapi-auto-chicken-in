@@ -96,6 +96,9 @@ class RunOptions:
     # proxy_shard = (序号, 总片数)，1-based。Actions 分片并行时透传给平台，让每个 job
     # 只拿属于自己的那份代理，几个 job 之间不会把同一个出口 IP 同时分给不同账号
     proxy_shard: Optional[tuple] = None
+    # 本片汇总结果的落盘路径。给值就写 JSON 并且**不再自己发邮件** —— Actions 分片
+    # 并行时各片都发会把一天的结果拆成好几封，改由汇总 job 读齐所有片发一封
+    summary_out: Optional[str] = None
 
 
 class Runner:
@@ -370,6 +373,9 @@ class Runner:
                 log.info(f"账号级并行度 {workers}，浏览器并发上限 {browser_workers}")
                 exit_code = self._run_parallel(accounts, workers)
 
+            # 分片结果落盘：给汇总 job 合并成一封邮件用。放在发信之前，且写失败只
+            # WARN —— 这一轮真正的产出是签到本身，不能让一个写文件的错抹掉它
+            self._dump_summary()
             # 邮件通知：无论成败都发；失败只 WARN 不影响退出码
             self._send_notification()
             return exit_code
@@ -476,29 +482,46 @@ class Runner:
         except Exception:  # noqa: BLE001 - 取不到主机名无所谓
             return "签到客户端"
 
+    def _dump_summary(self) -> None:
+        """把本片汇总行写成 JSON，交给 Actions 汇总 job 合并后统一发信。
+
+        落盘失败只 WARN：汇总那边会把「预期 N 片、实到 M 片」写进邮件，缺的片一眼
+        能看出来，比在这里抛异常把整轮搞挂要好。
+        """
+        if not self.options.summary_out:
+            return
+        try:
+            from .shard_report import dump_shard_summary
+
+            path = dump_shard_summary(
+                self.options.summary_out, self.summary.rows,
+                shard=self.options.proxy_shard, dry_run=self.options.dry_run,
+            )
+            log.ok(f"本片 {len(self.summary.rows)} 条结果已写入 {path}")
+        except Exception as exc:  # noqa: BLE001 - 落盘不能拖垮签到
+            log.warn(f"本片结果落盘失败: {type(exc).__name__}: {exc}")
+
     def _send_notification(self) -> None:
-        """把本轮汇总表以 HTML 邮件发出。未配置/发送失败均降级为 WARN。"""
+        """把本轮汇总表以 HTML 邮件发出。未配置/发送失败均降级为 WARN。
+
+        Actions 分片并行时这里不发：每片各发一封会把一天的结果拆成好几封邮件，
+        改由 --summary-out 落盘、汇总 job 合并后统一发一封（见 shard_report）。
+        """
         email_cfg = self.cfg.notify.email
         if not email_cfg.enabled:
             return
+        if self.options.summary_out:
+            log.info("本片结果已落盘，邮件交由汇总步骤统一发送")
+            return
         try:
-            from .notify import EmailNotifier, beijing_now, build_report_html, build_subject
+            from .notify import send_report
 
-            date_str = beijing_now().strftime("%Y-%m-%d")
-            beijing_time = beijing_now().strftime("%Y-%m-%d %H:%M")
-            subject = build_subject(
-                email_cfg.subject_prefix, date_str,
-                failed_count=self.summary.failed, dry_run=self.options.dry_run,
-            )
-            html = build_report_html(
-                self.summary.rows,
-                date_str=date_str,
-                run_context="GitHub Actions" if not self.options.manual else "本地/桌面",
-                beijing_time=beijing_time,
+            sent, subject = send_report(
+                email_cfg, self.summary.rows,
                 dry_run=self.options.dry_run,
+                run_context="GitHub Actions" if not self.options.manual else "本地/桌面",
             )
-            notifier = EmailNotifier(email_cfg)
-            if notifier.send(subject, html):
+            if sent:
                 log.ok(f"结果邮件已发送到 {len(email_cfg.to_addrs)} 个收件人: {subject}")
             else:
                 log.warn("结果邮件发送失败（已降级，不影响签到结果）")
