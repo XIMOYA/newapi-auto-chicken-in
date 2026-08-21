@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -398,6 +399,7 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (aliveCount 
 		wg.Add(1)
 		go func(idx int, s string) {
 			defer wg.Done()
+			defer recoverPanic("代理源抓取")
 			perSource[idx] = fetchSource(s, timeout)
 		}(i, src)
 	}
@@ -477,6 +479,7 @@ dispatch:
 		wg2.Add(1)
 		go func(it item) {
 			defer wg2.Done()
+			defer recoverPanic("代理测通")
 			defer func() { <-sem }()
 			// 抢到名额到真正开工之间，可能有别的 goroutine 已把 alive 推到
 			// saveLimit 并置位 stop：此时立即退出并归还名额，别让「达标即停」失效
@@ -827,6 +830,7 @@ func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout in
 		wg.Add(1)
 		go func(e ProxyEntry) {
 			defer wg.Done()
+			defer recoverPanic("代理测速")
 			defer func() { <-sem }()
 			if ctx.Err() != nil {
 				return
@@ -897,6 +901,54 @@ func (m *ProxyManager) AvailableAddrs(limit int) []string {
 	out := make([]string, 0, len(entries))
 	for _, e := range entries {
 		out = append(out, e.Addr)
+	}
+	return out
+}
+
+/*
+parseShardParam 解析 ?shard=I/N。空串表示不分片，返回 (0, 0, nil)。
+
+格式故意做窄：只认 `正整数/正整数`，不接受负数、小数、空段。参数写错时宁可报错也不
+静默当作不分片 —— 客户端会以为自己拿到的是独占的一批代理，实际上和别的 job 撞了，
+这种错要在第一次调用就暴露出来。
+*/
+func parseShardParam(raw string) (int, int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, 0, nil
+	}
+	left, right, found := strings.Cut(raw, "/")
+	if !found {
+		return 0, 0, fmt.Errorf("shard 需要 I/N 形式，收到 %q", raw)
+	}
+	index, err1 := strconv.Atoi(strings.TrimSpace(left))
+	total, err2 := strconv.Atoi(strings.TrimSpace(right))
+	if err1 != nil || err2 != nil {
+		return 0, 0, fmt.Errorf("shard 的两段都必须是整数，收到 %q", raw)
+	}
+	if total < 1 {
+		return 0, 0, fmt.Errorf("shard 的总片数必须 >= 1，收到 %d", total)
+	}
+	if index < 1 || index > total {
+		return 0, 0, fmt.Errorf("shard 的序号必须在 1..%d 之间，收到 %d", total, index)
+	}
+	return index, total, nil
+}
+
+/*
+shardAddrs 按轮转取第 index 片（1-based，共 total 片）。
+
+轮转而不是切连续块：列表是按优选排好的，切块会让第 1 片吃掉所有最优代理、后面的片
+只剩次品。轮转让每片都能均匀拿到各档质量 —— 第 1 片拿第 1、4、7 名，第 2 片拿第
+2、5、8 名。各片之间完全不重叠，几个 job 并行也不会把同一个出口 IP 同时分给多个账号。
+*/
+func shardAddrs(addrs []string, index, total int) []string {
+	if total <= 1 || index < 1 || index > total {
+		return addrs
+	}
+	out := make([]string, 0, len(addrs)/total+1)
+	for i := index - 1; i < len(addrs); i += total {
+		out = append(out, addrs[i])
 	}
 	return out
 }

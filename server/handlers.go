@@ -559,6 +559,12 @@ func (s *Server) handleCookieTest(w http.ResponseWriter, r *http.Request, mode s
 		return
 	}
 	if err := s.cookieTests.Start(&cfg, mode, req.AccountNames); err != nil {
+		// 两次检查之间被别人抢先启动了：这是「已在跑」而不是参数错，得给 409。
+		// 前端认 409 才会转去轮询状态，给 400 只会弹一句错误、界面停在原地。
+		if errors.Is(err, ErrCookieTestBusy) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -742,6 +748,7 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 // 带 alive=1 时走优选排序（Actions 实测表现优先），与 /available 给客户端的顺序一致。
 func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
 	aliveOnly := r.URL.Query().Get("alive") == "1"
+	source := strings.TrimSpace(r.URL.Query().Get("source"))
 	// 页面展示默认给 500 条够用；显式传 ?limit=0 才拉全量
 	limit := 500
 	if v := r.URL.Query().Get("limit"); v != "" {
@@ -749,10 +756,28 @@ func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	entries, err := s.proxies.ListProxies(aliveOnly, limit)
+	// 按来源过滤时先不截断：limit 是「要几条」而不是「从前几条里挑」，
+	// 先砍再筛会让某个来源明明有很多可用代理却只显示出零星几条
+	queryLimit := limit
+	if source != "" {
+		queryLimit = 0
+	}
+	entries, err := s.proxies.ListProxies(aliveOnly, queryLimit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "查询代理列表失败")
 		return
+	}
+	if source != "" {
+		filtered := make([]ProxyEntry, 0, len(entries))
+		for _, e := range entries {
+			if e.Source == source {
+				filtered = append(filtered, e)
+			}
+		}
+		if limit > 0 && len(filtered) > limit {
+			filtered = filtered[:limit]
+		}
+		entries = filtered
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"proxies": entries,
@@ -760,8 +785,15 @@ func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleAvailableProxies GET /api/proxies/available（API Key）—— Actions 预取可用代理列表。
-// 返回 {"proxies": ["ip:port", ...], "count": N, "checked_at": "..."}。
+/*
+handleAvailableProxies GET /api/proxies/available（API Key）—— Actions 预取可用代理列表。
+
+返回 {"proxies": ["ip:port", ...], "count": N, "checked_at": "..."}。
+
+支持 ?shard=I/N：按轮转把优选列表切成 N 份只返回第 I 份。Actions 每 30 个账号拆一个
+job 并行跑时，几个 job 拿到的是同一份排好序的列表、又都从头取，最优的那几个 IP 会被
+同时分给不同账号；带上分片号就各拿各的，互不重叠。
+*/
 func (s *Server) handleAvailableProxies(w http.ResponseWriter, r *http.Request) {
 	// 默认不限制：上游有多少可用就全部返回。?limit=N 可显式限制。
 	limit := 0
@@ -770,7 +802,15 @@ func (s *Server) handleAvailableProxies(w http.ResponseWriter, r *http.Request) 
 			limit = n
 		}
 	}
+	shardIndex, shardTotal, err := parseShardParam(r.URL.Query().Get("shard"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	addrs := s.proxies.AvailableAddrs(limit)
+	if shardTotal > 1 {
+		addrs = shardAddrs(addrs, shardIndex, shardTotal)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"proxies":    addrs,
 		"count":      len(addrs),
@@ -809,6 +849,7 @@ func (s *Server) handleRefreshProxies(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := cfg.ProxyPool.SaveLimit
 	go func() {
+		defer recoverPanic("代理池手动刷新")
 		alive, rerr := s.proxies.RefreshProxies(cfg.ProxyPool, limit)
 		if rerr != nil {
 			log.Printf("[proxy] 手动刷新失败: %v", rerr)
@@ -841,6 +882,7 @@ func (s *Server) handleSpeedTestProxies(w http.ResponseWriter, r *http.Request) 
 	}
 	timeout := cfg.ProxyPool.Timeout
 	go func() {
+		defer recoverPanic("代理测速任务")
 		// 测速后台使用独立 120 秒 context：不随 HTTP 请求结束/取消而中断
 		ctx, cancel := context.WithTimeout(context.Background(), speedTestBackgroundTimeout)
 		defer cancel()

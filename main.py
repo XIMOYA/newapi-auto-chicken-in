@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="不签到：把启用账号每 SIZE 个切一片，写出 GitHub Actions matrix 用的 "
              f"{SHARD_PLAN_PATH}，供分片并行的前置 job 读取",
     )
+    parser.add_argument(
+        "--shard", metavar="I/N",
+        help="告诉平台自己是第 I 个分片（共 N 片），只领属于本片的代理；"
+             "几个 job 并行时避免同一个出口 IP 被分给多个账号",
+    )
     parser.add_argument("--dry-run", action="store_true",
                         help="只验证当前登录方式的凭据与连通性，不执行签到")
     parser.add_argument(
@@ -131,6 +136,27 @@ def _write_shard_plan(cfg, args, size: int) -> int:
     return 0
 
 
+def _parse_shard(raw) -> tuple:
+    """解析 --shard I/N。返回 (序号, 总片数)；没传返回 None。
+
+    格式做窄：只认「正整数/正整数」且序号在范围内。写错不静默忽略 —— 那会让这个 job
+    以为自己领到的是独占的一批代理，实际上和别的 job 撞了，问题要在启动时就暴露。
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    left, _, right = text.partition("/")
+    try:
+        index, total = int(left.strip()), int(right.strip())
+    except ValueError:
+        raise ConfigError(f"--shard 需要 I/N 形式的正整数，收到 {raw!r}") from None
+    if total < 1:
+        raise ConfigError(f"--shard 的总片数必须 >= 1，收到 {total}")
+    if index < 1 or index > total:
+        raise ConfigError(f"--shard 的序号必须在 1..{total} 之间，收到 {index}")
+    return index, total
+
+
 def _maybe_sync_remote_config(cfg) -> None:
     """签到前同步远程配置；失败只降级用本地配置，绝不中断签到。
 
@@ -158,6 +184,13 @@ def _maybe_sync_remote_config(cfg) -> None:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     log.setup(verbose=args.verbose, log_dir=LOGS_DIR)
+
+    # 分片号先解析：写错就没必要往下走了，早失败比跑到一半发现代理领重了好
+    try:
+        shard = _parse_shard(args.shard)
+    except ConfigError as exc:
+        log.err(str(exc))
+        return 2
 
     try:
         cfg = load_config(Path(args.config) if args.config else None)
@@ -224,6 +257,7 @@ def main(argv=None) -> int:
         # 参数保留兼容；Runner 自动签到统一固定 6 个账号并发。
         parallelism_explicit=args.parallel is not None and not args.manual,
         browser_parallelism=args.browser_parallel or 0,
+        proxy_shard=shard,
     )
 
     try:

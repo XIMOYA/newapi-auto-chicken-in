@@ -93,6 +93,9 @@ class RunOptions:
     parallelism: int = 1          # 兼容调用方字段；自动签到实际固定为 6，人工模式为 1
     parallelism_explicit: bool = False   # 兼容字段；固定并发模式下不改变实际账号并发
     browser_parallelism: int = 0         # 兼容调用方字段；浏览器实际固定为 3（人工模式为 1）
+    # proxy_shard = (序号, 总片数)，1-based。Actions 分片并行时透传给平台，让每个 job
+    # 只拿属于自己的那份代理，几个 job 之间不会把同一个出口 IP 同时分给不同账号
+    proxy_shard: Optional[tuple] = None
 
 
 class Runner:
@@ -135,7 +138,7 @@ class Runner:
         try:
             from .proxy_pool import ProxyPool
 
-            self._pool = ProxyPool(self.cfg.proxy_pool)
+            self._pool = ProxyPool(self.cfg.proxy_pool, shard=self.options.proxy_shard)
             count = self._pool.refresh(desired=desired)
             if count:
                 log.ok(f"代理池就绪: {count} 个可用代理")

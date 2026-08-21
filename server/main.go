@@ -177,37 +177,49 @@ func main() {
 // refresh_minutes <= 0 时仅保留手动刷新能力。
 func startProxyRefresher(db *sql.DB, mgr *ProxyManager) {
 	go func() {
-		// 启动后立即刷一次，让页面/Actions 第一时间有数据
-		cfg, _, err := LoadConfig(db)
-		if err == nil && cfg.ProxyPool.Enabled {
-			if _, rerr := mgr.RefreshProxies(cfg.ProxyPool, cfg.ProxyPool.SaveLimit); rerr != nil {
-				log.Printf("[proxy] 启动刷新失败: %v", rerr)
-			}
-		}
+		// 常驻协程：panic 被兜住之后不能就这么没了，否则后台刷新永久停摆，而界面上
+		// 看不出任何异常。隔一分钟重进循环，比让它静默消失好。
 		for {
-			cfg, _, err = LoadConfig(db)
-			if err != nil {
-				time.Sleep(60 * time.Second)
-				continue
-			}
-			// 代理池在界面上关掉了就不该继续外联第三方源、也不该做并发测通；
-			// 手动点「刷新」仍可随时触发（那是用户的显式意图）
-			if !cfg.ProxyPool.Enabled {
-				time.Sleep(10 * time.Minute)
-				continue
-			}
-			interval := cfg.ProxyPool.RefreshMinutes
-			if interval <= 0 {
-				// 后台刷新关闭：睡长一点再检查（避免空转），随时可被手动触发
-				time.Sleep(10 * time.Minute)
-				continue
-			}
-			time.Sleep(time.Duration(interval) * time.Minute)
-			if _, rerr := mgr.RefreshProxies(cfg.ProxyPool, cfg.ProxyPool.SaveLimit); rerr != nil {
-				log.Printf("[proxy] 周期刷新失败: %v", rerr)
-			}
+			proxyRefreshLoop(db, mgr)
+			log.Printf("[proxy] 后台刷新协程异常退出，60 秒后重启")
+			time.Sleep(60 * time.Second)
 		}
 	}()
+}
+
+// proxyRefreshLoop 正常情况下永不返回；一旦返回，说明内部 panic 已被兜住。
+func proxyRefreshLoop(db *sql.DB, mgr *ProxyManager) {
+	defer recoverPanic("代理池后台刷新")
+	// 启动后立即刷一次，让页面/Actions 第一时间有数据
+	cfg, _, err := LoadConfig(db)
+	if err == nil && cfg.ProxyPool.Enabled {
+		if _, rerr := mgr.RefreshProxies(cfg.ProxyPool, cfg.ProxyPool.SaveLimit); rerr != nil {
+			log.Printf("[proxy] 启动刷新失败: %v", rerr)
+		}
+	}
+	for {
+		cfg, _, err = LoadConfig(db)
+		if err != nil {
+			time.Sleep(60 * time.Second)
+			continue
+		}
+		// 代理池在界面上关掉了就不该继续外联第三方源、也不该做并发测通；
+		// 手动点「刷新」仍可随时触发（那是用户的显式意图）
+		if !cfg.ProxyPool.Enabled {
+			time.Sleep(10 * time.Minute)
+			continue
+		}
+		interval := cfg.ProxyPool.RefreshMinutes
+		if interval <= 0 {
+			// 后台刷新关闭：睡长一点再检查（避免空转），随时可被手动触发
+			time.Sleep(10 * time.Minute)
+			continue
+		}
+		time.Sleep(time.Duration(interval) * time.Minute)
+		if _, rerr := mgr.RefreshProxies(cfg.ProxyPool, cfg.ProxyPool.SaveLimit); rerr != nil {
+			log.Printf("[proxy] 周期刷新失败: %v", rerr)
+		}
+	}
 }
 
 // randomHex 生成 n 字节的随机十六进制字符串。

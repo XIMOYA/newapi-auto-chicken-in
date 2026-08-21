@@ -162,8 +162,11 @@ def _as_bool(value, default: bool = False) -> bool:
 class ProxyPool:
     """抓取/测通/分配一体化。线程安全，可被 Runner 并行使用。"""
 
-    def __init__(self, cfg: ProxyPoolConfig):
+    def __init__(self, cfg: ProxyPoolConfig, shard: Optional[tuple] = None):
         self.cfg = cfg
+        # shard = (序号, 总片数)，1-based。Actions 分片并行时透传给平台，让每个 job
+        # 拿到互不重叠的一份代理；不传就是整份列表（本机单进程跑的情形）
+        self._shard = shard
         self._available: list[str] = []
         self._used: set[str] = set()
         self._bad: set[str] = set()
@@ -224,6 +227,22 @@ class ProxyPool:
             headers[self.cfg.remote_token_header] = f"{prefix} {self.cfg.remote_token}".strip()
         return headers
 
+    def _remote_url(self) -> str:
+        """预取地址；带分片号时让平台只发属于本 job 的那一份。
+
+        平台按轮转切片，各 job 拿到的集合互不重叠。不带的话几个 job 会拿到同一份按
+        优选排好的列表又都从头取，最优的那几个出口 IP 被同时分给不同账号。
+        remote_url 可能已经带了 ?limit= 之类，分隔符要看情况选。
+        """
+        url = self.cfg.remote_url
+        if not self._shard:
+            return url
+        index, total = self._shard
+        if total <= 1:
+            return url
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}shard={index}/{total}"
+
     def _fetch_remote(self) -> Optional[list]:
         """请求配置管理平台 /api/proxies/available，返回可用代理地址列表。"""
         from curl_cffi import requests as cffi
@@ -231,7 +250,7 @@ class ProxyPool:
         headers = self._auth_headers()
         try:
             resp = cffi.get(
-                self.cfg.remote_url,
+                self._remote_url(),
                 headers=headers,
                 timeout=self.cfg.timeout,
                 impersonate="chrome",

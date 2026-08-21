@@ -211,11 +211,16 @@ jobs:
         #
         # --account 收的是 plan job 分好的这一片账号名。各分片名单互不重叠，
         # 所以几个 job 并行不会重复签同一个账号。
+        #
+        # --shard 让平台只发属于本片的代理：不带的话几个 job 拿到的是同一份按优选排好
+        # 的列表、又都从头取，最优的那几个出口 IP 会被同时分给不同账号。
         env:
           SHARD_ACCOUNTS: ${{ matrix.shard.accounts }}
         run: |
           python main.py --headless --parallel 6 --browser-parallel 3 -v \
-            --account "$SHARD_ACCOUNTS" ${{ inputs.dry_run && '--dry-run' || '' }}
+            --account "$SHARD_ACCOUNTS" \
+            --shard "${{ matrix.shard.index }}/${{ needs.plan.outputs.total }}" \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: 上传排障截图与页面快照（仅失败时）
         if: failure()

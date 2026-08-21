@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -66,10 +67,42 @@ func NewCookieTestRunner(pm *ProxyManager, db *sql.DB) *CookieTestRunner {
 	return &CookieTestRunner{pm: pm, db: db}
 }
 
+/*
+ErrCookieTestBusy 已有检测任务在跑。
+
+单独定义成哨兵错误是为了让 HTTP 层能把它和「账号选错了」之类的参数错误区分开：
+之前两者一起走 400，而前端是靠 409 才认出「有任务在跑」并转去轮询状态的，撞上这条
+竞态就只弹一句错误、界面不进轮询。
+*/
+var ErrCookieTestBusy = errors.New("已有 Cookie 检测任务在进行中")
+
 func (r *CookieTestRunner) IsRunning() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.running
+}
+
+/*
+failFromPanic 是 loop 崩掉后的收尾：把任务标成已结束，并把原因留给界面。
+
+不做这一步的话 running 会永远停在 true —— IsRunning() 恒真，后续每次检测请求都被
+409 挡掉，用户只能重启服务。还没跑出结论的账号统一标成 failed 而不是留在 running：
+它们确实没有结论，显示成「检测中」会让人一直等。
+*/
+func (r *CookieTestRunner) failFromPanic(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.running = false
+	r.finishedAt = time.Now()
+	r.lastErr = fmt.Sprintf("检测任务内部异常，已中止：%s", reason)
+	for i := range r.rows {
+		if r.rows[i].State == cookieTestStateRunning || r.rows[i].State == cookieTestStatePending {
+			// 标 abnormal 而不是 skipped：skipped 是用户主动停止的语义，这里是故障，
+			// 两者在界面上要能分得开
+			r.rows[i].State = cookieTestStateAbnormal
+			r.rows[i].Message = "检测任务内部异常，未取得结论"
+		}
+	}
 }
 
 // Snapshot 返回当前任务状态；结果切片是拷贝，调用方可安全序列化。
@@ -111,7 +144,7 @@ func (r *CookieTestRunner) Start(cfg *Config, mode string, names []string) error
 	r.mu.Lock()
 	if r.running {
 		r.mu.Unlock()
-		return fmt.Errorf("已有 Cookie 检测任务在进行中")
+		return ErrCookieTestBusy
 	}
 	// 后台 context 自持 cancel：不随触发它的 HTTP 请求结束而中断
 	ctx, cancel := context.WithCancel(context.Background())
@@ -148,6 +181,9 @@ func (r *CookieTestRunner) Stop() {
 
 // loop 轮次调度：每轮给所有未完成账号各试一次，代理类失败留到下一轮。
 func (r *CookieTestRunner) loop(ctx context.Context, cfg *Config, mode string, targets []Account) {
+	// 兜住 panic：这条协程崩掉会带走整个进程，而且 running 停在 true 之后所有检测
+	// 请求都会被 409 挡掉，只能重启服务。失败原因写进 last_error 让界面上能看见。
+	defer recoverPanicWith("Cookie 检测任务", r.failFromPanic)
 	source := newCookieTestProxySource(r.pm)
 	// pending 保存「仍需重试的账号」在 r.rows 中的下标
 	pending := make([]int, 0, len(targets))

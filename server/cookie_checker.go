@@ -178,6 +178,7 @@ func runCookieTestPass(ctx context.Context, cfg *Config, mode string,
 		wg.Add(1)
 		go func(index int, target Account, proxy string) {
 			defer wg.Done()
+			defer recoverPanic("Cookie 检测单账号")
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
