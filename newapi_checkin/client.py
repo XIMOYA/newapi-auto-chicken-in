@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 from curl_cffi import requests as cffi
 
-from .config import SELF_PATH, Account, HttpConfig
+from .config import DEFAULT_QUOTA_PER_UNIT, SELF_PATH, STATUS_PATH, Account, HttpConfig
 from .utils import parse_proxy, sanitize_header_value  # noqa: F401  (parse_proxy 供上层复用)
 from .cf import detect
 from .cf.session_store import CFSession
@@ -128,6 +128,42 @@ def _extract_quota(data: dict) -> Any:
     return None
 
 
+def _as_number(raw) -> Optional[float]:
+    """把接口返回的额度统一成数字。字符串数字也认，认不出返回 None。
+
+    额度值有站点用 int、有站点用字符串，展示层要做除法，先在这里收口成一种类型。
+    """
+    if raw in (None, ""):
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_quota_per_unit(data: Optional[dict]) -> Optional[int]:
+    """从 /api/status 的响应里挖出 quota_per_unit。
+
+    站点文档只说了这个字段存在，没给完整 JSON 结构，所以 data 里和顶层都看一遍
+    —— 和 _extract_quota 一个路子。取不到或不是正数就返回 None，交给调用方兜底，
+    绝不返回 0：那会让换算除零。
+    """
+    if not isinstance(data, dict):
+        return None
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    for source in (payload, data):
+        raw = source.get("quota_per_unit")
+        if raw in (None, ""):
+            continue
+        try:
+            value = int(float(raw))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
 def _hit(message: str, markers) -> bool:
     low = (message or "").lower()
     return any(m in low for m in markers)
@@ -149,8 +185,11 @@ def classify_self(status: int, data: Optional[dict], text: str = "") -> "ApiResu
         return ApiResult(FAILED, message="响应中缺少 data.id，无法构造 New-Api-User 头",
                          status=status, path=SELF_PATH)
     username = str(payload.get("username") or payload.get("display_name") or "")
+    # self 的 data.quota 是**账户剩余额度**，和签到接口的 quota_awarded（本次奖励）
+    # 不是一回事。quota 字段沿用不动（历史调用方仍在读），余额另放 balance
     return ApiResult(SUCCESS, message=username, status=status, path=SELF_PATH,
-                     user_id=user_id, quota=payload.get("quota"))
+                     user_id=user_id, quota=payload.get("quota"),
+                     balance=_as_number(payload.get("quota")))
 
 
 def classify_checkin(status: int, data: Optional[dict], text: str = "",
@@ -183,6 +222,9 @@ class ApiResult:
     user_id: Optional[int] = None
     verdict: Optional[detect.Verdict] = None
     signals: list = field(default_factory=list)
+    # 账户剩余额度，原始 quota 单位（不是 $）。只有查过 /api/user/self 才有值。
+    # 上面的 quota 是「本次签到奖励」，两者别混用
+    balance: Optional[float] = None
 
     @property
     def ok(self) -> bool:
@@ -274,6 +316,17 @@ class ApiClient:
         if result.user_id:
             self.set_user_id(result.user_id)
         return result
+
+    def fetch_quota_per_unit(self) -> Optional[int]:
+        """GET /api/status 取额度换算率。公开接口，不需要鉴权。
+
+        探不到就返回 None（上层退回 DEFAULT_QUOTA_PER_UNIT）—— 这只影响金额显示，
+        任何失败都不该冒泡成签到错误，所以被盾拦、非 JSON、字段缺失一律当没探到。
+        """
+        resp, blocked = self._request("GET", STATUS_PATH)
+        if blocked is not None or resp is None:
+            return None
+        return extract_quota_per_unit(_json_of(resp))
 
     def checkin(self) -> ApiResult:
         """POST 签到接口，路径按候选列表探测（404/405 视为路径不对，继续试下一个）。"""

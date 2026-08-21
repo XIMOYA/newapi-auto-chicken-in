@@ -80,6 +80,9 @@ class AccountSession:
     cf: Optional[CFSession] = None
     # TaBiAI 的 new_api_refresh 会按代次轮转，必须逐轮持久化，否则下次用旧代会被判重放
     refresh_cookie: Optional[str] = None
+    # 站点的额度换算率（quota_per_unit）。站点级属性，探到一次就能一直用，
+    # 缓存下来免得每轮都去打 /api/status
+    quota_per_unit: Optional[int] = None
 
     def to_dict(self) -> dict:
         out: dict = {}
@@ -89,6 +92,8 @@ class AccountSession:
             out["user_id"] = self.user_id
         if self.refresh_cookie:
             out["refresh_cookie"] = self.refresh_cookie
+        if self.quota_per_unit:
+            out["quota_per_unit"] = self.quota_per_unit
         if self.cf is not None:
             out["cf"] = self.cf.to_dict()
         return out
@@ -100,12 +105,19 @@ class AccountSession:
             uid = int(uid) if uid not in (None, "") else None
         except (TypeError, ValueError):
             uid = None
+        # 换算率是除数，坏值（0/负数/非数字）必须当成没有，否则展示层要除零
+        try:
+            unit = int(raw.get("quota_per_unit"))
+            unit = unit if unit > 0 else None
+        except (TypeError, ValueError):
+            unit = None
         cf_raw = raw.get("cf")
         return cls(
             checkin_path=raw.get("checkin_path") or None,
             user_id=uid,
             cf=CFSession.from_dict(cf_raw) if isinstance(cf_raw, dict) else None,
             refresh_cookie=raw.get("refresh_cookie") or None,
+            quota_per_unit=unit,
         )
 
 
@@ -164,7 +176,8 @@ class SessionStore:
                 self._dirty = True
 
     def remember(self, slug: str, *, checkin_path: Optional[str] = None,
-                 user_id: Optional[int] = None) -> None:
+                 user_id: Optional[int] = None,
+                 quota_per_unit: Optional[int] = None) -> None:
         with self._lock:
             record = self.get(slug)
             if checkin_path and record.checkin_path != checkin_path:
@@ -172,6 +185,10 @@ class SessionStore:
                 self._dirty = True
             if user_id is not None and record.user_id != user_id:
                 record.user_id = user_id
+                self._dirty = True
+            # 只认正数：0 会让金额换算除零，负数是脏数据
+            if quota_per_unit and quota_per_unit > 0 and record.quota_per_unit != quota_per_unit:
+                record.quota_per_unit = quota_per_unit
                 self._dirty = True
 
     def remember_refresh_cookie(self, slug: str, cookie: str) -> None:

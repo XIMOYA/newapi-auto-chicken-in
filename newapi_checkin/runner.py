@@ -707,7 +707,10 @@ class Runner:
         """把源站/不可恢复问题统一记为 skipped，避免无意义重试。"""
         detail = f"{reason}：{row.detail}" if row.detail else reason
         log.warn(f"跳过账号：{detail}")
-        return log.SummaryRow(account.name, "skipped", row.strategy, detail, row.quota)
+        # balance/quota_per_unit 照原样带走：这一行只是换个状态和说明，
+        # 之前已经查到的额度信息不该在这里丢掉
+        return log.SummaryRow(account.name, "skipped", row.strategy, detail, row.quota,
+                              balance=row.balance, quota_per_unit=row.quota_per_unit)
 
     def _give_up_on_deadline(self, row: log.SummaryRow, shield_rounds: int) -> log.SummaryRow:
         """时间盒耗尽：关掉该账号的全部重试，带着当前结果收工。
@@ -974,6 +977,13 @@ class Runner:
             )
             provider = None if dry else self._turnstile_provider(account, turnstile_token)
             result = client.checkin(turnstile_provider=provider, dry_run=dry)
+            # 余额已由 TabiAIClient 在 access_token 还在手上时补好（见 attach_balance），
+            # 这里只需要把站点换算率探出来缓存，供展示层把额度换算成 $
+            if result.kind in (api.SUCCESS, api.ALREADY_DONE):
+                try:
+                    self._ensure_quota_per_unit(account, client)
+                except Exception as exc:  # noqa: BLE001 - 只影响金额显示
+                    log.debug(f"探换算率异常，跳过: {type(exc).__name__}: {exc}")
         if result.kind in _SETTLED and result.user_id:
             account.user_id = result.user_id
             self.store.remember(account.slug, user_id=result.user_id)
@@ -1205,7 +1215,39 @@ class Runner:
             result = client.checkin()
             if result.kind in (api.SUCCESS, api.ALREADY_DONE) and result.path:
                 self.store.remember(account.slug, checkin_path=result.path)
+            if result.kind in (api.SUCCESS, api.ALREADY_DONE):
+                self._attach_balance(account, result, client)
             return result
+
+    def _ensure_quota_per_unit(self, account: Account, client) -> None:
+        """站点的额度换算率探一次就够，之后从 sessions.json 复用。
+
+        额度在接口里是内部整数（TaBiAI 500000 = $1），要按站点自己的 quota_per_unit
+        换算才能显示成钱。不同 fork 这个值不一定一样，所以宁可探一次也不写死。
+        """
+        if self.store.get(account.slug).quota_per_unit:
+            return
+        unit = client.fetch_quota_per_unit()
+        if unit:
+            self.store.remember(account.slug, quota_per_unit=unit)
+            log.debug(f"站点额度换算率 quota_per_unit={unit}")
+
+    def _attach_balance(self, account: Account, result: api.ApiResult, client) -> None:
+        """签到有结论后补查一次账户余额，顺手把换算率探出来缓存。
+
+        只在签到成功 / 今日已签时查：失败的账号连凭据都可能是坏的，再打一次接口
+        既拿不到余额也是白费请求。全程异常吞掉只留 debug —— 余额是邮件里多一列，
+        不能因为它把一个已经签成功的账号变成失败。
+        """
+        try:
+            self._ensure_quota_per_unit(account, client)
+            me = client.fetch_self()
+            if me.balance is None:
+                log.debug(f"未能取到剩余额度（{me.kind}: {me.message}）")
+                return
+            result.balance = me.balance
+        except Exception as exc:  # noqa: BLE001 - 补充信息失败不许影响签到
+            log.debug(f"查余额异常，跳过: {type(exc).__name__}: {exc}")
 
     def _row(self, account: Account, result: api.ApiResult, strategy: str,
              detail: Optional[str] = None) -> log.SummaryRow:
@@ -1223,5 +1265,8 @@ class Runner:
         if result.path:
             log.debug(f"命中接口 {result.path}，HTTP {result.status}")
         return log.SummaryRow(
-            account.name, result.kind, STRATEGY_LABEL.get(strategy, strategy), text, result.quota
+            account.name, result.kind, STRATEGY_LABEL.get(strategy, strategy), text, result.quota,
+            balance=result.balance,
+            # 换算率跟着行走：几个站点混在一封邮件里时，每行要按自己站点的比例换算
+            quota_per_unit=self.store.get(account.slug).quota_per_unit,
         )

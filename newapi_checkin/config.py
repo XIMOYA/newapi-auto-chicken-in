@@ -56,6 +56,11 @@ CHECKIN_PATH_CANDIDATES = (
 )
 
 SELF_PATH = "/api/user/self"
+# 站点公开信息，不需要鉴权。这里只关心 quota_per_unit —— 额度是内部整数单位，
+# 换算成站点展示的 $ 要除以它（TaBiAI 是 500000 quota = $1，别的 fork 未必一样）
+STATUS_PATH = "/api/status"
+# 站点没告诉我们换算率时的兜底值。New API 上游默认就是这个数
+DEFAULT_QUOTA_PER_UNIT = 500000
 
 LOGIN_METHOD_NEWAPI_COOKIE = "newapi_cookie"
 # TaBiAI（New API 分支）：凭据是 new_api_refresh cookie，先 refresh 换短期 access token，

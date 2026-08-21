@@ -25,6 +25,7 @@ from . import logger as log
 from .cf import detect
 from .cf.session_store import CFSession
 from .config import (
+    SELF_PATH,
     TABIAI_CHECKIN_PATH,
     TABIAI_REFRESH_COOKIE_NAME,
     TABIAI_REFRESH_PATH,
@@ -317,6 +318,44 @@ class TabiAIClient:
         return api.classify_checkin(
             resp.status_code, self._json(resp), self._text(resp, 160), path=TABIAI_CHECKIN_PATH)
 
+    # ---- 查账户信息：只为拿剩余额度 ----
+
+    def fetch_self(self, token: str) -> api.ApiResult:
+        """GET /api/user/self，用它的 data.quota 当账户剩余额度。
+
+        和签到走同一个 session、同一个 Bearer，凭据和盾都已经就绪，所以这一发很轻。
+        """
+        result, resp = self._request("GET", SELF_PATH, token=token)
+        if result.kind != api.UNKNOWN:
+            return result
+        return api.classify_self(resp.status_code, self._json(resp), self._text(resp, 160))
+
+    def fetch_quota_per_unit(self) -> Optional[int]:
+        """GET /api/status 取额度换算率。公开接口，不带 token 也能读。
+
+        探不到返回 None，由上层退回默认值。只影响金额怎么显示，不影响签到。
+        """
+        result, resp = self._request("GET", api.STATUS_PATH)
+        if result.kind != api.UNKNOWN or resp is None:
+            return None
+        return api.extract_quota_per_unit(self._json(resp))
+
+    def attach_balance(self, result: api.ApiResult, token: str) -> None:
+        """给已经有结论的签到结果补上账户余额。
+
+        任何失败都只 debug 一行就算了：余额是邮件里多一列信息，绝不能让它改变
+        签到结论，更不能因为它把一个已经签成功的账号弄成失败。
+        """
+        try:
+            me = self.fetch_self(token)
+        except Exception as exc:  # noqa: BLE001 - 补充信息失败不许影响签到
+            log.debug(f"查余额异常，跳过: {type(exc).__name__}: {exc}")
+            return
+        if me.balance is None:
+            log.debug(f"未能取到剩余额度（{me.kind}: {me.message}）")
+            return
+        result.balance = me.balance
+
     # ---- 只验证凭据：--cookie-test tabiai 用，零浏览器零 AI ----
 
     def test_cookie(self) -> api.ApiResult:
@@ -353,13 +392,16 @@ class TabiAIClient:
         if not status_result.ok:
             return status_result
         if checked:
-            return api.ApiResult(
+            already = api.ApiResult(
                 api.ALREADY_DONE,
                 message="今日已签到",
                 status=status_result.status,
                 path=TABIAI_CHECKIN_PATH,
                 user_id=step.user_id,
             )
+            # 已签到也要报余额：这正是老版本额度列空着的主因
+            self.attach_balance(already, token)
+            return already
 
         if turnstile_provider is None:
             return api.ApiResult(
@@ -383,6 +425,8 @@ class TabiAIClient:
             result.user_id = step.user_id
         if result.kind == api.SUCCESS and step.username:
             result.message = f"{step.username}: {result.message}"
+        if result.kind in (api.SUCCESS, api.ALREADY_DONE):
+            self.attach_balance(result, token)
         return result
 
 

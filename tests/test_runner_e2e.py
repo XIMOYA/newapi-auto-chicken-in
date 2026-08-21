@@ -7,9 +7,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from newapi_checkin import config as cfgmod
+from newapi_checkin import logger as log
 from newapi_checkin import runner as runner_mod
 
-STATE = {"mode": "ok", "hits": []}
+STATE = {"mode": "ok", "hits": [], "balance": None, "quota_per_unit": None}
 
 CF_BODY = (
     "<html><head><title>Just a moment...</title></head><body>"
@@ -55,7 +56,19 @@ class Handler(BaseHTTPRequestHandler):
             if STATE["mode"] == "auth":
                 self._send(401, {"success": False, "message": "无权进行此操作"})
                 return
-            self._send(200, {"success": True, "data": {"id": 42, "username": "kiro"}})
+            payload = {"id": 42, "username": "kiro"}
+            # quota 是账户剩余额度。默认不给，保留老用例「拿不到余额」的场景；
+            # 需要验证余额链路的用例把 STATE["balance"] 设上
+            if STATE.get("balance") is not None:
+                payload["quota"] = STATE["balance"]
+            self._send(200, {"success": True, "data": payload})
+            return
+        if self.path == "/api/status":
+            unit = STATE.get("quota_per_unit")
+            if unit is None:
+                self._send(404, {"success": False, "message": "not found"})
+                return
+            self._send(200, {"success": True, "data": {"quota_per_unit": unit}})
             return
         self._send(404, {"success": False, "message": "not found"})
 
@@ -85,6 +98,8 @@ def server():
     thread.start()
     STATE["mode"] = "ok"
     STATE["hits"] = []
+    STATE["balance"] = None
+    STATE["quota_per_unit"] = None
     yield f"http://127.0.0.1:{httpd.server_address[1]}"
     httpd.shutdown()
     httpd.server_close()
@@ -124,16 +139,80 @@ class TestHappyPath:
         assert make_runner(server).run() == 0
         STATE["hits"] = []
         assert make_runner(server).run() == 0
-        # user_id 已缓存 -> 不再调 /api/user/self；路径已缓存 -> 不再试 404 的那个
-        assert ("GET", "/api/user/self") not in STATE["hits"]
+        # 路径已缓存 -> 不再试那个 404 的候选
         assert ("POST", "/api/user/checkin") not in STATE["hits"]
         assert ("POST", "/api/user/check_in") in STATE["hits"]
+        # self 仍会被请求，但目的变了：不是拿 user_id（已缓存），而是签到后查剩余额度。
+        # 顺序能证明这一点 —— 它出现在签到之后，而不是之前。
+        hits = STATE["hits"]
+        assert hits.index(("POST", "/api/user/check_in")) < hits.index(("GET", "/api/user/self"))
 
     def test_already_checked_in_counts_as_success(self, server, wire):
         STATE["mode"] = "already"
         runner = make_runner(server)
         assert runner.run() == 0
         assert runner.summary.rows[0].status == "already_done"
+
+
+class TestBalance:
+    """签到后补查余额：这是「额度列一直空着」的修复点。"""
+
+    def test_balance_attached_after_checkin(self, server, wire):
+        STATE["balance"] = 6170000
+        runner = make_runner(server)
+        assert runner.run() == 0
+        row = runner.summary.rows[0]
+        assert row.balance == 6170000
+        # quota 仍是本次奖励，两个字段各管各的，不许互相覆盖
+        assert row.quota == 1000
+
+    def test_already_done_also_gets_balance(self, server, wire):
+        """今日已签时签到接口不返回奖励额度，余额是那一列唯一能显示的东西。"""
+        STATE["mode"] = "already"
+        STATE["balance"] = 250000
+        runner = make_runner(server)
+        assert runner.run() == 0
+        row = runner.summary.rows[0]
+        assert row.status == "already_done" and row.balance == 250000
+
+    def test_quota_per_unit_probed_and_cached(self, server, wire):
+        STATE["balance"] = 1000000
+        STATE["quota_per_unit"] = 250000
+        assert make_runner(server).run() == 0
+        STATE["hits"] = []
+        runner = make_runner(server)
+        assert runner.run() == 0
+        # 换算率已落 sessions.json，第二轮不该再打 /api/status
+        assert ("GET", "/api/status") not in STATE["hits"]
+        assert runner.summary.rows[0].quota_per_unit == 250000
+
+    def test_status_404_falls_back_to_default_unit(self, server, wire):
+        """站点不给 quota_per_unit 也要能出金额，按默认 500000 算。"""
+        STATE["balance"] = 1000000          # /api/status 返回 404
+        runner = make_runner(server)
+        assert runner.run() == 0
+        row = runner.summary.rows[0]
+        assert row.quota_per_unit is None
+        assert "$2.00" in log.format_balance(row.balance, row.quota_per_unit, None)
+
+    def test_self_failure_does_not_fail_checkin(self, server, wire, monkeypatch):
+        """查余额炸了也不能把签成功的账号弄成失败。"""
+        import newapi_checkin.client as client_mod
+
+        original = client_mod.ApiClient.fetch_self
+        calls = {"n": 0}
+
+        def flaky(self):
+            calls["n"] += 1
+            if calls["n"] > 1:            # 第一次照常（拿 user_id），补查那次炸
+                raise RuntimeError("boom")
+            return original(self)
+
+        monkeypatch.setattr(client_mod.ApiClient, "fetch_self", flaky)
+        runner = make_runner(server)
+        assert runner.run() == 0
+        row = runner.summary.rows[0]
+        assert row.status == "success" and row.balance is None
 
 
 class TestFailures:

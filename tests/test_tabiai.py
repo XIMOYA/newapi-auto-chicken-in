@@ -111,6 +111,14 @@ def status_resp(checked):
     })
 
 
+def self_resp(quota=6170000, uid=42):
+    """GET /api/user/self 的假响应。签到有结论后会被补查一次，用来拿剩余额度。"""
+    return FakeResponse(200, {
+        "success": True,
+        "data": {"id": uid, "username": "kiq", "quota": quota},
+    })
+
+
 class TestNormalize:
     def test_bare_value_gets_cookie_name(self):
         assert tabiai.normalize_refresh_cookie("sid.secret") == "new_api_refresh=sid.secret"
@@ -203,27 +211,44 @@ class TestCheckinFlow:
             called.append(True)
             return "token", ""
 
-        client = make_client([refresh_ok(), status_resp(True)])
+        client = make_client([refresh_ok(), status_resp(True), self_resp()])
         result = client.checkin(turnstile_provider=provider)
         assert result.kind == api.ALREADY_DONE
         assert called == []
-        assert len(client._session.calls) == 2
+        # refresh + 查签到状态 + 查余额；关键是没有第四次（取 token / 发签到）
+        assert len(client._session.calls) == 3
+        assert result.balance == 6170000
+
+    def test_already_checked_in_still_reports_balance(self):
+        """今日已签也要带出余额 —— 老版本这里没有奖励额度，额度列就一直空着。"""
+        client = make_client([refresh_ok(), status_resp(True), self_resp(quota=1234500)])
+        assert client.checkin(turnstile_provider=lambda: ("t", "")).balance == 1234500
+
+    def test_balance_failure_does_not_break_checkin(self):
+        """查余额失败只能让余额缺失，不能把已签到的结论改坏。"""
+        client = make_client([refresh_ok(), status_resp(True),
+                              FakeResponse(500, None, text="boom")])
+        result = client.checkin(turnstile_provider=lambda: ("t", ""))
+        assert result.kind == api.ALREADY_DONE and result.balance is None
 
     def test_full_checkin_sends_token_in_query(self):
         client = make_client([
             refresh_ok(),
             status_resp(False),
             FakeResponse(200, {"success": True, "message": "签到成功，获得 1000 额度"}),
+            self_resp(),
         ])
         result = client.checkin(turnstile_provider=lambda: ("tok-123", ""))
         assert result.kind == api.SUCCESS
         assert result.user_id == 42
         assert "kiq" in result.message
-        post = client._session.calls[-1]
-        assert post["method"] == "POST"
+        # 最后一次调用现在是补查余额的 GET self，签到那次要按方法找
+        post = next(c for c in client._session.calls if c["method"] == "POST"
+                    and "checkin" in c["url"])
         assert "turnstile=tok-123" in post["url"]
         # 业务接口只认 Bearer，不该再带 refresh cookie
         assert post["headers"]["Authorization"] == "Bearer jwt-token"
+        assert result.balance == 6170000
 
     def test_business_failure_on_http_200_is_not_success(self):
         client = make_client([

@@ -11,6 +11,38 @@ def make_row(name="A", status="success", strategy="S1", detail="", quota=None):
 
 
 # --------------------------------------------------------------------------- #
+# 额度列文案：余额为主、本次奖励跟括号。邮件与控制台表格共用这一份
+# --------------------------------------------------------------------------- #
+
+
+class TestBalanceFormat:
+    fmt = staticmethod(nt.log.format_balance)
+
+    @pytest.mark.parametrize("balance,unit,award,expected", [
+        (6170000, 500000, 2600000, "$12.34（+$5.20）"),
+        (6170000, 500000, None, "$12.34"),
+        (6170000, 500000, 0, "$12.34"),          # 奖励 0 等于没奖励，不挂空括号
+        (0, 500000, None, "$0.00"),              # 没钱了，不是查不到
+        (6170000, None, None, "$12.34"),         # 换算率缺失走默认 500000
+        (6170000, 0, None, "$12.34"),            # 0 会除零，必须兜底
+        (6170000, 250000, None, "$24.68"),       # 别的 fork 换算率不同
+        ("6170000", 500000, "2600000", "$12.34（+$5.20）"),  # 字符串数字也认
+    ])
+    def test_renders(self, balance, unit, award, expected):
+        assert self.fmt(balance, unit, award) == expected
+
+    def test_missing_balance_falls_back_to_award(self):
+        assert self.fmt(None, 500000, 2600000) == "+$5.20"
+
+    def test_nothing_known_is_dash(self):
+        assert self.fmt(None, 500000, None) == "-"
+
+    def test_garbage_is_dash(self):
+        assert self.fmt("x", 500000, None) == "-"
+        assert self.fmt(None, 500000, "x") == "-"
+
+
+# --------------------------------------------------------------------------- #
 # 主题
 # --------------------------------------------------------------------------- #
 
@@ -117,9 +149,34 @@ class TestReportHtml:
         assert "跳过</div>" in html             # 失败态也要能看到跳过数
 
     def test_quota_shown(self):
+        """额度列显示的是账户剩余额度，按站点换算率折成 $。"""
         rows = [make_row("A", "success", quota=500000)]
+        rows[0].balance = 6170000
         html = nt.build_report_html(rows, date_str="2026-08-12")
-        assert "500000" in html
+        # 余额 6170000/500000 = $12.34，本次奖励 500000 = $1.00 跟在括号里
+        assert "$12.34" in html and "+$1.00" in html
+        assert "剩余额度" in html
+
+    def test_balance_missing_falls_back_to_award(self):
+        """余额没查到时退一步显示本次奖励，整列空着最没用。"""
+        html = nt.build_report_html([make_row("A", "success", quota=500000)],
+                                    date_str="2026-08-12")
+        assert "+$1.00" in html
+
+    def test_zero_balance_is_not_dash(self):
+        """余额真的是 0 要显示 $0.00，那是「没钱了」，不是「查不到」。"""
+        rows = [make_row("A", "already_done")]
+        rows[0].balance = 0
+        html = nt.build_report_html(rows, date_str="2026-08-12")
+        assert "$0.00" in html
+
+    def test_per_row_quota_per_unit(self):
+        """几个站点混在一封邮件里时，每行按自己站点的换算率折算。"""
+        rows = [make_row("A", "success"), make_row("B", "success")]
+        rows[0].balance, rows[0].quota_per_unit = 1000000, 500000   # $2.00
+        rows[1].balance, rows[1].quota_per_unit = 1000000, 250000   # $4.00
+        html = nt.build_report_html(rows, date_str="2026-08-12")
+        assert "$2.00" in html and "$4.00" in html
 
     def test_badge_status_style_mapping(self):
         # success 与 already_done 颜色一致（绿），文字不同；徽章含语义色圆点

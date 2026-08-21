@@ -252,11 +252,13 @@ def build_report_html(rows: list, *, date_str: str, run_context: str = "GitHub A
         "<th style='text-align:left;padding:10px 16px;font-size:11px;color:#64748b;"
         "background:#f8fafc;border-bottom:1px solid #e2e8f0;letter-spacing:.5px;'>策略</th>"
         "<th style='text-align:right;padding:10px 16px;font-size:11px;color:#64748b;"
-        "background:#f8fafc;border-bottom:1px solid #e2e8f0;letter-spacing:.5px;'>额度</th></tr>"
+        "background:#f8fafc;border-bottom:1px solid #e2e8f0;letter-spacing:.5px;'>剩余额度</th></tr>"
     )
     body_rows = []
     for idx, r in enumerate(rows):
-        quota = "-" if r.quota in (None, "", 0) else str(r.quota)
+        # 余额为主、本次奖励跟括号，和控制台表格共用同一份换算与文案规则
+        quota = log.format_balance(getattr(r, "balance", None),
+                                   getattr(r, "quota_per_unit", None), r.quota)
         stripe = "background:#ffffff;" if idx % 2 == 0 else "background:#fcfdfe;"
         detail = (
             f"<div style='font-size:11px;color:#94a3b8;margin-top:2px;'>{_esc(r.detail)}</div>"

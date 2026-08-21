@@ -18,8 +18,10 @@ from newapi_checkin import shard_report as sr
 from newapi_checkin.logger import SummaryRow
 
 
-def row(name="A", status="success", strategy="S1", detail="", quota=None):
-    return SummaryRow(name, status, strategy, detail, quota)
+def row(name="A", status="success", strategy="S1", detail="", quota=None,
+        balance=None, quota_per_unit=None):
+    return SummaryRow(name, status, strategy, detail, quota,
+                      balance=balance, quota_per_unit=quota_per_unit)
 
 
 def write(tmp_path, rel, rows, *, shard=None, dry_run=False):
@@ -57,6 +59,19 @@ class TestDump:
         got = merged.rows[0]
         assert (got.name, got.status, got.strategy, got.detail, got.quota) == \
             ("站点A", "failed", "S3", "过盾超时", 42)
+
+    def test_round_trip_keeps_balance(self, tmp_path):
+        """余额和换算率必须能过一遍 JSON —— 少一个，汇总邮件的额度列就全是 -。"""
+        write(tmp_path, "s.json",
+              [row(name="站点A", balance=6170000, quota_per_unit=250000, quota=500000)],
+              shard=(1, 1))
+        got = sr.merge_shard_summaries(tmp_path).rows[0]
+        assert (got.balance, got.quota_per_unit, got.quota) == (6170000, 250000, 500000)
+
+    def test_zero_balance_survives_round_trip(self, tmp_path):
+        """余额 0 是「没钱了」，不能在序列化时被当成空值丢掉。"""
+        write(tmp_path, "s.json", [row(name="A", balance=0)], shard=(1, 1))
+        assert sr.merge_shard_summaries(tmp_path).rows[0].balance == 0
 
 
 # --------------------------------------------------------------------------- #
