@@ -26,7 +26,8 @@ export function idleRunState(): RunState {
     started_at: '',
     heartbeat_at: '',
     stale_after_seconds: 0,
-    heartbeat_seconds: 0
+    heartbeat_seconds: 0,
+    holders: 0
   }
 }
 
@@ -63,12 +64,14 @@ export function runLockSummary(state: RunState, now = Date.now()): string {
   if (!state.running) return ''
   const left = secondsUntilAutoUnlock(state, now)
   const owner = runLockOwner(state)
+  // 分片并行时会有多个持有者，说一句能省掉「为什么点了解锁还锁着」的困惑
+  const shards = state.holders > 1 ? `（${state.holders} 个任务在跑）` : ''
   if (left <= 0) {
-    return `${owner} 正在签到，TaBiAI 凭据检测与签发已锁定`
+    return `${owner} 正在签到${shards}，TaBiAI 凭据检测与签发已锁定`
   }
   // 不足一分钟也报 1 分钟：显示「还剩 0 分钟」比模糊说法更让人困惑
   const minutes = Math.max(1, Math.ceil(left / 60))
-  return `${owner} 正在签到，TaBiAI 凭据检测与签发已锁定；`
+  return `${owner} 正在签到${shards}，TaBiAI 凭据检测与签发已锁定；`
     + `若对方已停止上报心跳，约 ${minutes} 分钟后自动解锁`
 }
 
@@ -96,6 +99,7 @@ export function runLockFromError(error: unknown): RunState | null {
     stale_after_seconds:
       typeof state.stale_after_seconds === 'number' ? state.stale_after_seconds : 0,
     heartbeat_seconds:
-      typeof state.heartbeat_seconds === 'number' ? state.heartbeat_seconds : 0
+      typeof state.heartbeat_seconds === 'number' ? state.heartbeat_seconds : 0,
+    holders: typeof state.holders === 'number' ? state.holders : 0
   }
 }

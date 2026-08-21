@@ -26,6 +26,7 @@ function locked(overrides: Partial<RunState> = {}): RunState {
     heartbeat_at: '2026-08-18T11:59:00Z',
     stale_after_seconds: 300,
     heartbeat_seconds: 60,
+    holders: 1,
     ...overrides
   }
 }
@@ -88,6 +89,16 @@ describe('runLockSummary', () => {
     expect(runLockSummary(locked({ running: false }), NOW)).toBe('')
   })
 
+  it('多个持有者时说明有几个任务在跑', () => {
+    // Actions 分片并行会有多个持有者，不说清用户会以为解锁按钮没生效
+    const text = runLockSummary(locked({ holders: 3 }), NOW)
+    expect(text).toContain('3 个任务在跑')
+  })
+
+  it('单个持有者不加多余括号', () => {
+    expect(runLockSummary(locked({ holders: 1 }), NOW)).not.toContain('个任务在跑')
+  })
+
   it('锁定时要同时说清「谁在跑」和「多久自动解锁」', () => {
     const text = runLockSummary(locked(), NOW)
     expect(text).toContain('GitHub Actions（me/repo）')
@@ -137,7 +148,8 @@ describe('runLockFromError', () => {
       started_at: '',
       heartbeat_at: '',
       stale_after_seconds: 0,
-      heartbeat_seconds: 0
+      heartbeat_seconds: 0,
+      holders: 0
     })
   })
 

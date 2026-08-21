@@ -5,7 +5,14 @@
 # 触发方式：
 #   1. schedule —— 每天北京时间 00:05（GitHub Actions 的 cron 使用 UTC，
 #      UTC 16:05 = 北京 00:05）。注意：schedule 触发不保证准点，可能有延迟。
-#   2. workflow_dispatch —— 仓库 Actions 页面手动运行，可选 dry-run 只验连通性。
+#   2. workflow_dispatch —— 仓库 Actions 页面手动运行，可选 dry-run 只验连通性，
+#      也可临时改分片大小。
+#
+# 分片并行（每 N 个账号一个 job）：
+#   plan job 先按真实账号名单算出分片矩阵，再由 checkin job 用 matrix 并行跑。
+#   账号名单来自和签到完全相同的配置加载路径（含 config_sync 远程同步），所以
+#   平台上刚加的账号不会被漏掉、刚停用的也不会白占一个分片。
+#   各分片通过 --account 收到自己那一批账号名，互不重叠。
 #
 # 首次使用前必须配置（重要！）：
 #   GitHub 仓库 -> Settings and variables -> Actions -> New repository secret
@@ -44,22 +51,96 @@ on:
         description: '只做连通性检查，不真签到'
         type: boolean
         default: false
+      shard_size:
+        description: '每个 job 跑多少个账号'
+        type: string
+        default: '30'
 
 permissions:
   contents: read
 
-# 同一时间只允许一个签到任务在跑，防止并发触发互相干扰
+# 同一时间只允许一个签到任务在跑，防止并发触发互相干扰。
+# 这是 workflow 级的：同一次运行内部的分片 job 属于同一个 group，不会互相排队。
 concurrency:
   group: checkin
   cancel-in-progress: false
 
 jobs:
-  checkin:
+  # ---------------------------------------------------------------------- #
+  # 第一段：算分片。只解析配置、不启浏览器，所以不装 camoufox/patchright
+  # ---------------------------------------------------------------------- #
+  plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      total: ${{ steps.plan.outputs.total }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖（剔掉浏览器相关，算名单不需要）
+        run: |
+          # 版本仍取自 requirements-ci.txt，只是去掉两个几百 MB 的浏览器包，
+          # 避免为了数个账号名去下载整个 Firefox
+          grep -vE '^(camoufox|patchright)' requirements-ci.txt > /tmp/req-plan.txt
+          pip install -r /tmp/req-plan.txt
+
+      - name: 写入配置（来自 GitHub Secrets）
+        env:
+          CONFIG_JSON_B64: ${{ secrets.CONFIG_JSON_B64 }}
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+        run: |
+          if [ -n "$CONFIG_JSON_B64" ]; then
+            printf '%s' "$CONFIG_JSON_B64" | base64 --decode > config.json
+          elif [ -n "$CONFIG_JSON" ]; then
+            printf '%s' "$CONFIG_JSON" > config.json
+          else
+            echo "::error::未设置 CONFIG_JSON_B64 secret。请添加完整 config.json 的 base64 文本；旧 CONFIG_JSON 仍兼容"
+            exit 2
+          fi
+          python -c "import json,pathlib;json.loads(pathlib.Path('config.json').read_text(encoding='utf-8'));print('config.json 校验通过')"
+
+      - name: 算分片名单
+        id: plan
+        run: |
+          python main.py --shard-plan "${{ inputs.shard_size || '30' }}"
+          python - <<'PY'
+          import json, os, pathlib
+          plan = json.loads(pathlib.Path("data/shard-plan.json").read_text(encoding="utf-8"))
+          # ensure_ascii=True：矩阵要过 GitHub 的 fromJson，非 ASCII 账号名转义后更稳
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("matrix=" + json.dumps(plan["shards"]) + "\n")
+              fh.write(f"total={plan['total']}\n")
+              fh.write(f"count={plan['count']}\n")
+          print(f"::notice::{plan['count']} 个启用账号，切成 {plan['total']} 个分片")
+          PY
+
+  # ---------------------------------------------------------------------- #
+  # 第二段：按分片并行签到
+  # ---------------------------------------------------------------------- #
+  checkin:
+    needs: plan
+    # 一个账号都没启用时 matrix 会是空数组，GitHub 会直接把 job 判为失败，先挡掉
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    name: 签到分片 ${{ matrix.shard.index }}/${{ needs.plan.outputs.total }}
     # 不设 timeout-minutes：走 GitHub 的默认值 360 分钟（6 小时，也是平台硬上限）。
     # 真正控制总时长的是程序里的「单账号时间盒」ACCOUNT_DEADLINE_SECONDS：
     # 盾类失败会不限次数地换 IP + 重开浏览器重试，直到该账号的时间盒用尽，
-    # 所以整轮上限约为 ceil(账号数 / --parallel) × 单账号时间盒。
+    # 所以单个分片上限约为 ceil(分片账号数 / --parallel) × 单账号时间盒。
+    strategy:
+      # 一个分片挂了不影响其余分片：账号之间本来就没有依赖关系
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -127,13 +208,21 @@ jobs:
         #   浏览器实例固定为 3，不再按 runner 的 CPU 核数动态计算，避免排队时
         #   在不同运行环境之间出现并发抖动。公开库 runner 是 4 vCPU/16GB，
         #   过 Turnstile 吃 CPU，开到 4 个反而会互相抢核拖慢每个实例。
-        run: python main.py --headless --parallel 6 --browser-parallel 3 -v ${{ inputs.dry_run && '--dry-run' || '' }}
+        #
+        # --account 收的是 plan job 分好的这一片账号名。各分片名单互不重叠，
+        # 所以几个 job 并行不会重复签同一个账号。
+        env:
+          SHARD_ACCOUNTS: ${{ matrix.shard.accounts }}
+        run: |
+          python main.py --headless --parallel 6 --browser-parallel 3 -v \
+            --account "$SHARD_ACCOUNTS" ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: 上传排障截图与页面快照（仅失败时）
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: checkin-shots
+          # 带上分片号：几个分片同时上传，同名 artifact 会互相覆盖
+          name: checkin-shots-${{ matrix.shard.index }}
           path: data/shots
           if-no-files-found: ignore
           retention-days: 7

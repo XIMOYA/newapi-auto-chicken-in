@@ -458,10 +458,16 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
   "started_at": "2026-08-18T11:00:00Z",
   "heartbeat_at": "2026-08-18T11:04:00Z",
   "stale_after_seconds": 300,
-  "heartbeat_seconds": 60
+  "heartbeat_seconds": 60,
+  "holders": 3
 }
 ```
-`POST /api/run-state/unlock`（JWT 或 API Key）响应 `{ "ok": true }` —— 管理员强制解锁。
+`POST /api/run-state/unlock`（JWT 或 API Key）响应 `{ "ok": true }` —— 管理员强制解锁，
+**一次清空全部持有者**。
+
+这把锁是引用计数的（`holders`）：Actions 分片并行时每个 job 各自 start/stop，减到 0 才
+真正解锁，最先跑完的分片不会把还在跑的锁掉。上一轮心跳已过期时 start 会把计数重置为 1
+而不是累加，避免被强杀的进程留下的计数永远压住锁。心跳不分持有者，任一 job 续期即可。
 
 为什么要它：网页端的 TaBiAI 凭据检测**本身就是一次真 refresh**，签到进程同时也在
 推进代次。两边一撞，谁手里的代次旧了下次就会被判重放，整条会话被撤销

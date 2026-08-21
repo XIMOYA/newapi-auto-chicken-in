@@ -14,3 +14,7 @@ server/newapi-config-server-linux-amd64 binary
 *.json text eol=lf
 *.md text eol=lf
 *.sh text eol=lf
+# workflow 必须是 LF：run: | 里的 bash heredoc（<<'PY' ... PY）在 CRLF 下
+# 结束标记会带上 \r 而匹配不上，脚本直接在 runner 上炸掉
+*.yml text eol=lf
+*.yaml text eol=lf

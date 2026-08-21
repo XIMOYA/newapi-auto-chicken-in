@@ -357,3 +357,135 @@ func TestRunStateQueryAndUnlockAcceptBothCredentials(t *testing.T) {
 		t.Error("解锁后应已放开")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 引用计数：Actions 分片并行时几个 job 各自 start/stop
+// ---------------------------------------------------------------------------
+
+func stopRun(t *testing.T, srv *Server, key string) {
+	t.Helper()
+	rr := doReq(t, srv, http.MethodPost, "/api/run-state/stop", key, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("上报收尾失败 = %d, %s", rr.Code, rr.Body.String())
+	}
+}
+
+/*
+最先跑完的分片不能把锁整个删掉。
+
+这是分片并行最危险的一条：锁提前释放后网页端以为签到结束了，跑去动 TaBiAI 凭据，
+而其余 job 还在跑同一批凭据，撞上就是代次冲突。
+*/
+func TestRunLockSurvivesUntilLastHolderStops(t *testing.T) {
+	srv := newTestServer(t)
+	jwt := loginToken(t, srv)
+	key := apiKeyToken(t, srv, jwt)
+
+	startRun(t, srv, key, "shard-1")
+	startRun(t, srv, key, "shard-2")
+	startRun(t, srv, key, "shard-3")
+	if got := runStateOf(t, srv, jwt).Holders; got != 3 {
+		t.Fatalf("holders = %d, want 3", got)
+	}
+
+	stopRun(t, srv, key)
+	if state := runStateOf(t, srv, jwt); !state.Running || state.Holders != 2 {
+		t.Fatalf("第一个分片收尾后 running=%v holders=%d, want true/2", state.Running, state.Holders)
+	}
+	stopRun(t, srv, key)
+	if state := runStateOf(t, srv, jwt); !state.Running || state.Holders != 1 {
+		t.Fatalf("第二个分片收尾后 running=%v holders=%d, want true/1", state.Running, state.Holders)
+	}
+	stopRun(t, srv, key)
+	if state := runStateOf(t, srv, jwt); state.Running {
+		t.Fatalf("最后一个分片收尾后应解锁, got %+v", state)
+	}
+}
+
+// 单实例场景行为不变：一进一出就该彻底放开
+func TestRunLockSingleHolderUnchanged(t *testing.T) {
+	srv := newTestServer(t)
+	jwt := loginToken(t, srv)
+	key := apiKeyToken(t, srv, jwt)
+
+	startRun(t, srv, key, "local")
+	if got := runStateOf(t, srv, jwt).Holders; got != 1 {
+		t.Fatalf("holders = %d, want 1", got)
+	}
+	stopRun(t, srv, key)
+	if runStateOf(t, srv, jwt).Running {
+		t.Error("单实例收尾后应解锁")
+	}
+}
+
+// 多余的 stop 不该把计数压成负数，之后重新 start 仍要能正常锁上
+func TestRunLockExtraStopIsHarmless(t *testing.T) {
+	srv := newTestServer(t)
+	jwt := loginToken(t, srv)
+	key := apiKeyToken(t, srv, jwt)
+
+	startRun(t, srv, key, "local")
+	stopRun(t, srv, key)
+	stopRun(t, srv, key) // 重复收尾（客户端重试、或 finally 走了两遍）
+	if runStateOf(t, srv, jwt).Running {
+		t.Fatal("重复收尾后不该还锁着")
+	}
+	startRun(t, srv, key, "next-round")
+	state := runStateOf(t, srv, jwt)
+	if !state.Running || state.Holders != 1 {
+		t.Fatalf("下一轮 running=%v holders=%d, want true/1", state.Running, state.Holders)
+	}
+}
+
+/*
+上一轮被强杀留下的计数不能一直压着锁。
+
+心跳过期说明那些进程已经不在了，这时候新来的 start 必须把计数重置为 1；累加的话
+泄漏出来的计数会让锁再也回不到 0，只能改库才能恢复。
+*/
+func TestRunLockResetsAfterStaleHeartbeat(t *testing.T) {
+	srv := newTestServer(t)
+	jwt := loginToken(t, srv)
+	key := apiKeyToken(t, srv, jwt)
+
+	startRun(t, srv, key, "shard-1")
+	startRun(t, srv, key, "shard-2")
+	if got := runStateOf(t, srv, jwt).Holders; got != 2 {
+		t.Fatalf("holders = %d, want 2", got)
+	}
+	// 把心跳推到过期之前：模拟两个 job 都被 runner 强杀，谁都没来得及 stop
+	stale := time.Now().UTC().Add(-2 * runStateStaleAfter).Format(time.RFC3339)
+	if _, err := srv.db.Exec(`UPDATE run_state SET heartbeat_at = ? WHERE id = ?`,
+		stale, runStateRowID); err != nil {
+		t.Fatal(err)
+	}
+	if runStateOf(t, srv, jwt).Running {
+		t.Fatal("心跳过期后应判为未运行")
+	}
+
+	startRun(t, srv, key, "next-round")
+	state := runStateOf(t, srv, jwt)
+	if !state.Running || state.Holders != 1 {
+		t.Fatalf("过期后新一轮 running=%v holders=%d, want true/1", state.Running, state.Holders)
+	}
+	stopRun(t, srv, key)
+	if runStateOf(t, srv, jwt).Running {
+		t.Error("新一轮收尾后应解锁，说明计数没被上一轮的泄漏顶住")
+	}
+}
+
+// 强制解锁是管理员的兜底，必须一次清空全部持有者
+func TestRunLockUnlockClearsAllHolders(t *testing.T) {
+	srv := newTestServer(t)
+	jwt := loginToken(t, srv)
+	key := apiKeyToken(t, srv, jwt)
+
+	startRun(t, srv, key, "shard-1")
+	startRun(t, srv, key, "shard-2")
+	if rr := doReq(t, srv, http.MethodPost, "/api/run-state/unlock", jwt, nil); rr.Code != http.StatusOK {
+		t.Fatalf("强制解锁 = %d: %s", rr.Code, rr.Body.String())
+	}
+	if state := runStateOf(t, srv, jwt); state.Running || state.Holders != 0 {
+		t.Fatalf("强制解锁后 running=%v holders=%d, want false/0", state.Running, state.Holders)
+	}
+}

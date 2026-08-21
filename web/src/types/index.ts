@@ -293,6 +293,8 @@ export interface RunState {
   stale_after_seconds: number
   /** 平台建议的心跳间隔，客户端用 */
   heartbeat_seconds: number
+  /** 当前有几个进程持有这把锁；Actions 分片并行时会大于 1，全部收尾才解锁 */
+  holders: number
 }
 
 // ===== API Key =====

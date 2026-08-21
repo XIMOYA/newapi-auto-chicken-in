@@ -11,6 +11,7 @@
     python main.py --no-browser       只走 HTTP 快路径，不启浏览器
     python main.py --parallel 6       账号级并行度（自动签到固定 6，人工模式 1）
     python main.py --browser-parallel 3   浏览器实例并发上限（自动签到固定 3）
+    python main.py --shard-plan 30    只算分片名单：每 30 个账号一片，写 data/shard-plan.json
     python main.py -v                 详细日志
 
 退出码：0 全部成功 / 1 有失败 / 2 配置错误 / 130 被中断
@@ -19,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -27,6 +29,10 @@ from newapi_checkin import __version__
 from newapi_checkin import logger as log
 from newapi_checkin.config import LOGS_DIR, ConfigError, load_config
 from newapi_checkin.runner import RunOptions, Runner
+
+# 分片计划的落盘位置。写文件而不是打到 stdout：日志走 rich Console（也是 stdout），
+# 混在一起 workflow 没法干净地把 JSON 取出来。
+SHARD_PLAN_PATH = Path("data") / "shard-plan.json"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", metavar="PATH", help="指定配置文件路径，默认 config.json")
     parser.add_argument("--account", action="append", metavar="NAME",
                         help="只跑指定账号，可重复传入或用逗号分隔")
+    parser.add_argument(
+        "--shard-plan", type=int, metavar="SIZE",
+        help="不签到：把启用账号每 SIZE 个切一片，写出 GitHub Actions matrix 用的 "
+             f"{SHARD_PLAN_PATH}，供分片并行的前置 job 读取",
+    )
     parser.add_argument("--dry-run", action="store_true",
                         help="只验证当前登录方式的凭据与连通性，不执行签到")
     parser.add_argument(
@@ -78,6 +89,46 @@ def _split_accounts(values) -> list:
     for item in values or []:
         names.extend(part.strip() for part in str(item).split(",") if part.strip())
     return names
+
+
+def _write_shard_plan(cfg, args, size: int) -> int:
+    """把启用账号每 size 个切一片，写出 Actions matrix 能直接吃的 JSON。
+
+    走的是和签到完全一样的配置加载路径（含远程同步），否则平台上刚加的账号会被漏掉，
+    或者刚停用的账号还占着一个分片。
+
+    账号名不能含逗号：分片是靠 `--account A,B,C` 传给各个 job 的，而 --account 本来
+    就按逗号切，含逗号的名字会在传递途中被拆成两个不存在的账号。这里提前拦下来，
+    比让某个 job 在半夜报「找不到账号」好。
+    """
+    if size <= 0:
+        log.err(f"--shard-plan 需要正整数，收到 {size}")
+        return 2
+    try:
+        accounts = cfg.select(_split_accounts(args.account))
+    except ConfigError as exc:
+        log.err(str(exc))
+        return 2
+
+    names = [a.name for a in accounts]
+    bad = [n for n in names if "," in n]
+    if bad:
+        log.err(f"账号名不能包含逗号（分片按逗号传递）: {', '.join(bad)}")
+        return 2
+
+    shards = [
+        {"index": i + 1, "accounts": ",".join(names[i * size:(i + 1) * size])}
+        for i in range((len(names) + size - 1) // size)
+    ]
+    plan = {"count": len(names), "total": len(shards), "shards": shards}
+    SHARD_PLAN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SHARD_PLAN_PATH.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+    if not names:
+        log.warn(f"没有启用的账号，分片计划为空（已写入 {SHARD_PLAN_PATH}）")
+    else:
+        log.ok(f"分片计划已写入 {SHARD_PLAN_PATH}：{len(names)} 个启用账号 "
+               f"-> {len(shards)} 个分片（每片最多 {size} 个）")
+    return 0
 
 
 def _maybe_sync_remote_config(cfg) -> None:
@@ -126,6 +177,10 @@ def main(argv=None) -> int:
     if cfg.migrated_from is not None:
         log.warn(f"已把旧配置 {cfg.migrated_from.name} 迁移为 config.json，"
                  f"请补上 ai 段落后再启用 AI 辅助")
+
+    # 分片计划：只算名单不签到，放在远程同步之后，保证与真正开跑时看到的是同一份账号
+    if args.shard_plan is not None:
+        return _write_shard_plan(cfg, args, args.shard_plan)
 
     # CLI 覆盖配置
     if args.manual and args.headless:
