@@ -81,6 +81,18 @@ RUN_LOCK_STALE_HINT_MINUTES = 5
 # 并发路径压根没有"账号间隔"这个概念，配置只在人工串行时生效，形同摆设。
 # 现在收成常量：人工模式仍然逐个来、中间喘口气，其余场景由并发度控制节奏。
 MANUAL_INTERVAL_SECONDS = (3.0, 8.0)
+# 代理池预取的余量：在「按共用上限折算出的占用量」之外多备这么多个出口。
+#
+# 盾类失败靠换 IP 翻盘，而且是不限次数地换，所以余量比占用量更值钱 —— 占用量算少了
+# 顶多几个账号挤一个 IP，余量算少了会在最需要换 IP 的时候拿不到新的。
+PROXY_SPARE_COUNT = 50
+# 平台上凭据保活占锁时用的 source 值，必须和 Go 侧 tabiaiKeepaliveSource 一致。
+KEEPALIVE_RUN_SOURCE = "tabiai-keepalive"
+# 开跑前最多等保活多久（秒）。保活一轮的超时是 10 分钟，但签到本身有价值，
+# 不能因为等锁彻底不跑；超时就带着告警继续。
+KEEPALIVE_WAIT_MAX_SECONDS = 300
+# 等待期间的轮询间隔（秒）。保活一轮通常几十秒，5 秒够灵敏又不刷接口
+KEEPALIVE_POLL_SECONDS = 5
 # 出口 IP 探测结果缓存的上限。代理池在换 IP 时地址是有限的，但 daemon 长跑
 # 或手动配置频繁变更时不该让这个 dict 无界增长，超出后丢弃最早的一条。
 IP_CACHE_MAX = 256
@@ -137,6 +149,20 @@ class Runner:
     # ------------------------------------------------------------------ #
     # 懒加载资源
     # ------------------------------------------------------------------ #
+
+    def _desired_proxies(self, accounts: int) -> int:
+        """按共用上限折算这一轮该预取多少代理。
+
+        以前是「账号数 + 10」，那是一账号一 IP 的年代。现在同一出口最多给
+        max_accounts_per_ip 个账号用，占用量按上限除下来，省掉的抓取+测通时间很可观：
+        64 个账号从探 74 个降到探 16+50。
+
+        上限设成 0（不限共用）时按账号数算 —— 不限共用不等于只需要一个 IP，
+        换 IP 的余量还是得留够。
+        """
+        limit = int(getattr(self.cfg.proxy_pool, "max_accounts_per_ip", 0) or 0)
+        needed = accounts if limit <= 0 else -(-accounts // limit)  # 向上取整
+        return max(1, needed) + PROXY_SPARE_COUNT
 
     def init_proxy_pool(self, desired: Optional[int] = None,
                         accounts: Optional[int] = None) -> None:
@@ -357,9 +383,11 @@ class Runner:
         # 自动签到固定 6 个账号并发；人工模式强制串行 1。
         self._set_parallelism(1 if self.options.manual else DEFAULT_ACCOUNT_PARALLELISM)
 
-        # 代理池：启用后就必须走代理，拿不到代理的账号会被跳过而不是直连
-        # desired 比账号数多 10：留出换 IP 的余量，账号越多目标越大
-        self.init_proxy_pool(desired=len(accounts) + 10, accounts=len(accounts))
+        # 代理池：启用后就必须走代理，拿不到代理的账号会被跳过而不是直连。
+        # desired 按共用上限折算（详见 _desired_proxies）：同一出口可以服务多个账号，
+        # 所以要的不是「一账号一 IP」，而是「够摊平 + 够换」
+        self.init_proxy_pool(desired=self._desired_proxies(len(accounts)),
+                             accounts=len(accounts))
 
         try:
             if self.options.cookie_test:
@@ -367,6 +395,9 @@ class Runner:
             else:
                 mode = "dry-run 连通性检查" if self.options.dry_run else "签到"
             log.step(f"开始{mode}，共 {len(accounts)} 个账号")
+            # 先等平台上的凭据保活跑完：它也会真 refresh，撞上会让旧代被判重放。
+            # 保活那边会避让签到，但「它跑到一半我们才启动」这个窗口只能由这里堵
+            self._wait_for_keepalive(accounts)
             # 告诉平台「我开始跑了」，网页端据此锁住 TaBiAI 检测与签发。
             # 放在账号筛选之后：没有账号可跑时压根不该上报，省得白锁一段时间。
             self._start_run_report(accounts)
@@ -399,6 +430,45 @@ class Runner:
     # ------------------------------------------------------------------ #
     # 运行状态上报（配合平台锁住高危凭据操作）
     # ------------------------------------------------------------------ #
+
+    def _wait_for_keepalive(self, accounts: list) -> None:
+        """签到开跑前，等平台上的凭据保活跑完。
+
+        保活也会真 refresh，两边同时动同一条 sid 会让旧代被判重放、整条会话被站点
+        撤销。保活自己会避让签到，但「保活跑到一半、签到才启动」那个窗口只能由这边堵。
+
+        只等保活，不等别的签到进程：run_state 是引用计数锁，分片并行时几个 job 互相
+        持锁是正常的，互等会直接死锁。所以判定落在 source 上而不是「有人持锁」。
+
+        查询失败一律当没锁 —— 平台不可达时不该连签到都做不了。
+        """
+        if not self._needs_run_lock(accounts):
+            return
+        from .remote_sync import fetch_run_state
+
+        deadline = time.monotonic() + KEEPALIVE_WAIT_MAX_SECONDS
+        waited = False
+        while True:
+            ok, state = fetch_run_state(self.cfg.config_sync)
+            if not ok:
+                return
+            if not state.get("running"):
+                if waited:
+                    log.ok("凭据保活已结束，继续签到")
+                return
+            if KEEPALIVE_RUN_SOURCE not in str(state.get("source") or ""):
+                # 是别的分片 job 在跑，那是同伴不是竞争者
+                return
+            left = deadline - time.monotonic()
+            if left <= 0:
+                log.warn(f"等凭据保活超过 {KEEPALIVE_WAIT_MAX_SECONDS} 秒仍未结束，"
+                         "继续签到（存在与保活撞代次的风险）")
+                return
+            if not waited:
+                log.info("平台上的凭据保活正在运行，先等它跑完"
+                         f"（最多 {KEEPALIVE_WAIT_MAX_SECONDS} 秒）")
+                waited = True
+            time.sleep(min(KEEPALIVE_POLL_SECONDS, left))
 
     def _needs_run_lock(self, accounts: list) -> bool:
         """这一轮值不值得上报。

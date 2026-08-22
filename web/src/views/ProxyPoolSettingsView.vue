@@ -101,6 +101,13 @@ web/src/views/ProxyPoolSettingsView.vue
           <n-input-number v-model:value="form.preflight_seconds" :min="1" :max="120" class="num-input" />
           <span class="switch-tip">到点就用已有结论，没测到的照旧保留，不会因为超时误删</span>
         </n-form-item>
+        <n-form-item label="单 IP 账号数上限">
+          <n-input-number v-model:value="form.max_accounts_per_ip" :min="0" :max="64" class="num-input" />
+          <span class="switch-tip">
+            几个账号可以共用一个出口；0 = 不限。客户端按它折算要预取多少代理，
+            调小更安全但要抓更多 IP
+          </span>
+        </n-form-item>
       </n-form>
     </config-card>
   </div>
@@ -153,7 +160,8 @@ const form = reactive<ProxyPoolConfig>({
   report_feedback: true,
   preflight_check: true,
   preflight_limit: 60,
-  preflight_seconds: 15
+  preflight_seconds: 15,
+  max_accounts_per_ip: 4
 })
 
 function initForm(cfg: AppConfig) {
@@ -178,6 +186,7 @@ function initForm(cfg: AppConfig) {
   form.preflight_check = p.preflight_check ?? true
   form.preflight_limit = p.preflight_limit ?? 60
   form.preflight_seconds = p.preflight_seconds ?? 15
+  form.max_accounts_per_ip = p.max_accounts_per_ip ?? 4
   savedSnapshot.value = JSON.stringify(form)
 }
 

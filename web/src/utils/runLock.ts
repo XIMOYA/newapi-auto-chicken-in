@@ -52,9 +52,32 @@ export function secondsUntilAutoUnlock(state: RunState, now = Date.now()): numbe
   return left > 0 ? left : 0
 }
 
+/**
+ * 平台上的凭据保活占锁时用的 source。
+ *
+ * 必须和 Go 侧 tabiaiKeepaliveSource、Python 侧 KEEPALIVE_RUN_SOURCE 字面量一致 ——
+ * 三端靠这个字符串识别「这把锁是保活的」，改一处就得改三处。
+ */
+export const KEEPALIVE_RUN_SOURCE = 'tabiai-keepalive'
+
 /** 「谁在跑」的展示名：后端可能没拿到来源，别在界面上留空白 */
 export function runLockOwner(state: RunState): string {
-  return state.source.trim() || '签到客户端'
+  const source = state.source.trim()
+  if (!source) return '签到客户端'
+  // 保活是服务端自己的协程，把 tabiai-keepalive 这种机器串摊到界面上没人看得懂
+  if (source.includes(KEEPALIVE_RUN_SOURCE)) return '凭据保活'
+  return source
+}
+
+/**
+ * 持锁者正在干什么。
+ *
+ * 保活跑的是 refresh 而不是签到，一律说成「正在签到」会让用户在没有签到任务的时候
+ * 看到「正在签到」，把它当成残留的僵尸锁去点强制解锁 —— 那恰好会打断正在轮转 sid
+ * 的保活，比不提示更糟。
+ */
+function runLockAction(state: RunState): string {
+  return state.source.includes(KEEPALIVE_RUN_SOURCE) ? '正在刷新凭据' : '正在签到'
 }
 
 /**
@@ -64,14 +87,15 @@ export function runLockSummary(state: RunState, now = Date.now()): string {
   if (!state.running) return ''
   const left = secondsUntilAutoUnlock(state, now)
   const owner = runLockOwner(state)
+  const action = runLockAction(state)
   // 分片并行时会有多个持有者，说一句能省掉「为什么点了解锁还锁着」的困惑
   const shards = state.holders > 1 ? `（${state.holders} 个任务在跑）` : ''
   if (left <= 0) {
-    return `${owner} 正在签到${shards}，TaBiAI 凭据检测与签发已锁定`
+    return `${owner} ${action}${shards}，TaBiAI 凭据检测与签发已锁定`
   }
   // 不足一分钟也报 1 分钟：显示「还剩 0 分钟」比模糊说法更让人困惑
   const minutes = Math.max(1, Math.ceil(left / 60))
-  return `${owner} 正在签到${shards}，TaBiAI 凭据检测与签发已锁定；`
+  return `${owner} ${action}${shards}，TaBiAI 凭据检测与签发已锁定；`
     + `若对方已停止上报心跳，约 ${minutes} 分钟后自动解锁`
 }
 

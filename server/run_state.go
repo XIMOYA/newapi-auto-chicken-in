@@ -31,6 +31,13 @@ import (
 // 多台机器同时跑同一份配置本身就会撞代次，不是这里要支持的场景。
 const runStateRowID = 1
 
+// tabiaiKeepaliveSource 凭据保活占锁时用的 source 值。
+//
+// 保活也会真 refresh，所以它跑的时候必须同样挡住网页端的凭据操作。但签到客户端
+// 只该为**保活**让路，不能因为看到别的分片持锁就傻等 —— run_state 是引用计数锁，
+// 分片并行时互等会直接死锁。客户端靠这个字符串区分「该等的」和「同伴」。
+const tabiaiKeepaliveSource = "tabiai-keepalive"
+
 const (
 	// runStateHeartbeatSeconds 建议客户端多久上报一次心跳。
 	// 通过 start 响应下发，客户端不必硬编码；改这里就能全局调整。

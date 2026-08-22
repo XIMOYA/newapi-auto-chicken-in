@@ -407,6 +407,7 @@ Actions 每 30 个账号拆一个 job 并行跑时，几个 job 拿到同一份�
 | `preflight_check` | bool | `true` | 签到前在客户端本机快测一遍预取列表，剔掉当场连不上的 |
 | `preflight_limit` | int | `60` | 自筛只测列表最前面多少条；`0` = 不自筛。Python 侧夹到 0..500 |
 | `preflight_seconds` | int | `15` | 自筛整体时间盒（秒），到点就用已有结论。Python 侧夹到 1..120 |
+| `max_accounts_per_ip` | int | `4` | 同一出口 IP 最多给几个账号用，`<=0` 不限。客户端按 `ceil(账号数 / 它) + 50` 折算预取量。Python 侧夹到 0..64 |
 
 自筛探测打的仍是 `proxy_pool.test_url`，不碰目标站点。两个语义要点：
 
@@ -490,6 +491,18 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
 为什么要它：网页端的 TaBiAI 凭据检测**本身就是一次真 refresh**，签到进程同时也在
 推进代次。两边一撞，谁手里的代次旧了下次就会被判重放，整条会话被撤销
 （`AUTH_SESSION_REVOKED`），只能重新签发。这不是「本次检测失败」，是把账号打死。
+
+**服务端的凭据保活也占这把锁**，`source` 固定为 `tabiai-keepalive`。这是一个
+**跨语言契约**：Python 客户端（`runner.KEEPALIVE_RUN_SOURCE`）和网页端
+（`runLock.KEEPALIVE_RUN_SOURCE`）都按这个字面量比对，改一处就得改三处。
+
+客户端据此反向避让：开跑前 `GET /api/run-state`，若 `running` 且 `source` 含
+`tabiai-keepalive` 就等它跑完（上限 300 秒，超时带告警继续）。判定必须落在 `source`
+而不是「`running` 为真」——分片并行时同伴 job 也持锁，按 `running` 判会互等死锁。
+纯 Cookie 账号的轮次不查。查询失败当成没锁，照常签到。
+
+单行表只记一个 `source`：客户端超时放行后再 start 会让 `holders` 变 2（互斥仍然正确），
+但 `source` 被覆盖成客户端的名字，此时从响应里看不出保活也在跑。
 
 ### TaBiAI 凭据保活
 
@@ -637,7 +650,7 @@ tabiai 账号会就地判 `turnstile_required` 失败，整轮白跑。
   "ai": { "enabled": false, "base_url": "", "api_key": "", "model": "gpt-4o-mini", "timeout": 60, "max_retries": 2 },
   "browser": { "driver": "camoufox", "headless": "virtual", "humanize": true, "timeout": 60, "keep_artifacts_on_fail": true, "locale": "zh-CN", "window": [1280, 800], "executable_path": null },
   "http": { "impersonate": "chrome", "timeout": 20, "verify": true },
-  "proxy_pool": { "enabled": false, "test_url": "https://api.ipify.org", "timeout": 8, "max_workers": 25, "max_proxies": 250, "ip_swap_limit": 10, "sources": [], "refresh_minutes": 30, "save_limit": 0, "auto_test": true, "remote_url": "", "remote_token": "", "remote_token_header": "Authorization", "remote_token_prefix": "Bearer", "report_feedback": true, "preflight_check": true, "preflight_limit": 60, "preflight_seconds": 15 },
+  "proxy_pool": { "enabled": false, "test_url": "https://api.ipify.org", "timeout": 8, "max_workers": 25, "max_proxies": 250, "ip_swap_limit": 10, "sources": [], "refresh_minutes": 30, "save_limit": 0, "auto_test": true, "remote_url": "", "remote_token": "", "remote_token_header": "Authorization", "remote_token_prefix": "Bearer", "report_feedback": true, "preflight_check": true, "preflight_limit": 60, "preflight_seconds": 15, "max_accounts_per_ip": 4 },
   "notify": { "email": { "enabled": false, "smtp_host": "smtp.aliyun.com", "smtp_port": 465, "use_ssl": true, "username": "", "password": "", "from_addr": "", "to_addrs": [], "subject_prefix": "NewAPI 签到日报", "timeout": 20 } },
   "config_sync": { "enabled": false, "url": "", "method": "GET", "token": "", "token_header": "Authorization", "token_prefix": "Bearer", "headers": {}, "body": null, "response_field": "", "timeout": 20, "auto_before_checkin": true },
   "security": { "encryption_enabled": false, "config_key": "", "encrypted_file": "data/config.encrypted.json" }

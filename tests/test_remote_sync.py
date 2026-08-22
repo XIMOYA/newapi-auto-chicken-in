@@ -2,6 +2,7 @@
 
 import json
 
+from newapi_checkin import remote_sync
 from newapi_checkin.config_store import load_document, save_document
 from newapi_checkin.remote_sync import _merge_payload, sync_remote_config
 from newapi_checkin.secure_config import encrypt_json
@@ -198,3 +199,75 @@ def test_auto_only_skips_when_auto_sync_is_off(tmp_path, monkeypatch):
 
     assert result["ok"] is True
     assert result["skipped"] is True
+
+
+class TestFetchRunState:
+    """查平台运行锁。签到开跑前靠它判断凭据保活是不是正在跑。"""
+
+    @staticmethod
+    def _sync(enabled=True, url="https://panel.example.com/api/config/raw"):
+        from newapi_checkin.config import ConfigSyncConfig
+
+        return ConfigSyncConfig.from_raw({"enabled": enabled, "url": url, "token": "k" * 20})
+
+    def _capture(self, monkeypatch, response):
+        """替掉网络层，记录实际发出的请求。"""
+        seen = {}
+
+        def fake_request(method, url, **kwargs):
+            seen.update(method=method, url=url, **kwargs)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        monkeypatch.setattr(remote_sync.cffi, "request", fake_request)
+        return seen
+
+    def test_reads_running_source_over_get(self, monkeypatch):
+        """必须用 GET：这个端点是只读的，POST 会被平台当成 start 上报。"""
+        seen = self._capture(
+            monkeypatch, FakeResponse({"running": True, "source": "tabiai-keepalive"})
+        )
+        ok, state = remote_sync.fetch_run_state(self._sync())
+        assert ok is True
+        assert state["source"] == "tabiai-keepalive"
+        assert seen["method"] == "GET"
+        assert seen["url"] == "https://panel.example.com/api/run-state"
+        assert "json" not in seen
+
+    def test_carries_the_api_key_header(self, monkeypatch):
+        """客户端只有 API Key，没有 JWT —— 认证头漏了就永远查不到锁。"""
+        seen = self._capture(monkeypatch, FakeResponse({"running": False}))
+        remote_sync.fetch_run_state(self._sync())
+        assert any("k" * 20 in str(v) for v in seen["headers"].values())
+
+    def test_disabled_sync_short_circuits(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(remote_sync.cffi, "request",
+                            lambda *a, **kw: called.append(1))
+        assert remote_sync.fetch_run_state(self._sync(enabled=False)) == (False, {})
+        assert called == []
+
+    def test_unusable_url_reports_failure_instead_of_raising(self, monkeypatch):
+        monkeypatch.setattr(remote_sync.cffi, "request",
+                            lambda *a, **kw: FakeResponse({"running": True}))
+        assert remote_sync.fetch_run_state(self._sync(url="")) == (False, {})
+        assert remote_sync.fetch_run_state(self._sync(url="不是个地址")) == (False, {})
+
+    def test_network_error_is_swallowed(self, monkeypatch):
+        self._capture(monkeypatch, RuntimeError("connection reset"))
+        assert remote_sync.fetch_run_state(self._sync()) == (False, {})
+
+    def test_http_error_and_garbage_body_are_not_trusted(self, monkeypatch):
+        self._capture(monkeypatch, FakeResponse({"message": "boom"}, status_code=500))
+        assert remote_sync.fetch_run_state(self._sync()) == (False, {})
+
+        class NotJson:
+            status_code = 200
+            text = "<html>"
+
+            def json(self):
+                raise ValueError("no json")
+
+        self._capture(monkeypatch, NotJson())
+        assert remote_sync.fetch_run_state(self._sync()) == (False, {})

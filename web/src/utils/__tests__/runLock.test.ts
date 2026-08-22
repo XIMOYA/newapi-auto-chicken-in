@@ -6,6 +6,7 @@ web/src/utils/__tests__/runLock.test.ts
 */
 import { describe, expect, it } from 'vitest'
 import {
+  KEEPALIVE_RUN_SOURCE,
   RUN_LOCK_POLL_INTERVAL,
   idleRunState,
   runLockFromError,
@@ -163,5 +164,48 @@ describe('轮询间隔', () => {
   it('比配置版本号轮询更慢：锁的变化频率低得多', () => {
     expect(RUN_LOCK_POLL_INTERVAL).toBeGreaterThanOrEqual(5000)
     expect(RUN_LOCK_POLL_INTERVAL).toBeLessThanOrEqual(30000)
+  })
+})
+
+describe('凭据保活占锁时的文案', () => {
+  // 服务端的保活协程也会占这把锁。它跑的是 refresh 而不是签到，文案说错的代价不是
+  // 「提示不准」——用户看到「正在签到」却没有签到任务，会当成僵尸锁去强制解锁，
+  // 那恰好打断正在轮转 sid 的保活。
+  const keepalive = (overrides: Partial<RunState> = {}) =>
+    locked({ source: KEEPALIVE_RUN_SOURCE, ...overrides })
+
+  it('source 常量必须和 Go/Python 两端字面量一致', () => {
+    expect(KEEPALIVE_RUN_SOURCE).toBe('tabiai-keepalive')
+  })
+
+  it('持锁者显示成人话，不把机器串摊到界面上', () => {
+    expect(runLockOwner(keepalive())).toBe('凭据保活')
+  })
+
+  it('说「正在刷新凭据」而不是「正在签到」', () => {
+    const text = runLockSummary(keepalive(), NOW)
+    expect(text).toContain('凭据保活 正在刷新凭据')
+    expect(text).not.toContain('正在签到')
+  })
+
+  it('倒计时与锁定说明照旧给全', () => {
+    const text = runLockSummary(keepalive(), NOW)
+    expect(text).toContain('TaBiAI 凭据检测与签发已锁定')
+    expect(text).toContain('4 分钟')
+  })
+
+  it('签到客户端占锁时文案不受影响', () => {
+    const text = runLockSummary(locked(), NOW)
+    expect(text).toContain('GitHub Actions（me/repo） 正在签到')
+    expect(text).not.toContain('刷新凭据')
+  })
+
+  it('source 带前后缀也能认出来（服务端可能拼上实例名）', () => {
+    expect(runLockOwner(locked({ source: `${KEEPALIVE_RUN_SOURCE} (panel-1)` }))).toBe('凭据保活')
+  })
+
+  it('空 source 仍退化成「签到客户端」，不会被误判成保活', () => {
+    expect(runLockOwner(locked({ source: '  ' }))).toBe('签到客户端')
+    expect(runLockSummary(locked({ source: '' }), NOW)).toContain('签到客户端 正在签到')
   })
 })

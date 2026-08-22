@@ -380,6 +380,22 @@ func (k *TabiAIKeepalive) RunOnce(ctx context.Context, trigger string) (int, int
 	k.skippedByCheckin = false
 	k.mu.Unlock()
 
+	// 反向保护：保活自己也占住这把锁。
+	//
+	// 只在开头查一次 run_state 是不够的 —— 保活跑到一半时签到可能才启动，两边就会
+	// 在同一条 sid 上撞。占锁让签到客户端在开跑前能看见我们（它只对 keepalive 这个
+	// source 让路），也顺手挡住「保活期间网页端点凭据检测」这个同类漏洞。
+	if _, err := StartRun(k.db, tabiaiKeepaliveSource); err != nil {
+		log.Printf("[tabiai-keepalive] 占用运行锁失败，本轮跳过（避免和签到撞代次）: %v", err)
+		return 0, 0, 0
+	}
+	defer func() {
+		// defer 释放：panic 或提前 return 也不能把锁留在库里，那会一直挡着网页端
+		if err := StopRun(k.db); err != nil {
+			log.Printf("[tabiai-keepalive] 释放运行锁失败（5 分钟后会自动过期）: %v", err)
+		}
+	}()
+
 	cfg, _, err := LoadConfig(k.db)
 	if err != nil {
 		log.Printf("[tabiai-keepalive] 读配置失败: %v", err)

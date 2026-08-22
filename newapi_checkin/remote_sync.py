@@ -336,6 +336,35 @@ def report_run_start(sync: ConfigSyncConfig, source: str) -> tuple[bool, str, in
     return True, detail, gap
 
 
+def fetch_run_state(sync: ConfigSyncConfig) -> tuple[bool, dict]:
+    """查平台当前的运行锁状态。返回 (查询是否成功, 状态字典)。
+
+    用途是「签到开跑前看看凭据保活是不是正在跑」：保活也会真 refresh，两边同时动
+    同一条 sid 会让旧代被判重放。查询失败一律当成没锁 —— 平台不可达时不该连签到
+    都做不了。
+
+    GET 而不是 POST：这个端点是只读的，用 POST 会被平台当成 start 上报。
+    """
+    if not sync.enabled:
+        return False, {}
+    # 端点是 /api/run-state（不带 action 后缀），复用同源推导后去掉尾部斜杠
+    endpoint = _run_state_endpoint(sync, "").rstrip("/")
+    if not endpoint:
+        return False, {}
+    try:
+        response = cffi.request("GET", endpoint, headers=_headers(sync), timeout=sync.timeout)
+    except Exception as exc:  # noqa: BLE001 - 网络库异常类型不固定
+        log.debug(f"查运行锁失败: {type(exc).__name__}: {exc}")
+        return False, {}
+    if int(getattr(response, "status_code", 0) or 0) >= 400:
+        return False, {}
+    try:
+        parsed = response.json()
+    except Exception:  # noqa: BLE001
+        return False, {}
+    return (True, parsed) if isinstance(parsed, dict) else (False, {})
+
+
 def report_run_heartbeat(sync: ConfigSyncConfig) -> tuple[bool, bool]:
     """续期。返回 (上报是否成功, 平台是否仍认为我在跑)。
 

@@ -527,6 +527,14 @@ job 并行跑时，几个 job 各自 start，谁先跑完都不会把还在跑�
 `holders` 是当前持有这把锁的进程数，分片并行时大于 1。网页端会在提示里带上它，
 免得用户以为解锁按钮没生效。
 
+**`source` 为 `tabiai-keepalive` 表示服务端的凭据保活正在跑**（不是签到客户端）。
+签到客户端开跑前查这个端点，只在识别到这个 source 时等待（上限 300 秒，超时带告警
+继续）。判定必须按 source 而不是 `running`：分片并行时同伴 job 也持锁，按 `running`
+判会让分片互等死锁。这个字面量在 Go、Python、Web 三端各有一份常量，改要一起改。
+
+单行表只记一个 `source`。客户端超时放行后再 start 会让 `holders` 变 2（互斥仍然正确），
+但 `source` 被覆盖成客户端的名字，此时从这里看不出保活也在跑 —— 只影响观测。
+
 ### POST /api/run-state/unlock
 
 双认证。管理员强制解锁。**200** `{ "ok": true }`
@@ -948,6 +956,7 @@ Go 侧除了存取之外不读它们 —— 在网页端改完不会影响服务
 | preflight_check | bool | `true` | 签到前在客户端本机快测一遍预取列表，剔掉当场连不上的 |
 | preflight_limit | int | `60` | 自筛只测列表最前面多少条；`0` = 不自筛。Python 侧夹到 0..500 |
 | preflight_seconds | int | `15` | 自筛整体时间盒（秒），到点就用已有结论。Python 侧夹到 1..120 |
+| max_accounts_per_ip | int | `4` | 同一出口 IP 最多给几个账号用，`<=0` 不限。客户端按 `ceil(账号数 / 它) + 50` 折算预取量。Python 侧夹到 0..64 |
 
 自筛探测打的仍是 `proxy_pool.test_url`，不碰目标站点。两个语义要点：
 

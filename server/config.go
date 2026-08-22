@@ -131,6 +131,12 @@ type ProxyPool struct {
 	PreflightCheck   bool `json:"preflight_check"`
 	PreflightLimit   int  `json:"preflight_limit"`
 	PreflightSeconds int  `json:"preflight_seconds"`
+	// MaxAccountsPerIP 同一出口 IP 最多给几个账号用，<=0 视为不限。
+	//
+	// 客户端据此分配代理，也据此折算要预取多少个：占用量 = ceil(账号数 / 这个值)，
+	// 再加固定余量。共用是正常策略而不是降级 —— 4 个账号共用一个出口通常不会招来
+	// 更多质询，换来的是预取与测通量大幅下降。发现盾突然变难过时先把它调小。
+	MaxAccountsPerIP int `json:"max_accounts_per_ip"`
 }
 
 // Notify 通知配置。
@@ -222,6 +228,7 @@ func DefaultConfig() Config {
 			PreflightCheck:    true,
 			PreflightLimit:    60,
 			PreflightSeconds:  15,
+			MaxAccountsPerIP:  4,
 		},
 		Notify: Notify{
 			Email: EmailConfig{

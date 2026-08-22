@@ -86,6 +86,14 @@ class ProxyPoolConfig:
     preflight_check: bool = True
     preflight_limit: int = 60      # 只测前多少个（列表已按优选排过，后面的本来也轮不到）
     preflight_seconds: int = 15    # 整体时间盒；超时就用已有结论，不为了测全拖慢签到
+    # 同一个出口 IP 最多给几个账号用。<=0 视为不限。
+    #
+    # 以前是「优先一账号一 IP，池子用尽才被迫共用」，共用还当降级告警。现在共用是正常
+    # 策略：4 个账号共用一个 IP 在实践上通常不会招来更多质询，换来的是预取量大幅下降
+    # （desired 按这个上限折算），启动快得多。
+    # 代价要知道：同 IP 上的账号越多，这个出口被 Cloudflare/Turnstile 盯上的概率越高；
+    # 如果哪天发现盾突然变难过，先把这个值调小。
+    max_accounts_per_ip: int = 4
 
     @classmethod
     def from_raw(cls, raw: Optional[dict]) -> "ProxyPoolConfig":
@@ -114,6 +122,8 @@ class ProxyPoolConfig:
             preflight_check=_as_bool(raw.get("preflight_check"), True),
             preflight_limit=max(0, min(500, _as_int(raw.get("preflight_limit"), 60))),
             preflight_seconds=max(1, min(120, _as_int(raw.get("preflight_seconds"), 15))),
+            # 0 或负数表示不限共用；上限 64 是防手滑写出天文数字
+            max_accounts_per_ip=max(0, min(64, _as_int(raw.get("max_accounts_per_ip"), 4))),
         )
 
     def to_dict(self) -> dict:
@@ -133,6 +143,7 @@ class ProxyPoolConfig:
             "preflight_check": self.preflight_check,
             "preflight_limit": self.preflight_limit,
             "preflight_seconds": self.preflight_seconds,
+            "max_accounts_per_ip": self.max_accounts_per_ip,
         }
 
 
@@ -538,31 +549,53 @@ class ProxyPool:
     # ------------------------------------------------------------------ #
 
     def acquire(self) -> Optional[str]:
-        """分配一个代理。优先独占且按质量择优；池子用尽时复用已分配的，绝不返回「直连」。
+        """分配一个代理。同一 IP 最多给 max_accounts_per_ip 个账号用，绝不返回「直连」。
 
-        调用方的要求是「宁可几个账号共用一个代理 IP，也不要降级直连」，所以只有
-        池里连一个未拉黑的代理都没有时才返回 None。共用时挑「当前使用账号数最少」
-        的那个，把账号尽量摊平到各个出口 IP 上。
+        共用是**正常策略**而不是降级：4 个账号共用一个出口在实践上通常不会招来更多
+        质询，换来的是预取量大幅下降、启动快得多。所以这里不再「优先独占」，而是
+        在「还没到共用上限」的代理里挑用得最少的那个 —— 摊平比装箱安全，账号散在
+        各个 IP 上，单个 IP 被盯上时受影响的账号更少。
 
         择优取代理：服务器预取时 available 已按速度/延迟排序（speed_bps 高、
-        延迟低在前），本地抓取时 _available 也是按存活+延迟排好序的，所以这里
-        顺序取第一个空闲代理就能实现「优选」，而不是随机选。
+        延迟低在前），本地抓取时 _available 也是按存活+延迟排好序的。共用数相同时
+        取列表里更靠前的那个，等于在同等负载下选质量更好的出口。
+
+        所有代理都到上限后仍然继续超额共用并告警 —— 宁可几个账号挤一个 IP，
+        也不要降级直连。只有池里连一个未拉黑的代理都没有时才返回 None。
         """
         with self._lock:
             healthy = [p for p in self._available if p not in self._bad]
             if not healthy:
                 return None
-            fresh = [p for p in healthy if p not in self._used]
-            if fresh:
-                proxy = fresh[0]  # 顺序取优：列表头 = 质量最好（服务器已排序）
+            limit = int(getattr(self.cfg, "max_accounts_per_ip", 0) or 0)
+            # 共用数最少优先；同等负载下保持 _available 的优选顺序（enumerate 做稳定次序）
+            ranked = sorted(
+                enumerate(healthy),
+                key=lambda pair: (self._share_count.get(pair[1], 0), pair[0]),
+            )
+            if limit > 0:
+                room = [p for _, p in ranked if self._share_count.get(p, 0) < limit]
+                if room:
+                    proxy = room[0]
+                    self._used.add(proxy)
+                    self._share_count[proxy] = self._share_count.get(proxy, 0) + 1
+                    shared = self._share_count[proxy]
+                    if shared > 1:
+                        log.debug(f"代理 {proxy} 已分配给 {shared} 个账号（上限 {limit}）")
+                    return proxy
+            else:
+                # 不限共用：直接给用得最少的
+                proxy = ranked[0][1]
                 self._used.add(proxy)
-                self._share_count[proxy] = 1
+                self._share_count[proxy] = self._share_count.get(proxy, 0) + 1
                 return proxy
-            # 池已用尽：复用被共用得最少的那个
-            proxy = min(healthy, key=lambda p: self._share_count.get(p, 1))
-            self._share_count[proxy] = self._share_count.get(proxy, 1) + 1
+            # 全部到达上限：仍然共用而不是直连，但这次要提醒 —— 池子确实不够用了
+            proxy = ranked[0][1]
+            self._used.add(proxy)
+            self._share_count[proxy] = self._share_count.get(proxy, 0) + 1
             shared = self._share_count[proxy]
-        log.warn(f"代理池已无空闲 IP，改为共用 {proxy}（含本账号，该 IP 上共 {shared} 个账号在用）")
+        log.warn(f"所有代理都已达到 {limit} 个账号的共用上限，超额共用 {proxy}"
+                 f"（该 IP 上共 {shared} 个账号在用）；建议扩大代理源或调高上限")
         return proxy
 
     def mark_bad(self, proxy: Optional[str], reason: str = "net") -> None:

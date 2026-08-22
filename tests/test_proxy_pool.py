@@ -101,7 +101,7 @@ class TestProxyPoolConfig:
 
 
 class TestProxyPoolAllocation:
-    """核心约定：优先独占；池子用尽时共用，绝不返回「直连」。"""
+    """核心约定：共用未到上限时挑负载最轻的 IP；池子用尽时超额共用，绝不返回「直连」。"""
 
     def test_acquire_prefers_exclusive_ips(self):
         pool = ProxyPool(ProxyPoolConfig())
@@ -667,3 +667,111 @@ class TestOneProxyPerAccount:
         third = account.proxy
         assert len({first, second, third}) == 3
         assert first in runner._pool._bad and second in runner._pool._bad
+
+
+# --------------------------------------------------------------------------- #
+# 单 IP 多账号共用
+# --------------------------------------------------------------------------- #
+
+
+class TestSharedIPCapacity:
+    """同一出口 IP 最多服务 max_accounts_per_ip 个账号（默认 4）。"""
+
+    def test_default_limit_is_four(self):
+        assert ProxyPoolConfig().max_accounts_per_ip == 4
+        assert ProxyPoolConfig.from_raw({}).max_accounts_per_ip == 4
+        assert ProxyPoolConfig.from_raw({"max_accounts_per_ip": None}).max_accounts_per_ip == 4
+
+    def test_limit_is_clamped_into_range(self):
+        assert ProxyPoolConfig.from_raw({"max_accounts_per_ip": 999}).max_accounts_per_ip == 64
+        assert ProxyPoolConfig.from_raw({"max_accounts_per_ip": -5}).max_accounts_per_ip == 0
+        assert ProxyPoolConfig.from_raw({"max_accounts_per_ip": "8"}).max_accounts_per_ip == 8
+
+    def test_limit_survives_a_config_round_trip(self):
+        """to_dict 必须带上它，否则网页端保存一次配置就把这项抹回默认值。"""
+        cfg = ProxyPoolConfig.from_raw({"max_accounts_per_ip": 6})
+        assert cfg.to_dict()["max_accounts_per_ip"] == 6
+        assert ProxyPoolConfig.from_raw(cfg.to_dict()).max_accounts_per_ip == 6
+
+    def test_allocation_is_flattened_not_packed(self):
+        """3 个代理 / 上限 4：12 次分配摊成 a,b,c,a,b,c…，每个 IP 正好 4 个。
+
+        摊平而不是装箱（先把 a 填满 4 个再用 b）—— 账号散开后单个 IP 被盯上时
+        受影响的账号更少。
+        """
+        pool = ProxyPool(ProxyPoolConfig(max_accounts_per_ip=4))
+        pool._available = ["a:80", "b:80", "c:80"]
+        assert [pool.acquire() for _ in range(12)] == ["a:80", "b:80", "c:80"] * 4
+        assert pool._share_count == {"a:80": 4, "b:80": 4, "c:80": 4}
+
+    def test_overflow_warns_but_still_shares(self, monkeypatch):
+        """全部到上限后继续超额共用并告警，绝不降级直连。"""
+        pool = ProxyPool(ProxyPoolConfig(max_accounts_per_ip=4))
+        pool._available = ["a:80", "b:80", "c:80"]
+        for _ in range(12):
+            pool.acquire()
+        warnings = []
+        monkeypatch.setattr(proxy_pool_mod.log, "warn", warnings.append)
+        extra = pool.acquire()
+        assert extra is not None
+        assert pool._share_count[extra] == 5
+        assert warnings and "共用上限" in warnings[0]
+
+    def test_limit_one_is_the_old_one_ip_per_account(self):
+        """上限 1 退化成旧行为：先各占一个，占满了才超额。"""
+        pool = ProxyPool(ProxyPoolConfig(max_accounts_per_ip=1))
+        pool._available = ["a:80", "b:80"]
+        assert {pool.acquire(), pool.acquire()} == {"a:80", "b:80"}
+        assert pool.acquire() is not None
+
+    def test_limit_zero_means_unlimited_but_still_spread(self):
+        pool = ProxyPool(ProxyPoolConfig(max_accounts_per_ip=0))
+        pool._available = ["a:80", "b:80"]
+        for _ in range(6):
+            pool.acquire()
+        assert pool._share_count == {"a:80": 3, "b:80": 3}
+
+    def test_blacklisted_proxy_takes_no_share(self):
+        """拉黑的代理不参与摊平，哪怕它的共用数是 0（最轻）。"""
+        pool = ProxyPool(ProxyPoolConfig(max_accounts_per_ip=4))
+        pool._available = ["a:80", "b:80"]
+        pool.mark_bad("a:80")
+        assert [pool.acquire() for _ in range(4)] == ["b:80"] * 4
+        assert "a:80" not in pool._share_count
+
+
+class TestDesiredProxyCount:
+    """预取量按共用上限折算，再加固定的换 IP 余量。"""
+
+    def _runner(self, monkeypatch, tmp_path, limit):
+        cfg = build_config({
+            "proxy_pool": {"enabled": True, "max_accounts_per_ip": limit},
+            "accounts": [{"name": "A", "url": "https://a.example.com", "cookie": "c"}],
+        })
+        monkeypatch.setattr(runner_mod, "SESSIONS_FILE", tmp_path / "sessions.json")
+        monkeypatch.setattr(runner_mod.Runner, "init_proxy_pool", lambda self, **kw: None)
+        return runner_mod.Runner(cfg, runner_mod.RunOptions(use_ai=False, use_browser=False))
+
+    def test_spare_count_is_fifty(self):
+        assert runner_mod.PROXY_SPARE_COUNT == 50
+
+    def test_folds_account_count_by_the_limit(self, monkeypatch, tmp_path):
+        """64 账号 / 上限 4 → 16 个 IP + 50 余量；240 账号 → 60 + 50。"""
+        runner = self._runner(monkeypatch, tmp_path, 4)
+        assert runner._desired_proxies(64) == 66
+        assert runner._desired_proxies(240) == 110
+
+    def test_rounds_up_partial_batches(self, monkeypatch, tmp_path):
+        """65 账号要 17 个 IP，不能因为除不尽就少给一个。"""
+        runner = self._runner(monkeypatch, tmp_path, 4)
+        assert runner._desired_proxies(65) == 67
+        assert runner._desired_proxies(1) == 51
+
+    def test_unlimited_sharing_keeps_full_headroom(self, monkeypatch, tmp_path):
+        """上限 0 不代表只要一个 IP —— 换 IP 的余量照留。"""
+        runner = self._runner(monkeypatch, tmp_path, 0)
+        assert runner._desired_proxies(64) == 114
+
+    def test_never_asks_for_zero(self, monkeypatch, tmp_path):
+        runner = self._runner(monkeypatch, tmp_path, 4)
+        assert runner._desired_proxies(0) == 51

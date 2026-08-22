@@ -33,7 +33,8 @@
     "report_feedback": true,
     "preflight_check": true,
     "preflight_limit": 60,
-    "preflight_seconds": 15
+    "preflight_seconds": 15,
+    "max_accounts_per_ip": 4
   },
   "notify": {
     "email": {

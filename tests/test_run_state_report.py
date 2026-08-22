@@ -9,6 +9,8 @@
 import threading
 import time
 
+import pytest
+
 from newapi_checkin import config as cfgmod
 from newapi_checkin import runner as runner_mod
 
@@ -277,3 +279,109 @@ class TestRunIntegration:
         self._stub_round(runner, monkeypatch, lambda accounts: 0)
         assert runner.run() == 0
         assert calls == []
+
+
+class TestKeepaliveYield:
+    """签到开跑前给平台上的凭据保活让路。
+
+    保活协程也会真 refresh，跟签到撞上就是旧代重放。保活那边已经会避让签到，
+    但「保活跑到一半、签到才启动」这个窗口只能由客户端这边堵。
+
+    判定必须落在 source 上：run_state 是引用计数锁，分片并行时几个 job 同时持锁
+    是常态，按「有人持锁」判定会让分片互等直接死锁。
+    """
+
+    @staticmethod
+    def _states(monkeypatch, sequence):
+        """把 fetch_run_state 换成按调用次序吐 sequence 的假实现，返回调用记录。"""
+        calls = []
+
+        def fake(_sync):
+            calls.append(True)
+            return sequence[min(len(calls) - 1, len(sequence) - 1)]
+
+        monkeypatch.setattr("newapi_checkin.remote_sync.fetch_run_state", fake)
+        return calls
+
+    def test_waits_until_keepalive_finishes(self, tmp_path, monkeypatch):
+        runner = _runner(tmp_path, monkeypatch)
+        calls = self._states(monkeypatch, [
+            (True, {"running": True, "source": "tabiai-keepalive"}),
+            (True, {"running": True, "source": "tabiai-keepalive"}),
+            (True, {"running": False}),
+        ])
+        slept = []
+        monkeypatch.setattr(runner_mod.time, "sleep", slept.append)
+        runner._wait_for_keepalive(runner.cfg.accounts)
+        assert len(calls) == 3                    # 一直问到它跑完
+        assert slept == [runner_mod.KEEPALIVE_POLL_SECONDS] * 2
+
+    def test_does_not_wait_for_sibling_shards(self, tmp_path, monkeypatch):
+        """别的签到分片持锁是同伴而不是竞争者 —— 互等会死锁。"""
+        runner = _runner(tmp_path, monkeypatch)
+        calls = self._states(monkeypatch, [
+            (True, {"running": True, "source": "github-actions shard 2/4"}),
+        ])
+        monkeypatch.setattr(runner_mod.time, "sleep",
+                            lambda _s: pytest.fail("不该为同伴分片等待"))
+        runner._wait_for_keepalive(runner.cfg.accounts)
+        assert len(calls) == 1
+
+    def test_timeout_proceeds_with_a_warning(self, tmp_path, monkeypatch):
+        """保活卡死不能把签到一起拖死：到点带告警继续跑。"""
+        runner = _runner(tmp_path, monkeypatch)
+        self._states(monkeypatch, [(True, {"running": True, "source": "tabiai-keepalive"})])
+        clock = {"t": 0.0}
+        monkeypatch.setattr(runner_mod.time, "monotonic", lambda: clock["t"])
+        monkeypatch.setattr(runner_mod.time, "sleep",
+                            lambda s: clock.__setitem__("t", clock["t"] + s))
+        warnings = []
+        monkeypatch.setattr(runner_mod.log, "warn", warnings.append)
+        runner._wait_for_keepalive(runner.cfg.accounts)
+        assert clock["t"] >= runner_mod.KEEPALIVE_WAIT_MAX_SECONDS
+        assert warnings and "保活" in warnings[0]
+
+    def test_wait_ceiling_is_five_minutes(self):
+        assert runner_mod.KEEPALIVE_WAIT_MAX_SECONDS == 300
+        assert runner_mod.KEEPALIVE_RUN_SOURCE == "tabiai-keepalive"
+
+    def test_query_failure_is_treated_as_unlocked(self, tmp_path, monkeypatch):
+        """平台不可达时照常签到 —— 查不到锁不能变成不干活。"""
+        runner = _runner(tmp_path, monkeypatch)
+        calls = self._states(monkeypatch, [(False, {})])
+        monkeypatch.setattr(runner_mod.time, "sleep",
+                            lambda _s: pytest.fail("查询失败不该等待"))
+        runner._wait_for_keepalive(runner.cfg.accounts)
+        assert len(calls) == 1
+
+    def test_pure_cookie_round_never_asks(self, tmp_path, monkeypatch):
+        """没有 tabiai 账号就不存在代次冲突，压根不用查。"""
+        runner = _runner(tmp_path, monkeypatch, cfg=_cfg(tabiai_account=False))
+        calls = self._states(monkeypatch, [
+            (True, {"running": True, "source": "tabiai-keepalive"}),
+        ])
+        runner._wait_for_keepalive(runner.cfg.accounts)
+        assert calls == []
+
+    def test_run_waits_before_reporting_start(self, tmp_path, monkeypatch):
+        """让路必须排在 start 上报之前，否则两边同时持锁等于没让。"""
+        runner = _runner(tmp_path, monkeypatch, dry_run=True)
+        order = []
+        monkeypatch.setattr(
+            "newapi_checkin.remote_sync.fetch_run_state",
+            lambda _sync: (order.append("wait"), (True, {"running": False}))[1],
+        )
+        monkeypatch.setattr(
+            "newapi_checkin.remote_sync.report_run_start",
+            lambda sync, source: (order.append("start"), (True, "ep", 0))[1],
+        )
+        monkeypatch.setattr("newapi_checkin.remote_sync.report_run_stop",
+                            lambda sync: (order.append("stop"), True)[1])
+        monkeypatch.setattr("newapi_checkin.remote_sync.report_run_heartbeat",
+                            lambda _sync: (True, True))
+        monkeypatch.setattr(runner, "_send_notification", lambda: None)
+        TestRunIntegration._stub_round(
+            runner, monkeypatch, lambda accounts: (order.append("checkin"), 0)[1]
+        )
+        assert runner.run() == 0
+        assert order == ["wait", "start", "checkin", "stop"]

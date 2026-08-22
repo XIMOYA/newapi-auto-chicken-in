@@ -98,6 +98,8 @@ export interface ProxyPoolConfig {
   preflight_limit: number
   /** 自筛整体时间盒（秒），到点就用已有结论 */
   preflight_seconds: number
+  /** 同一出口 IP 最多给几个账号用，<=0 不限；客户端据此分配代理并折算预取量 */
+  max_accounts_per_ip: number
 }
 
 export interface NotifyEmailConfig {
