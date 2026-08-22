@@ -138,6 +138,10 @@ func main() {
 	// 代理池后台刷新：按 proxy_pool.refresh_minutes 周期抓取+测通（可配置，<=0 关闭）
 	startProxyRefresher(db, srv.proxies)
 
+	// TaBiAI 凭据保活：按设定间隔主动 refresh 一次，让代次保持滚动并立刻落库。
+	// 签到运行期间会整轮避让 —— 两边抢同一条 sid 会把账号打死。
+	srv.keepalive.Start()
+
 	// HTTP 服务：统一超时防慢速攻击与连接耗尽
 	httpSrv := &http.Server{
 		Addr:              addr,

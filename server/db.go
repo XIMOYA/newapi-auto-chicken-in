@@ -129,6 +129,9 @@ func createSchema(db *sql.DB) error {
 	if err := createRunStateTable(db); err != nil {
 		return err
 	}
+	if err := createTabiAIKeepaliveTables(db); err != nil {
+		return err
+	}
 	return nil
 }
 

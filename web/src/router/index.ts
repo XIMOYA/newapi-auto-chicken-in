@@ -34,6 +34,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: 'Cookie 测试' }
       },
       {
+        path: 'tabiai-keepalive',
+        name: 'tabiai-keepalive',
+        component: () => import('@/views/TabiAIKeepaliveView.vue'),
+        meta: { title: '凭据保活' }
+      },
+      {
         path: 'settings/ai',
         name: 'settings-ai',
         component: () => import('@/views/AISettingsView.vue'),

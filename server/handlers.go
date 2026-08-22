@@ -36,6 +36,7 @@ type Server struct {
 	jwtSecret     []byte
 	proxies       *ProxyManager
 	cookieTests   *CookieTestRunner
+	keepalive     *TabiAIKeepalive
 	loginLim      *loginLimiter
 	exportTickets *exportTicketStore
 }
@@ -48,6 +49,7 @@ func NewServer(db *sql.DB, jwtSecret string) *Server {
 		jwtSecret:     []byte(jwtSecret),
 		proxies:       proxies,
 		cookieTests:   NewCookieTestRunner(proxies, db),
+		keepalive:     NewTabiAIKeepalive(db, proxies),
 		loginLim:      newLoginLimiter(),
 		exportTickets: newExportTicketStore(),
 	}
@@ -103,6 +105,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/run-state/stop", s.requireAPIKey(s.handleRunStateStop))
 	mux.HandleFunc("GET /api/run-state", s.requireJWTOrAPIKey(s.handleGetRunState))
 	mux.HandleFunc("POST /api/run-state/unlock", s.requireJWTOrAPIKey(s.handleRunStateUnlock))
+
+	// TaBiAI 凭据保活：按间隔主动 refresh 保持代次滚动。网页端专属，只认 JWT。
+	mux.HandleFunc("GET /api/tabiai/keepalive", s.requireJWT(s.handleGetTabiAIKeepalive))
+	mux.HandleFunc("PUT /api/tabiai/keepalive", s.requireJWT(s.handlePutTabiAIKeepalive))
+	mux.HandleFunc("POST /api/tabiai/keepalive/run", s.requireJWT(s.handlePostTabiAIKeepaliveRun))
 
 	// 代理池管理
 	mux.HandleFunc("GET /api/proxies", s.requireJWTOrAPIKey(s.handleListProxies))

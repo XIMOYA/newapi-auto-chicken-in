@@ -93,6 +93,7 @@ import {
   DownloadOutline,
   DocumentTextOutline,
   CheckmarkCircleOutline,
+  RefreshCircleOutline,
   RocketOutline,
   CubeOutline,
   PersonCircleOutline,
@@ -121,6 +122,7 @@ const renderIcon = (icon: unknown) => () => h(NIcon, null, { default: () => h(ic
 const menuOptions: MenuOption[] = [
   { label: '配置总览', key: '/', icon: renderIcon(HomeOutline) },
   { label: 'Cookie 测试', key: '/cookie-tests', icon: renderIcon(CheckmarkCircleOutline) },
+  { label: '凭据保活', key: '/tabiai-keepalive', icon: renderIcon(RefreshCircleOutline) },
   { label: 'AI 配置', key: '/settings/ai', icon: renderIcon(SparklesOutline) },
   { label: '浏览器配置', key: '/settings/browser', icon: renderIcon(PlanetOutline) },
   { label: 'HTTP 配置', key: '/settings/http', icon: renderIcon(GlobeOutline) },

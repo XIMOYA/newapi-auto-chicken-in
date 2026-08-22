@@ -491,6 +491,56 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
 推进代次。两边一撞，谁手里的代次旧了下次就会被判重放，整条会话被撤销
 （`AUTH_SESSION_REVOKED`），只能重新签发。这不是「本次检测失败」，是把账号打死。
 
+### TaBiAI 凭据保活
+
+按间隔主动 refresh 一次，让代次保持滚动并立刻落库，把「某一代长时间躺着」的暴露窗口
+压到一个间隔之内。三个接口都**只认 JWT**（网页端专属，客户端没有调它的场合）。
+
+`GET /api/tabiai/keepalive` 响应：
+```json
+{
+  "setting": { "enabled": true, "minutes": 90, "updated_at": "2026-08-21T10:00:00Z" },
+  "accounts": [
+    {
+      "account_name": "TaBiAI-1",
+      "last_run_at": "2026-08-21T10:00:00Z",
+      "state": "valid",
+      "message": "凭据有效",
+      "rotated": true,
+      "paused": false,
+      "paused_at": "",
+      "proxy_addr": "1.2.3.4:8080"
+    }
+  ],
+  "last_run_at": "2026-08-21T10:00:00Z",
+  "running": false,
+  "skipped_by_checkin": false,
+  "next_run_at": "2026-08-21T11:30:00Z"
+}
+```
+
+`PUT /api/tabiai/keepalive` 请求体 `{ "enabled": true, "minutes": 90 }`，响应同 GET。
+间隔被夹在 **15~720 分钟**（默认 90）：刷太勤只是多消耗代次，超过半天就失去压缩窗口的
+意义。关闭保活用 `enabled: false` 表达，不要传 `minutes: 0`。
+
+`POST /api/tabiai/keepalive/run` 立刻同步跑一轮，响应
+`{ "ok_count": 3, "paused_count": 1, "failed_count": 0, "status": { ... } }`。
+签到进行中返回 **409**，响应体与其他被锁操作一致。
+
+行为约定：
+
+- `state` 沿用 Cookie 检测的状态词（`valid` / `invalid` / `proxy_issue` / `abnormal`），
+  空串表示这个账号还没被刷过。代理发牌规则也和 Cookie 检测完全一致：账号自带代理优先，
+  否则从池子轮转，池空则直连。
+- **签到运行期间整轮避让**，`skipped_by_checkin` 会置为 true。这不是故障，是必须的：
+  两边抢同一条 sid 会把账号打死。
+- `state` 为 `invalid` 时该账号被**暂停**（`paused: true`），不再自动刷新 —— 继续刷既
+  救不回来也会刷满日志。恢复条件是**凭据被改过**：服务端记下暂停那一刻的凭据值，
+  下一轮发现库里的值不同了（重新签发/手动粘贴）就自动恢复并刷一次。
+- 只要站点在响应里下发了新 `Set-Cookie`，无论本次判定成败都会立刻写回
+  `accounts[].cookie`，`rotated` 反映这件事。正常状态下 `rotated: false` 属正常
+  （宽限窗口内 refresh 是幂等的，站点不换新值）；长期为 false 才值得怀疑回写链路。
+
 - 锁定期间 `POST /api/cookie-tests/tabiai` 与 `POST /api/tabiai/issue-cookie` 返回
   **409**，响应体为 `{ "error": "...可读说明...", "run_state": { ...同上... } }`，
   前端可直接用回传状态刷新视图
