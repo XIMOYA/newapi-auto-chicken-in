@@ -162,7 +162,6 @@ const moduleOptions: { key: string; label: string }[] = [
   { key: 'ai', label: 'AI 配置' },
   { key: 'browser', label: '浏览器配置' },
   { key: 'http', label: 'HTTP 配置' },
-  { key: 'defaults', label: '全局默认' },
   { key: 'proxy_pool', label: '代理池' },
   { key: 'notify', label: '邮件通知' },
   { key: 'config_sync', label: '配置同步' },

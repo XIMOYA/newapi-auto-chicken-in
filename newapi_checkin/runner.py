@@ -75,6 +75,12 @@ SHIELD_RETRY_BACKOFF_MAX = 30
 RUN_HEARTBEAT_FALLBACK_SECONDS = 60
 # 只用于日志文案：告诉用户漏解锁大概多久会自动过期。真实阈值在平台侧
 RUN_LOCK_STALE_HINT_MINUTES = 5
+# 人工模式（--manual）下账号之间的随机停顿区间（秒）。
+#
+# 以前这是 defaults.interval_seconds 配置项，但自动签到早就改成固定 6 账号并发了，
+# 并发路径压根没有"账号间隔"这个概念，配置只在人工串行时生效，形同摆设。
+# 现在收成常量：人工模式仍然逐个来、中间喘口气，其余场景由并发度控制节奏。
+MANUAL_INTERVAL_SECONDS = (3.0, 8.0)
 # 出口 IP 探测结果缓存的上限。代理池在换 IP 时地址是有限的，但 daemon 长跑
 # 或手动配置频繁变更时不该让这个 dict 无界增长，超出后丢弃最早的一条。
 IP_CACHE_MAX = 256
@@ -586,8 +592,9 @@ class Runner:
                 row = log.SummaryRow(account.name, api.UNKNOWN, "-", f"{type(exc).__name__}: {exc}")
             self.summary.add(row)
             self.store.flush_throttled()
-            if idx < total:
-                delay = jitter_sleep(self.cfg.defaults.interval_seconds)
+            if idx < total and self.options.manual:
+                # 只有人工模式才需要这个停顿：自动签到走并发路径，节奏由并发度决定
+                delay = jitter_sleep(MANUAL_INTERVAL_SECONDS)
                 log.debug(f"账号间隔停顿 {delay:.1f}s")
 
         self.store.flush()
@@ -762,8 +769,8 @@ class Runner:
     def _run_account_with_retries(self, account: Account, record) -> log.SummaryRow:
         """跑完一个账号。失败按可恢复性分流：
 
-        1. 网络层失败：只要代理池还能给出新 IP，就无限换 IP 立即重试，不计入
-           defaults.retry，也不受 ip_swap_limit 影响；成功换 IP 的耗时不计入账号时间盒，
+        1. 网络层失败：只要代理池还能给出新 IP，就无限换 IP 立即重试，不受
+           ip_swap_limit 影响；成功换 IP 的耗时不计入账号时间盒，
            换不到新 IP 就跳过。
         2. 源站业务失败/WAF 硬封禁：额外换最多 5 次 IP，每次等待 5 秒；
            换 IP 和等待耗时仍计入账号时间盒，仍是同类问题就跳过。

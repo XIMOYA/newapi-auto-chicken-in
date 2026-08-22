@@ -75,8 +75,8 @@ describe('状态展示映射', () => {
   it('已知状态词有中文标签', () => {
     expect(keepaliveStateLabel('valid')).toBe('正常')
     expect(keepaliveStateLabel('invalid')).toBe('凭据失效')
-    expect(keepaliveStateLabel('proxy_issue')).toBe('代理不通')
-    expect(keepaliveStateLabel('abnormal')).toBe('响应异常')
+    expect(keepaliveStateLabel('abnormal')).toBe('链路或响应异常')
+    expect(keepaliveStateLabel('skipped')).toBe('已跳过')
   })
 
   it('空状态表示还没轮到它，不是空白', () => {
@@ -90,7 +90,6 @@ describe('状态展示映射', () => {
   it('徽章配色按严重程度区分', () => {
     expect(keepaliveStateType('valid')).toBe('success')
     expect(keepaliveStateType('invalid')).toBe('error')
-    expect(keepaliveStateType('proxy_issue')).toBe('warning')
     expect(keepaliveStateType('abnormal')).toBe('warning')
     expect(keepaliveStateType('')).toBe('default')
   })

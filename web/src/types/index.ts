@@ -2,7 +2,7 @@
 web/src/types/index.ts
 类型定义：与 docs/api-contract.md 严格对齐
 职责：
-- 配置对象各模块类型（accounts/ai/browser/http/defaults/proxy_pool/notify/config_sync/security）
+- 配置对象各模块类型（accounts/ai/browser/http/proxy_pool/notify/config_sync/security）
 - API 请求/响应类型
 数据来源：docs/api-contract.md、config.example.json
 */
@@ -68,11 +68,6 @@ export interface HttpConfig {
   impersonate: string
   timeout: number
   verify: boolean
-}
-
-export interface DefaultsConfig {
-  retry: number
-  interval_seconds: [number, number]
 }
 
 export interface ProxyPoolConfig {
@@ -148,7 +143,6 @@ export interface AppConfig {
   ai: AIConfig
   browser: BrowserConfig
   http: HttpConfig
-  defaults: DefaultsConfig
   proxy_pool: ProxyPoolConfig
   notify: NotifyConfig
   config_sync: ConfigSyncConfig

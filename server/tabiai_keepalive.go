@@ -49,7 +49,14 @@ const (
 	tabiaiKeepaliveTickSeconds = 60
 	// tabiaiKeepaliveRunTimeout 单轮总超时。账号再多也不该无限期占着这个协程。
 	tabiaiKeepaliveRunTimeout = 10 * time.Minute
+	// tabiaiKeepaliveMaxProxyRounds 代理类失败最多换几轮代理。
+	//
+	// 代理不通换一个接着来是有意义的，但不能真的无限换：池子可能有几百个地址，
+	// 一个账号把它们全试一遍会吃掉整轮的时间预算，别的账号就轮不上了。
+	// 池子掏不出新代理时也会提前停，这个数字只是兜住"池子很大"那种情况。
+	tabiaiKeepaliveMaxProxyRounds = 5
 )
+
 
 // TabiAIKeepaliveSetting 保活策略。
 type TabiAIKeepaliveSetting struct {
@@ -392,22 +399,7 @@ func (k *TabiAIKeepalive) RunOnce(ctx context.Context, trigger string) (int, int
 		return 0, 0, 0
 	}
 
-	source := newCookieTestProxySource(k.pm)
-	proxies := make([]string, 0, len(targets))
-	for _, target := range targets {
-		addr := ""
-		// 账号自带代理时按它自己的走，和 cookie 检测同一规则
-		if !hasOwnProxy(target) {
-			addr = source.Next(ctx)
-		}
-		proxies = append(proxies, addr)
-	}
-	next := 0
-	results := runCookieTestPass(ctx, &cfg, LoginMethodTabiAI, targets, func() string {
-		addr := proxies[next]
-		next++
-		return addr
-	})
+	results, proxies := k.runWithProxyRetry(ctx, &cfg, targets)
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	ok, paused, failed := 0, 0, 0
@@ -454,6 +446,75 @@ func (k *TabiAIKeepalive) RunOnce(ctx context.Context, trigger string) (int, int
 	log.Printf("[tabiai-keepalive] %s刷新 %d 个账号：正常 %d / 暂停 %d / 异常 %d",
 		trigger, len(targets), ok, paused, failed)
 	return ok, paused, failed
+}
+
+/*
+runWithProxyRetry 跑到每个账号都有定论，代理类失败会换代理重试。
+
+分流规则和定价拉取那边一致：
+  - 代理类失败（result.retryable —— 代理不通、CDN/WAF 把请求挡在门外）换一个代理
+    接着来。池子掏不出新地址时自然停下，这就是"一直换"的天然终点。
+  - 非代理失败（凭据失效、响应异常）不重试：换 IP 也是同样结果，而凭据失效本来就
+    要走暂停逻辑，多打几次只是白耗代次。
+
+返回 (每个账号的最终结果, 每个账号最后一次用的代理)，下标与 targets 对齐。
+*/
+func (k *TabiAIKeepalive) runWithProxyRetry(ctx context.Context, cfg *Config,
+	targets []Account) ([]CookieTestResult, []string) {
+	source := newCookieTestProxySource(k.pm)
+	final := make([]CookieTestResult, len(targets))
+	usedProxy := make([]string, len(targets))
+	pending := make([]int, 0, len(targets))
+	for i := range targets {
+		pending = append(pending, i)
+	}
+
+	for round := 1; len(pending) > 0 && round <= tabiaiKeepaliveMaxProxyRounds; round++ {
+		if ctx.Err() != nil {
+			break
+		}
+		batch := make([]Account, 0, len(pending))
+		proxies := make([]string, 0, len(pending))
+		for _, idx := range pending {
+			addr := ""
+			// 账号自带代理时按它自己的走（换不了），否则从池子领一个新的
+			if !hasOwnProxy(targets[idx]) {
+				addr = source.Next(ctx)
+			}
+			batch = append(batch, targets[idx])
+			proxies = append(proxies, addr)
+		}
+		next := 0
+		results := runCookieTestPass(ctx, cfg, LoginMethodTabiAI, batch, func() string {
+			addr := proxies[next]
+			next++
+			return addr
+		})
+
+		stillPending := make([]int, 0, len(pending))
+		for i, idx := range pending {
+			final[idx] = results[i]
+			usedProxy[idx] = proxies[i]
+			if !results[i].retryable {
+				continue
+			}
+			// 池子已经空了（发牌拿到空串）就别再转：下一轮还是直连，结果不会变
+			if !hasOwnProxy(targets[idx]) && proxies[i] == "" {
+				continue
+			}
+			stillPending = append(stillPending, idx)
+		}
+		if len(stillPending) > 0 && round < tabiaiKeepaliveMaxProxyRounds {
+			log.Printf("[tabiai-keepalive] 第 %d 轮有 %d 个账号因链路问题失败，换代理重试",
+				round, len(stillPending))
+		}
+		pending = stillPending
+	}
+	if len(pending) > 0 {
+		log.Printf("[tabiai-keepalive] %d 个账号换了 %d 轮代理仍未通，按本轮最后结果记账",
+			len(pending), tabiaiKeepaliveMaxProxyRounds)
+	}
+	return final, usedProxy
 }
 
 // Status 汇总当前状态给网页端。账号列表以**当前配置**为准：

@@ -211,9 +211,13 @@ class TestBrowser:
         with pytest.raises(cfgmod.ConfigError, match="browser.driver"):
             build(browser={"driver": "selenium"})
 
-    def test_defaults_interval_is_sorted(self):
-        cfg = build(defaults={"interval_seconds": [9, 2]})
-        assert cfg.defaults.interval_seconds == (2.0, 9.0)
+    def test_legacy_defaults_section_is_ignored(self):
+        """defaults 段已移除（retry 早被时间盒接管、间隔只在人工模式生效并收成常量）。
+
+        老配置里留着这一段不能报错，只是不再被读 —— 用户没有必须先改配置才能升级的义务。
+        """
+        cfg = build(defaults={"retry": 9, "interval_seconds": [9, 2]})
+        assert not hasattr(cfg, "defaults")
 
 
 class TestEnvOverride:

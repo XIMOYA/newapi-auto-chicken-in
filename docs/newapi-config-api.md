@@ -225,7 +225,7 @@ API Key 通过鉴权时会顺手更新 `last_used_at`（更新失败被忽略，
 | mode | string | 是 | `overwrite` 或 `merge`（trim + 转小写后比较） |
 | modules | []string | 否 | 仅 merge 生效 |
 
-`modules` 合法值（10 个）：`accounts` `sites` `ai` `browser` `http` `defaults`
+`modules` 合法值（9 个）：`accounts` `sites` `ai` `browser` `http`
 `proxy_pool` `notify` `config_sync` `security`。不含 `config_version`。
 
 语义：未传或 `null` = 全部模块（兼容旧客户端）；`[]` = 一个模块都不导入；
@@ -903,7 +903,6 @@ CI secrets 一旦泄露就再也收不回控制权。
 | ai | object | `enabled` `base_url` `api_key` `model` `timeout` `max_retries` |
 | browser | object | `driver` `headless` `humanize` `timeout` `keep_artifacts_on_fail` `locale` `window` `executable_path` |
 | http | object | `impersonate` `timeout` `verify`（检测请求也复用） |
-| defaults | object | `retry` `interval_seconds` |
 | proxy_pool | object | 代理池抓取/测通/刷新参数 + Actions 预取的 `remote_*` 透传字段 + 客户端侧的回传与自筛开关 |
 | notify | object | 目前只有 `email` 一个子段（SMTP 全套） |
 | config_sync | object | 从远端拉配置：`url` `method` `token` `token_header` `headers` `body` `response_field` 等 |

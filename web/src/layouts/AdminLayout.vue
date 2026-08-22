@@ -126,7 +126,6 @@ const menuOptions: MenuOption[] = [
   { label: 'AI 配置', key: '/settings/ai', icon: renderIcon(SparklesOutline) },
   { label: '浏览器配置', key: '/settings/browser', icon: renderIcon(PlanetOutline) },
   { label: 'HTTP 配置', key: '/settings/http', icon: renderIcon(GlobeOutline) },
-  { label: '全局默认', key: '/settings/defaults', icon: renderIcon(SettingsOutline) },
   { label: '代理池配置', key: '/settings/proxy-pool', icon: renderIcon(SettingsOutline) },
   { label: '代理管理', key: '/proxies', icon: renderIcon(LayersOutline) },
   { label: '邮件通知', key: '/settings/notify', icon: renderIcon(MailOutline) },

@@ -11,7 +11,9 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // keepaliveDB 起一个带完整表结构的服务实例，返回它的库。
@@ -214,5 +216,92 @@ func TestKeepaliveAPIRequiresJWT(t *testing.T) {
 		if rr.Code != http.StatusUnauthorized {
 			t.Errorf("%s %s 未带 JWT 应 401，实际 %d", tc.method, tc.path, rr.Code)
 		}
+	}
+}
+
+// 下面几个用例守的是「代理不通要换 IP 重试」这条链路。
+//
+// 注意：链路类失败没有独立状态词，走的是 cookieTestProxyIssue —— 状态记 abnormal、
+// 额外把 retryable 置为 true。判定要看 retryable 而不是找一个 proxy_issue 状态。
+
+// seedAliveProxies 往池里塞几个「标记为可用」的地址。它们实际上连不通，
+// 正好用来逼保活走换代理那条路。
+func seedAliveProxies(t *testing.T, srv *Server, addrs []string) {
+	t.Helper()
+	entries := make([]ProxyEntry, 0, len(addrs))
+	for _, addr := range addrs {
+		entries = append(entries, ProxyEntry{
+			Source: "test", Addr: addr, LatencyMs: 10, Alive: true,
+			LastChecked: "now", LastAliveAt: "now",
+		})
+	}
+	if err := srv.proxies.replaceAll(entries); err != nil {
+		t.Fatalf("塞代理失败: %v", err)
+	}
+}
+
+func TestKeepaliveRetriesOnProxyFailure(t *testing.T) {
+	srv := newTestServer(t)
+	// 三个地址全都连不通：应该逐个换着试，而不是一次就收手
+	seedAliveProxies(t, srv, []string{"127.0.0.1:9", "127.0.0.1:10", "127.0.0.1:11"})
+
+	acc := tabiAccount("tabi-1", "sid.gen1")
+	cfg, _, _ := LoadConfig(srv.db)
+	results, used := srv.keepalive.runWithProxyRetry(context.Background(), &cfg, []Account{acc})
+	if len(results) != 1 || len(used) != 1 {
+		t.Fatalf("返回长度应与 targets 对齐，实际 results=%d used=%d", len(results), len(used))
+	}
+	if !results[0].retryable {
+		t.Fatalf("代理连不通应记成链路类失败（retryable），实际 %q: %s",
+			results[0].State, results[0].Message)
+	}
+	// 最后一次用的代理要带出来，界面上才知道是经谁失败的
+	if used[0] == "" {
+		t.Fatal("池里有代理时不该记成直连")
+	}
+}
+
+func TestKeepaliveNonProxyFailureIsNotRetried(t *testing.T) {
+	srv := newTestServer(t)
+	// 站点明确回 401 AUTH_SESSION_REVOKED：凭据死了，换 IP 也是一样的结果
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"success":false,"code":"AUTH_SESSION_REVOKED","message":"Unauthorized"}`))
+	}))
+	defer site.Close()
+
+	acc := tabiAccount("tabi-1", "sid.gen1")
+	acc.URL = site.URL
+	cfg, _, _ := LoadConfig(srv.db)
+	results, _ := srv.keepalive.runWithProxyRetry(context.Background(), &cfg, []Account{acc})
+	if results[0].State != cookieTestStateInvalid {
+		t.Fatalf("会话被撤销应判 invalid，实际 %q（%s）", results[0].State, results[0].Message)
+	}
+	if results[0].retryable {
+		t.Fatal("凭据失效不该被标成可重试，否则会白换一圈代理")
+	}
+}
+
+func TestKeepaliveDirectConnectionDoesNotLoop(t *testing.T) {
+	srv := newTestServer(t)
+	// 池子是空的：发牌拿到空串（直连）。此时重试没有意义，必须一轮就停
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer site.Close()
+
+	acc := tabiAccount("tabi-1", "sid.gen1")
+	acc.URL = site.URL
+	cfg, _, _ := LoadConfig(srv.db)
+	done := make(chan struct{})
+	go func() {
+		srv.keepalive.runWithProxyRetry(context.Background(), &cfg, []Account{acc})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("池子为空时不该反复重试，疑似死循环")
 	}
 }

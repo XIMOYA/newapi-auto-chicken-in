@@ -3,7 +3,7 @@ server/config.go
 NewAPI 签到配置管理平台 · 配置对象模型
 
 职责：
-- 定义与接口契约一致的完整配置结构体（accounts / ai / browser / http / defaults / proxy_pool / notify / config_sync / security）
+- 定义与接口契约一致的完整配置结构体（accounts / ai / browser / http / proxy_pool / notify / config_sync / security）
 - 提供默认配置（契约文档「配置对象默认结构」）
 - 敏感字段打码 / 还原：accounts[].cookie、ai.api_key、notify.email.password、config_sync.token
 - 配置校验：accounts 必填 name/url，cookie 可为空，url 需 http(s) 开头
@@ -40,7 +40,6 @@ type Config struct {
 	AI            AIConfig      `json:"ai"`
 	Browser       BrowserConfig `json:"browser"`
 	HTTP          HTTPConfig    `json:"http"`
-	Defaults      Defaults      `json:"defaults"`
 	ProxyPool     ProxyPool     `json:"proxy_pool"`
 	Notify        Notify        `json:"notify"`
 	ConfigSync    ConfigSync    `json:"config_sync"`
@@ -101,12 +100,6 @@ type HTTPConfig struct {
 	Impersonate string `json:"impersonate"`
 	Timeout     int    `json:"timeout"`
 	Verify      bool   `json:"verify"`
-}
-
-// Defaults 全局默认值。
-type Defaults struct {
-	Retry           int   `json:"retry"`
-	IntervalSeconds []int `json:"interval_seconds"`
 }
 
 // ProxyPool 隧道（代理）池配置。
@@ -209,10 +202,6 @@ func DefaultConfig() Config {
 			Impersonate: "chrome",
 			Timeout:     20,
 			Verify:      true,
-		},
-		Defaults: Defaults{
-			Retry:           2,
-			IntervalSeconds: []int{3, 8},
 		},
 		ProxyPool: ProxyPool{
 			Enabled:           false,
@@ -457,9 +446,6 @@ func cloneConfig(c *Config) *Config {
 		v := *c.Browser.ExecutablePath
 		cp.Browser.ExecutablePath = &v
 	}
-
-	cp.Defaults.IntervalSeconds = make([]int, len(c.Defaults.IntervalSeconds))
-	copy(cp.Defaults.IntervalSeconds, c.Defaults.IntervalSeconds)
 
 	cp.ProxyPool.Sources = make([]string, len(c.ProxyPool.Sources))
 	copy(cp.ProxyPool.Sources, c.ProxyPool.Sources)

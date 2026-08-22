@@ -78,10 +78,6 @@
     "token_interval_minutes": 21,
     "keep_page": false
   },
-  "defaults": {
-    "retry": 2,
-    "interval_seconds": [3, 8]
-  },
   "sites": [
     {
       "name": "GoRouter",

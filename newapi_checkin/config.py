@@ -165,12 +165,6 @@ class HttpConfig:
 
 
 @dataclass
-class Defaults:
-    retry: int = 2
-    interval_seconds: tuple = (3, 8)
-
-
-@dataclass
 class SecurityConfig:
     encryption_enabled: bool = False
     config_key: str = ""
@@ -367,7 +361,6 @@ class Config:
     ai: AIConfig = field(default_factory=AIConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     http: HttpConfig = field(default_factory=HttpConfig)
-    defaults: Defaults = field(default_factory=Defaults)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     config_sync: ConfigSyncConfig = field(default_factory=ConfigSyncConfig)
     proxy_pool: ProxyPoolConfig = field(default_factory=ProxyPoolConfig)
@@ -626,12 +619,6 @@ def build_config(raw: dict, source: Optional[Path] = None) -> Config:
         verify=_as_bool(http_raw.get("verify"), True),
     )
 
-    def_raw = raw.get("defaults") or {}
-    interval = _as_pair(def_raw.get("interval_seconds"), (3.0, 8.0))
-    defaults = Defaults(
-        retry=max(0, _as_int(def_raw.get("retry"), 2)),
-        interval_seconds=interval,
-    )
     config_sync = ConfigSyncConfig.from_raw(raw.get("config_sync"))
     proxy_pool = ProxyPoolConfig.from_raw(raw.get("proxy_pool"))
     tabiai = TabiAIConfig.from_raw(raw.get("tabiai"))
@@ -642,7 +629,7 @@ def build_config(raw: dict, source: Optional[Path] = None) -> Config:
         problems.append("accounts 为空，至少配置一个账号")
 
     cfg = Config(
-        ai=ai, browser=browser, http=http, defaults=defaults,
+        ai=ai, browser=browser, http=http,
         security=security, config_sync=config_sync, proxy_pool=proxy_pool,
         tabiai=tabiai, notify=notify, accounts=accounts, source=source,
     )
@@ -692,7 +679,6 @@ def migrate_legacy(raw_list: list) -> dict:
                "timeout": 60, "max_retries": 2},
         "browser": template.get("browser") or {},
         "http": template.get("http") or {},
-        "defaults": template.get("defaults") or {},
         "security": template.get("security") or {},
         "accounts": accounts,
     }

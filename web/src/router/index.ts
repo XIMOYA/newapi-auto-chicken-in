@@ -58,12 +58,6 @@ const routes: RouteRecordRaw[] = [
         meta: { title: 'HTTP 配置' }
       },
       {
-        path: 'settings/defaults',
-        name: 'settings-defaults',
-        component: () => import('@/views/DefaultsSettingsView.vue'),
-        meta: { title: '全局默认配置' }
-      },
-      {
         path: 'settings/proxy-pool',
         name: 'settings-proxy-pool',
         component: () => import('@/views/ProxyPoolSettingsView.vue'),

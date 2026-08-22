@@ -318,7 +318,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 //   - overwrite：整体覆盖（modules 忽略）
 //   - merge：仅合并 modules 列出的模块（未列出的保留现有）
 //     其中 accounts / sites 按 name 合并（同名更新、新名追加），
-//     其余标量模块（ai/browser/http/defaults/proxy_pool/notify/config_sync/security）
+//     其余标量模块（ai/browser/http/proxy_pool/notify/config_sync/security）
 //     若导入 JSON 中存在该模块则整体覆盖。
 func (s *Server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -401,7 +401,7 @@ func (s *Server) handleImportConfig(w http.ResponseWriter, r *http.Request) {
 
 // configModuleKeys 全部可导入的顶层模块。
 var configModuleKeys = []string{
-	"accounts", "sites", "ai", "browser", "http", "defaults",
+	"accounts", "sites", "ai", "browser", "http",
 	"proxy_pool", "notify", "config_sync", "security",
 }
 
@@ -477,9 +477,6 @@ func mergeConfigWithModules(in *Config, old *Config, present map[string]bool, mo
 	}
 	if want["http"] && present["http"] {
 		out.HTTP = in.HTTP
-	}
-	if want["defaults"] && present["defaults"] {
-		out.Defaults = in.Defaults
 	}
 	if want["proxy_pool"] && present["proxy_pool"] {
 		out.ProxyPool = in.ProxyPool

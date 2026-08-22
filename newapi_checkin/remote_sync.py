@@ -31,7 +31,7 @@ _LOCAL_CONTROLLED_KEYS = frozenset({"security", "config_sync", "tabiai"})
 # 参与合并的业务模块（缺失告警用）。
 # tabiai 不在其中：cdp_url 指向本机 Chrome 的调试端口，属于机器级设置，
 # 远端平台不可能知道每台机器的端口，下发覆盖只会把能用的配置改坏。
-_SYNC_MODULES = ("accounts", "ai", "browser", "http", "defaults", "proxy_pool", "notify")
+_SYNC_MODULES = ("accounts", "ai", "browser", "http", "proxy_pool", "notify")
 
 
 def _merge_payload(local_raw: dict, payload: dict) -> dict:
@@ -82,7 +82,7 @@ def _is_envelope(value: Any) -> bool:
 
 def _looks_like_config(value: Any) -> bool:
     return isinstance(value, dict) and any(
-        key in value for key in ("accounts", "ai", "browser", "http", "defaults", "security", "config_sync")
+        key in value for key in ("accounts", "ai", "browser", "http", "security", "config_sync")
     )
 
 
