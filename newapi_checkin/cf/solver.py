@@ -79,7 +79,8 @@ def _make_driver(cfg: Config, account: Account, options) -> BrowserDriver:
 
 
 def solve(*, cfg: Config, account: Account, exit_ip: Optional[str], options,
-          ai=None, want_turnstile_token: bool = False, on_rotate=None) -> SolveOutcome:
+          ai=None, want_turnstile_token: bool = False, on_rotate=None,
+          on_inflight=None, on_settled=None) -> SolveOutcome:
     """对外唯一入口。任何异常都转成 SolveOutcome，不向上抛。
 
     want_turnstile_token 只对 TaBiAI 账号有意义：由 runner 显式要求「这一轮请顺便
@@ -89,6 +90,9 @@ def solve(*, cfg: Config, account: Account, exit_ip: Optional[str], options,
     on_rotate 是 TaBiAI 页内签到的硬性依赖：页内 refresh 同样会轮转 new_api_refresh，
     新代次必须立刻交回上层落盘。没传就退化成只过盾（S2/S3），不做页内签到 ——
     宁可少走一步，也不能把轮转出来的代次丢在浏览器里。
+
+    on_inflight / on_settled 是代次悬空记账，转交给页内 refresh 用。页内那一发的超时
+    由浏览器决定，不受 HTTP 链路的 8 秒约束，烧掉的窗口可能更长，所以这条路同样得记账。
     """
     try:
         driver = _make_driver(cfg, account, options)
@@ -98,7 +102,9 @@ def solve(*, cfg: Config, account: Account, exit_ip: Optional[str], options,
     try:
         with driver:
             return _run(driver, cfg, account, exit_ip, options, ai,
-                        want_turnstile_token=want_turnstile_token, on_rotate=on_rotate)
+                        want_turnstile_token=want_turnstile_token, on_rotate=on_rotate,
+                        on_inflight=on_inflight, on_settled=on_settled)
+
     except DriverUnavailable as exc:
         return SolveOutcome(False, "S2", detail=str(exc))
     except Exception as exc:  # noqa: BLE001 - 过盾失败不能让整轮崩掉
@@ -110,7 +116,8 @@ def solve(*, cfg: Config, account: Account, exit_ip: Optional[str], options,
 
 
 def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional[str],
-         options, ai, want_turnstile_token: bool = False, on_rotate=None) -> SolveOutcome:
+         options, ai, want_turnstile_token: bool = False, on_rotate=None,
+         on_inflight=None, on_settled=None) -> SolveOutcome:
     is_tabiai = account.login_method == LOGIN_METHOD_TABIAI
     log.info(f"启动 {driver.name} 过盾（profile: {account.profile_dir.name}）")
     # 两种模式都要把凭据注入浏览器：站点 Cookie 是登录态，TaBiAI 是 new_api_refresh。
@@ -203,7 +210,8 @@ def _run(driver: BrowserDriver, cfg: Config, account: Account, exit_ip: Optional
         # 使用」，本来就容易被拒；页内直发则和站点 Cookie 模式一样，token 在哪生成就
         # 在哪用掉，还顺带带上了刚过盾的 cf_clearance 与真实浏览器指纹。
         outcome = _tabiai_checkin_in_page(
-            driver, cfg, account, options, ai, cf, strategy, on_rotate)
+            driver, cfg, account, options, ai, cf, strategy, on_rotate,
+            on_inflight=on_inflight, on_settled=on_settled)
         if outcome is not None:
             return outcome
         # 页内路线不可用（没给 on_rotate、或 refresh 阶段就失败）时退回老路：
@@ -687,7 +695,8 @@ def _tabiai_rotated_cookie(driver: BrowserDriver) -> str:
 
 
 def _tabiai_page_refresh(driver: BrowserDriver, account: Account,
-                         on_rotate) -> tuple[str, Optional[int], Optional[api.ApiResult]]:
+                         on_rotate, on_inflight=None,
+                         on_settled=None) -> tuple[str, Optional[int], Optional[api.ApiResult]]:
     """页内 POST /api/user/auth/refresh 换 Bearer token。
 
     返回 (access_token, user_id, 失败结果)。成功时第三项为 None。
@@ -695,8 +704,15 @@ def _tabiai_page_refresh(driver: BrowserDriver, account: Account,
     轮转处理是这里最要命的部分：只要浏览器实际发出了 refresh，就必须把 cookie jar 里
     的新代次交回上层落盘，**无论这次请求判定成功还是失败**。漏一次，下轮用旧代就会被
     站点判重放，整条会话直接撤销。
+
+    页内这一发的超时由浏览器/页面决定，不受 HTTP 链路那个 8 秒的约束，所以它烧掉的
+    重放窗口可能更长 —— 悬空记账在这里同样不能省。好在浏览器有个天然优势：只要
+    Set-Cookie 到了 jar 里，代次就能被抢救回来，那种情况直接销账即可。
     """
     before = (driver.cookie_dict().get("new_api_refresh") or "").strip()
+    # 发出前记账，理由同 HTTP 链路：超时的那一次才是最需要记账的
+    if before and on_inflight is not None:
+        on_inflight(f"new_api_refresh={before}")
     raw = driver.fetch_in_page(
         account.base_url + TABIAI_REFRESH_PATH, "POST",
         {"Accept": "application/json, text/plain, */*", "Content-Type": "application/json"},
@@ -709,9 +725,17 @@ def _tabiai_page_refresh(driver: BrowserDriver, account: Account,
         on_rotate(rotated)
 
     if not raw.get("ok"):
+        # 抢救到新代次就说明浏览器确实收到了 Set-Cookie，这一代已经安全交班，可以销账；
+        # 反之 jar 里还是旧代，站点侧状态不明，标记留着让上层拒绝预算外的重试
+        if rotated and rotated.split("=", 1)[1] != before and on_settled is not None:
+            on_settled()
         return "", None, api.ApiResult(
             api.NETWORK_ERROR, message=f"页内 refresh 失败: {str(raw.get('body'))[:160]}",
             path=TABIAI_REFRESH_PATH)
+
+    # 拿到了页内响应，站点侧状态已确定
+    if on_settled is not None:
+        on_settled()
 
     status, body, resp_headers, data = _parse_raw(raw)
     verdict = detect.analyze(status, resp_headers, body)
@@ -800,7 +824,8 @@ def _tabiai_page_checkin(driver: BrowserDriver, account: Account, token: str,
 
 def _tabiai_checkin_in_page(driver: BrowserDriver, cfg: Config, account: Account,
                             options, ai, cf: CFSession, strategy: str,
-                            on_rotate) -> Optional[SolveOutcome]:
+                            on_rotate, on_inflight=None,
+                            on_settled=None) -> Optional[SolveOutcome]:
     """TaBiAI 的 S4：过盾后在同一个页面里把签到做完。
 
     返回 None 表示这条路走不通，调用方应退回「交回 HTTP 链路」的老路。返回
@@ -813,7 +838,8 @@ def _tabiai_checkin_in_page(driver: BrowserDriver, cfg: Config, account: Account
         log.debug("未提供凭据轮转回调，跳过 TaBiAI 页内签到")
         return None
 
-    token, uid, failure = _tabiai_page_refresh(driver, account, on_rotate)
+    token, uid, failure = _tabiai_page_refresh(
+        driver, account, on_rotate, on_inflight=on_inflight, on_settled=on_settled)
     if failure is not None:
         # refresh 阶段失败：CF_BLOCKED 说明盾其实没过干净，交回上层换 IP 重试；
         # 认证类失败是定论，直接带出去，别再让 HTTP 链路重复消耗一代凭据。

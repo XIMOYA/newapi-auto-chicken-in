@@ -9,6 +9,7 @@ checkin_path / user_id 不受 IP 绑定影响，单独存放，cookie 失效时�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -80,6 +81,15 @@ class AccountSession:
     cf: Optional[CFSession] = None
     # TaBiAI 的 new_api_refresh 会按代次轮转，必须逐轮持久化，否则下次用旧代会被判重放
     refresh_cookie: Optional[str] = None
+    # 「当前这一代第一次被送进 refresh」的时刻，以及它绑定的代次指纹。
+    #
+    # 实测（2026-08 对 tabitoken.cc）旧代重放的宽限窗口只有 20~45 秒：放 20 秒重放还是
+    # 幂等成功，放 45 秒直接 AUTH_SESSION_REVOKED，中间没有温和的 AUTH_UNAUTHORIZED 过渡。
+    # 而 refresh 一旦超时（http.timeout 默认 20 秒）就已经烧掉整个安全窗口，此时换 IP 重试
+    # 等于拿整条会话赌运气。所以「这一代悬空多久了」必须跨进程记住 —— Actions 跑超时被平台
+    # 强杀是常态，纯内存计时的方案挡不住「进程死了、下一轮捡起旧代接着刷」。
+    refresh_inflight_at: Optional[float] = None
+    refresh_inflight_gen: Optional[str] = None
     # 站点的额度换算率（quota_per_unit）。站点级属性，探到一次就能一直用，
     # 缓存下来免得每轮都去打 /api/status
     quota_per_unit: Optional[int] = None
@@ -92,6 +102,10 @@ class AccountSession:
             out["user_id"] = self.user_id
         if self.refresh_cookie:
             out["refresh_cookie"] = self.refresh_cookie
+        if self.refresh_inflight_at and self.refresh_inflight_gen:
+            # 两个字段是一对，缺一个就没有意义，所以一起写、一起读
+            out["refresh_inflight_at"] = self.refresh_inflight_at
+            out["refresh_inflight_gen"] = self.refresh_inflight_gen
         if self.quota_per_unit:
             out["quota_per_unit"] = self.quota_per_unit
         if self.cf is not None:
@@ -112,13 +126,39 @@ class AccountSession:
         except (TypeError, ValueError):
             unit = None
         cf_raw = raw.get("cf")
+        # 悬空时间戳必须是能比较的数字；脏值当成没有标记（宁可多等一轮，不能拿坏值去判安全）
+        try:
+            inflight_at = float(raw.get("refresh_inflight_at"))
+            inflight_at = inflight_at if inflight_at > 0 else None
+        except (TypeError, ValueError):
+            inflight_at = None
+        inflight_gen = str(raw.get("refresh_inflight_gen") or "").strip() or None
+        if inflight_at is None or inflight_gen is None:
+            inflight_at, inflight_gen = None, None
         return cls(
             checkin_path=raw.get("checkin_path") or None,
             user_id=uid,
             cf=CFSession.from_dict(cf_raw) if isinstance(cf_raw, dict) else None,
             refresh_cookie=raw.get("refresh_cookie") or None,
+            refresh_inflight_at=inflight_at,
+            refresh_inflight_gen=inflight_gen,
             quota_per_unit=unit,
         )
+
+
+def generation_fingerprint(cookie: str) -> str:
+    """代次指纹：sid.secret 的短哈希，用来判断悬空标记还属不属于手上这一代。
+
+    存哈希不存原值 —— refresh_cookie 字段已经有完整凭据了，没必要在库里留第二份。
+    同时兼容 `new_api_refresh=sid.secret` 和裸 `sid.secret` 两种写法。
+    """
+    value = (cookie or "").strip()
+    if "=" in value:
+        value = value.split("=", 1)[1]
+    value = value.split(";")[0].strip()
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
 class SessionStore:
@@ -205,8 +245,61 @@ class SessionStore:
             if record.refresh_cookie == value:
                 return
             record.refresh_cookie = value
+            # 换代了，上一代的悬空账就此清零：它已经被站点取代，不会再被送去 refresh
+            record.refresh_inflight_at = None
+            record.refresh_inflight_gen = None
             self._dirty = True
         self.flush()
+
+    def mark_refresh_inflight(self, slug: str, cookie: str) -> None:
+        """记下「这一代开始被送进 refresh」的时刻，**立即落盘**。
+
+        必须在请求发出**之前**写。写晚了就没意义：超时的那次请求恰恰是最需要记账的
+        —— 站点可能已经推进了代次，而我们没收到响应，此时手上这一代已经是废纸。
+
+        同一代重复调用只认第一次：悬空时长要从「第一次送出」算起，否则每次重试都
+        重置计时，预算就永远用不完。
+        """
+        gen = generation_fingerprint(cookie)
+        if not gen:
+            return
+        with self._lock:
+            record = self.get(slug)
+            if record.refresh_inflight_gen == gen and record.refresh_inflight_at:
+                return
+            record.refresh_inflight_at = now()
+            record.refresh_inflight_gen = gen
+            self._dirty = True
+        self.flush()
+
+    def refresh_inflight_age(self, slug: str, cookie: str) -> Optional[float]:
+        """这一代已经悬空多少秒。没标记、指纹不匹配、或时钟倒流都返回 None。
+
+        指纹不匹配是正常情况：平台回写、人工重新签发都会换掉凭据，那一代的悬空账
+        自然作废。返回 None 表示「这一代没有悬空历史」，可以放心用。
+        """
+        gen = generation_fingerprint(cookie)
+        if not gen:
+            return None
+        with self._lock:
+            record = self._data.get(slug)
+            if record is None or not record.refresh_inflight_at:
+                return None
+            if record.refresh_inflight_gen != gen:
+                return None
+            age = now() - record.refresh_inflight_at
+        # 时钟被往回调过（容器里不罕见）会算出负数，当成没有标记而不是「刚刚才用」
+        return age if age >= 0 else None
+
+    def clear_refresh_inflight(self, slug: str) -> None:
+        """确认这一代已经安全落地（拿到响应）后销账。"""
+        with self._lock:
+            record = self._data.get(slug)
+            if record is None or not (record.refresh_inflight_at or record.refresh_inflight_gen):
+                return
+            record.refresh_inflight_at = None
+            record.refresh_inflight_gen = None
+            self._dirty = True
 
     def flush_throttled(self) -> bool:
         """节流落盘：距上次成功写盘不足 THROTTLE_SECONDS 就先攒着。

@@ -159,9 +159,11 @@ def wired(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _run(driver, cfg, account, *, on_rotate=None, ai=None, want_token=False):
+def _run(driver, cfg, account, *, on_rotate=None, ai=None, want_token=False,
+         on_inflight=None, on_settled=None):
     return solver_mod._run(driver, cfg, account, None, StubOptions(), ai,
-                           want_turnstile_token=want_token, on_rotate=on_rotate)
+                           want_turnstile_token=want_token, on_rotate=on_rotate,
+                           on_inflight=on_inflight, on_settled=on_settled)
 
 
 def _cf():
@@ -459,3 +461,88 @@ class TestRunnerWiring:
         runner._solve(account, runner.store.get(account.slug), None,
                       api.ApiResult(api.CF_BLOCKED))
         assert captured.get("on_rotate") is None
+
+
+class TestPageRefreshInflightAccounting:
+    """页内 refresh 的代次悬空记账。
+
+    HTTP 链路那条已经有 8 秒短超时压着悬空时长，页内这一发的超时却由浏览器/页面决定，
+    烧掉的重放窗口可能更长，所以这条路同样得记账 —— 漏了的话超时后回到重试循环，闸门
+    查不到标记，照样会拿旧代换 IP 重放。
+
+    好在浏览器有个 HTTP 链路没有的优势：Set-Cookie 只要进了 cookie jar，代次就能被
+    抢救回来。那种情况即使 fetch 判失败也该销账，不能白扣一代。
+    """
+
+    def _routes(self, refresh_body=None):
+        routes = {("GET", "/api/user/checkin"): _ok(_checkin_status(True))}
+        if refresh_body is not None:
+            routes[("POST", "/api/user/auth/refresh")] = refresh_body
+        return routes
+
+    def test_mark_happens_before_the_page_fetch(self, wired):
+        """记账必须早于请求发出，理由和 HTTP 链路一样。"""
+        cfg, account = _account()
+        order = []
+        driver = PageDriver(routes=self._routes(_ok(_refresh_ok())))
+        original = driver.fetch_in_page
+
+        def traced(url, method="GET", headers=None, body=None):
+            order.append(("fetch", method))
+            return original(url, method, headers, body)
+
+        driver.fetch_in_page = traced
+        _run(driver, cfg, account, on_rotate=lambda _v: None,
+             on_inflight=lambda value: order.append(("mark", value)),
+             on_settled=lambda: order.append(("settle", "")))
+        assert order[0] == ("mark", "new_api_refresh=sid.gen1")
+        assert order[1][0] == "fetch"
+
+    def test_successful_refresh_settles_the_account(self, wired):
+        cfg, account = _account()
+        settled = []
+        driver = PageDriver(routes=self._routes(_ok(_refresh_ok())))
+        _run(driver, cfg, account, on_rotate=lambda _v: None,
+             on_settled=lambda: settled.append(True))
+        assert settled == [True]
+
+    def test_page_fetch_failure_keeps_the_mark_when_nothing_was_rescued(self, wired):
+        """fetch 挂了且 jar 里还是旧代：站点侧状态不明，标记必须留着。"""
+        cfg, account = _account()
+        settled = []
+        # 不给 refresh 路由 -> fetch_in_page 返回 ok=False，且不触发轮转
+        driver = PageDriver(routes=self._routes(None))
+        marked = []
+        _run(driver, cfg, account, on_rotate=lambda _v: None,
+             on_inflight=lambda value: marked.append(value),
+             on_settled=lambda: settled.append(True))
+        assert marked == ["new_api_refresh=sid.gen1"]
+        assert settled == []                     # 没销账，闸门据此拦住下一轮
+
+    def test_rescued_generation_settles_even_though_fetch_failed(self, wired):
+        """fetch 判失败但 jar 里已经有新代次 —— 代次安全交班了，不该白扣一代。"""
+        cfg, account = _account()
+        settled, rotated = [], []
+        driver = PageDriver(routes=self._routes(None),
+                            rotate_on=("POST", "/api/user/auth/refresh"))
+        _run(driver, cfg, account, on_rotate=rotated.append,
+             on_settled=lambda: settled.append(True))
+        assert rotated == ["new_api_refresh=sid.gen2"]     # 抢救成功
+        assert settled == [True]                           # 因此销账
+
+    def test_missing_hooks_do_not_break_the_page_route(self, wired):
+        """回调是可选的：不接线时页内链路照跑，不能炸。"""
+        cfg, account = _account()
+        outcome = _run(driver=PageDriver(routes=self._routes(_ok(_refresh_ok()))),
+                       cfg=cfg, account=account, on_rotate=lambda _v: None)
+        assert outcome is not None
+
+    def test_empty_jar_skips_marking(self, wired):
+        """jar 里压根没有凭据时没什么可记账的，也不该拿空串去打标记。"""
+        cfg, account = _account()
+        marked = []
+        driver = PageDriver(routes=self._routes(_ok(_refresh_ok())),
+                            cookies={"cf_clearance": "cf"})
+        _run(driver, cfg, account, on_rotate=lambda _v: None,
+             on_inflight=marked.append)
+        assert marked == []

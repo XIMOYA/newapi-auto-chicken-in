@@ -878,6 +878,12 @@ class Runner:
             if row.status == api.NETWORK_ERROR:
                 if exhausted:
                     return self._give_up_on_deadline(row, shield_rounds)
+                # TaBiAI 例外：网络失败可能意味着 refresh 已经打到站点、代次已经推进，只是
+                # 响应没回来。这时拿旧代重试是在赌宽限窗口，超预算必须停手 —— 换 IP 更糟，
+                # 同一代从不同出口反复出现正是重放攻击的特征。
+                blocked = self._refresh_inflight_blocked(account)
+                if blocked is not None:
+                    return self._skip_after_failure(account, row, blocked)
                 swap_started = time.monotonic()
                 swapped = self._swap_pooled_proxy(account)
                 if swapped:
@@ -1065,7 +1071,52 @@ class Runner:
 
         return on_rotate
 
+    def _tabiai_inflight_callback(self, account: Account):
+        """refresh 发出前记账：这一代进入「站点可能已推进、我们还不知道」的悬空态。"""
+        def on_inflight(cookie: str) -> None:
+            try:
+                self.store.mark_refresh_inflight(account.slug, cookie)
+            except Exception as exc:  # noqa: BLE001 - 记账失败不该拖垮签到
+                log.debug(f"记录代次悬空失败: {type(exc).__name__}: {exc}")
+
+        return on_inflight
+
+    def _tabiai_settled_callback(self, account: Account):
+        """拿到 refresh 响应后销账。超时时不会被调用，标记留着挡住预算外的重试。"""
+        def on_settled() -> None:
+            try:
+                self.store.clear_refresh_inflight(account.slug)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(f"清除代次悬空标记失败: {type(exc).__name__}: {exc}")
+
+        return on_settled
+
+    def _refresh_inflight_blocked(self, account: Account) -> Optional[str]:
+        """TaBiAI 账号在网络失败后还能不能拿这一代重试。
+
+        返回 None 表示可以，返回字符串表示必须停手（内容是给用户看的原因）。
+
+        判定看「这一代已经悬空多久」而不是「重试了几次」：refresh 超时一次就吃掉半个安全
+        窗口，次数根本不是有效度量。实测旧代重放窗口只有 20~45 秒，超窗重放会撤销整条会话
+        （AUTH_SESSION_REVOKED），代价是所有账号重新签发，比少刷一轮重得多。
+
+        普通 Cookie 账号没有代次概念，网络失败无限换 IP 是正确行为，一律放行。
+        """
+        if account.login_method != LOGIN_METHOD_TABIAI:
+            return None
+        from .tabiai import INFLIGHT_BUDGET_SECONDS
+
+        cookie = self._tabiai_cookie(account)
+        if not cookie:
+            return None
+        age = self.store.refresh_inflight_age(account.slug, cookie)
+        if age is None or age <= INFLIGHT_BUDGET_SECONDS:
+            return None
+        return (f"TaBiAI 凭据已悬空 {age:.0f} 秒（安全预算 {INFLIGHT_BUDGET_SECONDS} 秒）："
+                "站点可能已推进代次，再用这一代会被判重放并撤销整条会话，本轮主动放弃")
+
     def _tabiai_api_call(self, account: Account, cf, turnstile_token: str = "") -> api.ApiResult:
+
         """跑一轮 TaBiAI 签到。
 
         turnstile_token 是过盾链刚在浏览器里取到的 token：传了就用它，没传就照旧
@@ -1083,7 +1134,10 @@ class Runner:
         on_rotate = self._tabiai_rotate_callback(account)
 
         dry = bool(self.options.cookie_test or self.options.dry_run)
-        with TabiAIClient(account, self.cfg.http, cookie, cf, on_rotate=on_rotate) as client:
+        with TabiAIClient(account, self.cfg.http, cookie, cf, on_rotate=on_rotate,
+                          on_inflight=self._tabiai_inflight_callback(account),
+                          on_settled=self._tabiai_settled_callback(account)) as client:
+
             log.debug(
                 f"TaBiAI impersonate={client.impersonate}, "
                 + ("缓存 UA" if cf is not None and cf.user_agent else "默认 UA")
@@ -1171,7 +1225,8 @@ class Runner:
     # ------------------------------------------------------------------ #
 
     def _solve_guarded(self, solve, account: Account, ip: Optional[str],
-                       want_turnstile_token: bool = False, on_rotate=None):
+                       want_turnstile_token: bool = False, on_rotate=None,
+                       on_inflight=None, on_settled=None):
         """在浏览器并发信号量的保护下调用过盾流程。"""
         ai = self.ai()
 
@@ -1184,6 +1239,8 @@ class Runner:
                 ai=ai,
                 want_turnstile_token=want_turnstile_token,
                 on_rotate=on_rotate,
+                on_inflight=on_inflight,
+                on_settled=on_settled,
             )
 
         def _call_bound():
@@ -1242,10 +1299,17 @@ class Runner:
         # dry-run / cookie_test 模式下不做页内签到，交回原链路按「只检查」处理。
         dry = bool(self.options.cookie_test or self.options.dry_run)
         on_rotate = None
+        on_inflight = None
+        on_settled = None
         if account.login_method == LOGIN_METHOD_TABIAI and not dry:
             on_rotate = self._tabiai_rotate_callback(account)
+            # 页内 refresh 同样消耗代次，记账链路要跟 HTTP 那条一致，否则超时后
+            # 回到重试循环时闸门查不到标记，照样会拿旧代换 IP 重放
+            on_inflight = self._tabiai_inflight_callback(account)
+            on_settled = self._tabiai_settled_callback(account)
 
-        outcome = self._solve_guarded(solve, account, ip, want_turnstile_token, on_rotate)
+        outcome = self._solve_guarded(solve, account, ip, want_turnstile_token, on_rotate,
+                                      on_inflight=on_inflight, on_settled=on_settled)
 
         if outcome.cf is not None:
             self.store.update_cf(account.slug, outcome.cf)

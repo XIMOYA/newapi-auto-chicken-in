@@ -248,11 +248,15 @@ def _install_fake_client(monkeypatch, script=None):
     queue = list(script or [])
 
     class Fake:
-        def __init__(self, account, http, cookie, cf=None, on_rotate=None):
+        def __init__(self, account, http, cookie, cf=None, on_rotate=None,
+                     on_inflight=None, on_settled=None):
             self.account = account
             self.cookie = cookie
             self.cf = cf
             self.on_rotate = on_rotate
+            # 代次悬空记账的两端。真客户端在 refresh 前后调它们，这里只记下来供断言
+            self.on_inflight = on_inflight
+            self.on_settled = on_settled
             self.impersonate = "chrome131"
             self.provider = None
             self.token = None

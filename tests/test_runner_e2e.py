@@ -273,7 +273,8 @@ class TestTabiAIMode:
         calls = []
 
         class FakeTabiAIClient:
-            def __init__(self, account, http, cookie, cf=None, on_rotate=None):
+            def __init__(self, account, http, cookie, cf=None, on_rotate=None,
+                         on_inflight=None, on_settled=None):
                 calls.append(("init", account.login_method, cookie, cf))
                 self.impersonate = "chrome"
 

@@ -54,10 +54,16 @@ class FakeSession:
         self.closed = False
 
     def request(self, method, url, headers=None, **kwargs):
-        self.calls.append({"method": method, "url": url, "headers": dict(headers or {})})
+        # 连 kwargs 一起记：refresh 用的是专用短超时而不是 http.timeout，
+        # 不记下来就没法断言那条安全约束
+        self.calls.append({"method": method, "url": url, "headers": dict(headers or {}),
+                           "kwargs": dict(kwargs)})
         if not self.script:
             raise AssertionError(f"没有为 {method} {url} 预置响应")
-        return self.script.pop(0)
+        response = self.script.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
     def close(self):
         self.closed = True
@@ -75,13 +81,18 @@ def make_account(cookie="new_api_refresh=sid.gen1"):
     return cfg, cfg.accounts[0]
 
 
-def make_client(script, cookie="new_api_refresh=sid.gen1", on_rotate=None, monkeypatch=None):
+def make_client(script, cookie="new_api_refresh=sid.gen1", on_rotate=None, monkeypatch=None,
+                on_inflight=None, on_settled=None):
     cfg, account = make_account(cookie)
     client = tabiai.TabiAIClient.__new__(tabiai.TabiAIClient)
     client.account = account
     client.http = cfg.http
     client.cf = None
     client.on_rotate = on_rotate
+    # 代次悬空记账的两端。__new__ 绕过了 __init__，这里必须手动补齐，
+    # 漏一个就是 AttributeError 而不是「回调没配」
+    client.on_inflight = on_inflight
+    client.on_settled = on_settled
     client._cookie = tabiai.normalize_refresh_cookie(cookie)
     client.user_id = account.user_id
     client.impersonate = "chrome"
@@ -421,3 +432,75 @@ class TestSessionPersistence:
         store.remember_refresh_cookie("acct", "new_api_refresh=sid.gen2")
         store.clear_cf("acct")
         assert store.get("acct").refresh_cookie == "new_api_refresh=sid.gen2"
+
+
+class TestRefreshInflightAccounting:
+    """refresh 的代次悬空记账。
+
+    这组断言守的是「超时后还敢不敢拿这一代重试」。实测旧代重放的安全窗口只有 20~45 秒
+    （放 20s 仍幂等成功，放 45s 直接 AUTH_SESSION_REVOKED、整条会话报废），而 refresh
+    一次超时就吃掉半个窗口。所以「请求发出前就记账、超时后不销账」这个顺序是硬要求：
+    记晚了或者超时也销账，上层就看不出这一代已经危险，会接着换 IP 重放。
+    """
+
+    def test_refresh_uses_its_own_short_timeout(self):
+        """必须用 REFRESH_TIMEOUT_SECONDS，不能沿用 http.timeout（默认 20s）。
+
+        20s 正好是已证实安全窗口的下界 —— 用它做超时等于一次超时就烧光预算。
+        """
+        client = make_client([refresh_ok()])
+        client.refresh()
+        sent = client._session.calls[0]
+        assert sent["kwargs"]["timeout"] == tabiai.REFRESH_TIMEOUT_SECONDS
+        assert tabiai.REFRESH_TIMEOUT_SECONDS < client.http.timeout
+
+    def test_budget_leaves_room_for_one_retry(self):
+        """两次 refresh 超时（8+8）要仍落在 15s 预算内，否则重试机会等于零。"""
+        assert tabiai.REFRESH_TIMEOUT_SECONDS * 2 <= tabiai.INFLIGHT_BUDGET_SECONDS + 1
+        assert tabiai.INFLIGHT_BUDGET_SECONDS < 20      # 必须小于实测窗口下界
+
+    def test_inflight_is_marked_before_the_request_goes_out(self):
+        """记账必须早于请求发出 —— 超时的那一次恰恰是最需要记账的。"""
+        order = []
+        client = make_client([refresh_ok()],
+                             on_inflight=lambda cookie: order.append(("mark", cookie)))
+        client._session.request = (
+            lambda method, url, headers=None, **kw: (
+                order.append(("request", method)),
+                refresh_ok(),
+            )[1]
+        )
+        client.refresh()
+        assert [step for step, _ in order] == ["mark", "request"]
+        assert order[0][1] == "new_api_refresh=sid.gen1"      # 带的是当前这一代
+
+    def test_settled_clears_the_mark_once_a_response_arrives(self):
+        client = make_client([refresh_ok()])
+        settled = []
+        client.on_settled = lambda: settled.append(True)
+        client.refresh()
+        assert settled == [True]
+
+    def test_http_error_still_settles(self):
+        """4xx 也是确定答案：站点侧状态已知，悬空态就该结束。"""
+        client = make_client([FakeResponse(401, {"code": "AUTH_UNAUTHORIZED"})])
+        settled = []
+        client.on_settled = lambda: settled.append(True)
+        client.refresh()
+        assert settled == [True]
+
+    def test_timeout_keeps_the_mark(self):
+        """超时**不能**销账：站点可能已经推进代次，这一代必须继续被视为危险。"""
+        client = make_client([OSError("timed out")])
+        settled = []
+        client.on_inflight = lambda cookie: None
+        client.on_settled = lambda: settled.append(True)
+        result = client.refresh()
+        assert result.result.kind == api.NETWORK_ERROR
+        assert settled == []                    # 标记留着，挡住预算外的重试
+
+    def test_missing_callbacks_do_not_break_refresh(self):
+        """回调是可选的：桌面版/测试里不接线也不能炸。"""
+        client = make_client([refresh_ok()])
+        assert client.on_inflight is None and client.on_settled is None
+        assert client.refresh().result.kind == api.SUCCESS

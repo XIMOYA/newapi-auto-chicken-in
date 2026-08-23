@@ -4,9 +4,12 @@
 
 1. 凭据是 `new_api_refresh=<sid>.<secret>` cookie，Path=/api/user/auth，HttpOnly
 2. 业务接口只认 `Authorization: Bearer <JWT>`，JWT 由 POST /api/user/auth/refresh 换取，约 300 秒
-3. **refresh 有轮转 + 重放检测**：每次成功都会下发下一代 secret。旧代超出宽限窗口后再用，
-   会先 401 AUTH_UNAUTHORIZED，被判重放则整条会话被撤销（401 AUTH_SESSION_REVOKED）。
-   所以每次 refresh 成功后必须立刻把新值落盘并回写平台，绝不能"更新一半又用回旧的"
+3. **refresh 有轮转 + 重放检测**：每次成功都会下发下一代 secret。旧代超出宽限窗口后再用
+   会被判重放，整条会话直接撤销（401 AUTH_SESSION_REVOKED）。实测（2026-08 对 tabitoken.cc）
+   窗口只有 20~45 秒：放 20 秒重放仍幂等成功，放 45 秒直接 REVOKED，**没有 AUTH_UNAUTHORIZED
+   这个温和中间态**。所以每次成功后必须立刻把新值落盘并回写平台，而超时后的重试必须受
+   悬空预算约束 —— 见 REFRESH_TIMEOUT_SECONDS / INFLIGHT_BUDGET_SECONDS
+
 4. 签到 `POST /api/user/checkin?turnstile=<token>` 需要真实 Turnstile token；
    业务失败也返回 HTTP 200，判定必须读 body 的 `success`
 5. 先查 `GET /api/user/checkin?month=` 的 `checked_in_today`，已签就不浪费 Turnstile 配额
@@ -38,6 +41,16 @@ BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
 )
+
+# refresh 专用超时，故意不复用 http.timeout（默认 20 秒）。
+#
+# 实测旧代重放的安全窗口下界就是 20 秒，一次 20 秒的超时正好把窗口烧光，之后无论怎么重试
+# 都是拿整条会话赌运气。8 秒的取舍：一次超时 + 一次重试累计 16 秒，仍落在已证实安全的
+# 20 秒内。代价是慢站点更容易超时，但那属于「这一轮没刷成」，比撤销会话轻得多。
+REFRESH_TIMEOUT_SECONDS = 8
+# 代次悬空预算：这一代从第一次送进 refresh 起，超过这个时长就绝不再用。
+# 窗口下界 20 秒，留 5 秒安全边际给发起请求本身的开销。
+INFLIGHT_BUDGET_SECONDS = 15
 
 
 @dataclass
@@ -78,18 +91,26 @@ class TabiAIClient:
 
     凭据轮转由 on_rotate 回调交给上层落盘（store + 回写平台），
     本类只保证「拿到新值就立刻回调」，不自己决定持久化策略。
+
+    on_inflight / on_settled 是代次悬空记账的两端：refresh 请求发出前调 on_inflight，
+    拿到响应（哪怕是 4xx）后调 on_settled。超时时 on_settled 不会被调用，悬空标记就留在
+    库里 —— 上层据此拒绝在预算外重试。同样只做回调，不碰持久化。
     """
 
     def __init__(self, account: Account, http: HttpConfig, cookie: str,
-                 cf: Optional[CFSession] = None, on_rotate=None):
+                 cf: Optional[CFSession] = None, on_rotate=None,
+                 on_inflight=None, on_settled=None):
         self.account = account
         self.http = http
         self.cf = cf
         self.on_rotate = on_rotate
+        self.on_inflight = on_inflight
+        self.on_settled = on_settled
         self._cookie = normalize_refresh_cookie(cookie)
         self.user_id = account.user_id
         self.impersonate = api.pick_impersonate(http.impersonate, cf.user_agent if cf else "")
         self._session = self._build_session()
+
 
     # ---- 生命周期 ----
 
@@ -183,7 +204,17 @@ class TabiAIClient:
     # ---- 第一步：refresh 换 access token（并轮转凭据）----
 
     def refresh(self) -> RefreshResult:
-        result, resp = self._request("POST", TABIAI_REFRESH_PATH, cookie=self._cookie)
+        # 发出前记账：这一代即刻进入「站点可能已推进代次、我们还不知道」的悬空态。
+        # 必须写在请求之前 —— 超时的那一次恰恰是最需要记账的，事后补写来不及。
+        if self.on_inflight is not None:
+            self.on_inflight(self._cookie)
+        # 短超时压住悬空时长，见 REFRESH_TIMEOUT_SECONDS 的说明
+        result, resp = self._request("POST", TABIAI_REFRESH_PATH, cookie=self._cookie,
+                                     timeout=REFRESH_TIMEOUT_SECONDS)
+        if resp is not None and self.on_settled is not None:
+            # 拿到响应就说明站点侧状态已确定（哪怕是 401），悬空态结束可以销账。
+            # 反之超时/连接失败时 resp 为 None，标记留着，让上层拒绝预算外的重试。
+            self.on_settled()
         if result.kind != api.UNKNOWN:
             return RefreshResult(result)
 
