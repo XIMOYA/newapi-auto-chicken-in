@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -32,6 +33,13 @@ _LOCAL_CONTROLLED_KEYS = frozenset({"security", "config_sync", "tabiai"})
 # tabiai 不在其中：cdp_url 指向本机 Chrome 的调试端口，属于机器级设置，
 # 远端平台不可能知道每台机器的端口，下发覆盖只会把能用的配置改坏。
 _SYNC_MODULES = ("accounts", "ai", "browser", "http", "proxy_pool", "notify")
+
+# 凭据回写的重试次数与退避。平台攥着旧代次的后果是它的保活/网页端检测下次 refresh
+# 撞重放、整条会话被撤销，所以这条链路值得多试几次；它打的是自己的平台而不是目标
+# 站点，重试没有加重风控的顾虑。
+WRITEBACK_ATTEMPTS = 3
+WRITEBACK_BACKOFF_SECONDS = (1.0, 2.0)
+
 
 
 def _merge_payload(local_raw: dict, payload: dict) -> dict:
@@ -237,10 +245,17 @@ def _writeback_endpoint(sync: ConfigSyncConfig, account_name: str) -> str:
 
 def writeback_refresh_cookie(sync: ConfigSyncConfig, account_name: str,
                              cookie: str) -> tuple[bool, str]:
-    """把轮转出的 new_api_refresh 回写到管理平台。
+    """把轮转出的 new_api_refresh 回写到管理平台，并确认平台真的收下了。
 
-    平台端拿旧代次去检测会直接被判失效，所以每轮转一次就同步一次。
-    这里失败不抛异常：本地 sessions.json 已经存了新值，签到本身不受影响。
+    平台端拿旧代次去检测或保活会直接撞重放检测、整条会话被撤销，所以这里不能只看
+    HTTP 状态码：中间要是有网关或鉴权代理回了自己的 200，请求压根没到服务端，平台
+    仍然攥着旧代次，而客户端会以为同步成功。必须读响应体里的 `ok` 字段。
+
+    失败会重试（见 WRITEBACK_ATTEMPTS）。这条链路打的是自己的配置管理平台，不是目标
+    站点，多试几次没有「加重风控」的顾虑，而漏掉一次的代价是整条会话。
+
+    **全程不走代理**：目标是自己的平台而不是被盾挡着的站点，没有伪装出口的需要；
+    套上代理只会让这条关键链路多一个失败点。
     """
     if not sync.enabled:
         return False, "未启用 config_sync"
@@ -249,12 +264,36 @@ def writeback_refresh_cookie(sync: ConfigSyncConfig, account_name: str,
         return False, "无法确定回写地址（配置 config_sync.writeback_url）"
     if not str(cookie or "").strip():
         return False, "凭据为空"
+
+    last = ""
+    for attempt in range(1, WRITEBACK_ATTEMPTS + 1):
+        ok, detail = _writeback_once(sync, endpoint, cookie)
+        if ok:
+            if attempt > 1:
+                log.debug(f"凭据回写第 {attempt} 次成功")
+            return True, endpoint
+        last = detail
+        if attempt < WRITEBACK_ATTEMPTS:
+            wait = WRITEBACK_BACKOFF_SECONDS[
+                min(attempt - 1, len(WRITEBACK_BACKOFF_SECONDS) - 1)
+            ]
+            log.debug(f"凭据回写第 {attempt} 次失败（{detail}），{wait:.0f}s 后重试")
+            time.sleep(wait)
+    return False, f"重试 {WRITEBACK_ATTEMPTS} 次仍失败：{last}"
+
+
+def _writeback_once(sync: ConfigSyncConfig, endpoint: str,
+                    cookie: str) -> tuple[bool, str]:
+    """发一次回写并验收响应。返回 (平台是否确认收下, 失败原因)。"""
     try:
         response = cffi.request(
             "POST", endpoint,
             headers={**_headers(sync), "Content-Type": "application/json"},
             json={"cookie": cookie},
             timeout=sync.timeout,
+            # 显式直连。写成参数而不是靠默认值，是为了让「这里不该套代理」变成
+            # 看得见的约定 —— 免得以后有人顺手把它改成走带代理的 session
+            proxies=None,
         )
     except Exception as exc:  # noqa: BLE001 - 网络库异常类型不固定
         return False, f"{type(exc).__name__}: {exc}"[:160]
@@ -262,7 +301,18 @@ def writeback_refresh_cookie(sync: ConfigSyncConfig, account_name: str,
     if status >= 400:
         text = str(getattr(response, "text", "") or "")[:160]
         return False, f"HTTP {status}: {text}"
-    return True, endpoint
+    # HTTP 2xx 不等于平台收下了：网关、鉴权代理、缓存层都可能替它回 200。
+    # 服务端只有在确认写库成功后才回 {"ok": true}，所以认这个字段而不是状态码。
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 - 响应不是 JSON 就是没到服务端
+        text = str(getattr(response, "text", "") or "")[:120]
+        return False, f"HTTP {status} 但响应不是 JSON（疑似网关代答）: {text!r}"
+    if not isinstance(body, dict):
+        return False, f"HTTP {status} 但响应不是 JSON 对象: {str(body)[:120]}"
+    if body.get("ok") is not True:
+        return False, f"HTTP {status} 但平台未确认收下: {str(body)[:120]}"
+    return True, ""
 
 
 # --------------------------------------------------------------------------- #

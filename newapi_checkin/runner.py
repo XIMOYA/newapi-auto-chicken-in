@@ -135,6 +135,9 @@ class Runner:
         self._state_lock = threading.RLock()
         self._browser_attempts: dict[str, int] = {}
         self._browser_gate: Optional[threading.Semaphore] = None
+        # 凭据回写平台失败的账号 -> 原因。轮转发生在 refresh 回调深处，那里改不了最终
+        # 汇总行，所以先记下来，账号跑完时统一把这一轮判成失败
+        self._writeback_failures: dict[str, str] = {}
         # 排队等浏览器槽位的耗时。并行签到时每个账号 worker 记自己的，
         # 由重试主循环取走并加回时间盒：等全局资源不该算这个账号的过盾时间。
         self._gate_waits = threading.local()
@@ -768,6 +771,8 @@ class Runner:
             self._browser_attempts[account.name] = 0
 
         row = self._run_account_with_retries(account, record)
+        # 凭据没同步到平台的话，签到成功也不算完 —— 平台下次会拿旧代撞重放
+        row = self._apply_writeback_verdict(account, row)
         self._record_proxy_success(account, row)
         return row
 
@@ -1171,11 +1176,48 @@ class Runner:
         from .remote_sync import writeback_refresh_cookie
 
         ok, detail = writeback_refresh_cookie(self.cfg.config_sync, account.name, cookie)
+        with self._state_lock:
+            if ok:
+                # 一轮里可能轮转多次，后一次补上了就把前一次的账划掉
+                self._writeback_failures.pop(account.name, None)
+            else:
+                self._writeback_failures[account.name] = detail
         if ok:
             log.debug(f"新凭据已回写管理平台: {detail}")
         else:
-            log.warn(f"新凭据未能回写管理平台（{detail}）：平台仍持有旧代次，"
-                     "网页端检测会失败，请重新签发或检查 config_sync.writeback_url")
+            log.err(f"新凭据未能回写管理平台（{detail}）：平台仍持有旧代次，"
+                    "它的保活或网页端检测下次会撞重放并撤销整条会话")
+
+    def _take_writeback_failure(self, name: str) -> str:
+        """取出并清掉回写失败记录 —— 不能跨轮次残留，否则下一轮被误判。"""
+        with self._state_lock:
+            return self._writeback_failures.pop(name, "")
+
+    def _apply_writeback_verdict(self, account: Account,
+                                 row: log.SummaryRow) -> log.SummaryRow:
+        """凭据回写彻底失败时，把这一轮判成失败。
+
+        本地 sessions.json 已经存了新代次，签到本身确实成了 —— 但平台还攥着旧代次，
+        它的保活协程和网页端检测下次会拿旧代去 refresh，直接撞重放、整条会话被撤销。
+        报成成功会让这件事在汇总邮件里彻底看不见，等发现时账号已经废了，所以宁可让
+        数字难看也要标出来。
+
+        已经失败的行不动：原本的失败原因比这个更接近根因。
+        """
+        reason = self._take_writeback_failure(account.name)
+        if not reason:
+            return row
+        if row.status not in (api.SUCCESS, api.ALREADY_DONE):
+            log.warn(f"凭据未能回写平台（{reason}）；本轮已按 {row.status} 记账")
+            return row
+        log.err("签到成功但凭据没能同步到平台，本轮按失败记账（本地已存新代次，"
+                "请手动同步或重新签发）")
+        return log.SummaryRow(
+            account.name, api.FAILED, row.strategy,
+            f"签到成功但凭据回写平台失败：{reason}",
+            row.quota, balance=row.balance,
+            quota_per_unit=row.quota_per_unit, site=row.site,
+        )
 
     def _turnstile_provider(self, account: Account, ready_token: str = ""):
         """返回 () -> (token, error)；没有可用取 token 手段时返回 None。

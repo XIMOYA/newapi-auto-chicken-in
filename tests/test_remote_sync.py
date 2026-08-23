@@ -271,3 +271,126 @@ class TestFetchRunState:
 
         self._capture(monkeypatch, NotJson())
         assert remote_sync.fetch_run_state(self._sync()) == (False, {})
+
+
+class TestWritebackVerification:
+    """凭据回写的验收。
+
+    平台攥着旧代次的后果不是「提示不准」：它的保活协程和网页端检测下次会拿旧代去
+    refresh，直接撞重放、整条会话被撤销、所有账号重新签发。而 HTTP 200 并不等于平台
+    收下了 —— 网关、鉴权代理、缓存层都可能替它回 200，请求压根没到服务端。所以这里
+    认的是响应体里的 ok 字段，而不是状态码。
+    """
+
+    @staticmethod
+    def _sync():
+        from newapi_checkin.config import ConfigSyncConfig
+
+        return ConfigSyncConfig.from_raw({
+            "enabled": True,
+            "url": "https://panel.example.com/api/config/raw",
+            "token": "k" * 20,
+        })
+
+    def _replies(self, monkeypatch, responses):
+        """按调用次序吐响应，并记录每次实际发出的请求。"""
+        sent = []
+
+        def fake_request(method, url, **kwargs):
+            sent.append({"method": method, "url": url, **kwargs})
+            item = responses[min(len(sent) - 1, len(responses) - 1)]
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        monkeypatch.setattr(remote_sync.cffi, "request", fake_request)
+        monkeypatch.setattr(remote_sync.time, "sleep", lambda _s: None)
+        return sent
+
+    def test_ok_true_is_accepted(self, monkeypatch):
+        sent = self._replies(monkeypatch, [FakeResponse({"ok": True})])
+        ok, detail = remote_sync.writeback_refresh_cookie(
+            self._sync(), "T", "new_api_refresh=sid.gen2")
+        assert ok is True
+        assert len(sent) == 1
+        assert sent[0]["json"] == {"cookie": "new_api_refresh=sid.gen2"}
+
+    def test_never_goes_through_a_proxy(self, monkeypatch):
+        """打的是自己的平台，不该套代理 —— 代理只会给关键链路多一个失败点。"""
+        sent = self._replies(monkeypatch, [FakeResponse({"ok": True})])
+        remote_sync.writeback_refresh_cookie(self._sync(), "T", "new_api_refresh=sid.gen2")
+        assert sent[0].get("proxies") is None
+
+    def test_gateway_answering_200_without_json_is_rejected(self, monkeypatch):
+        """最要防的一种：网关代答 200，请求压根没到服务端。"""
+        class HtmlPage:
+            status_code = 200
+            text = "<html>gateway ok</html>"
+
+            def json(self):
+                raise ValueError("not json")
+
+        self._replies(monkeypatch, [HtmlPage()])
+        ok, detail = remote_sync.writeback_refresh_cookie(
+            self._sync(), "T", "new_api_refresh=sid.gen2")
+        assert ok is False
+        assert "不是 JSON" in detail
+
+    def test_ok_false_is_rejected(self, monkeypatch):
+        self._replies(monkeypatch, [FakeResponse({"ok": False, "error": "库满了"})])
+        ok, detail = remote_sync.writeback_refresh_cookie(
+            self._sync(), "T", "new_api_refresh=sid.gen2")
+        assert ok is False
+        assert "未确认收下" in detail
+
+    def test_missing_ok_field_is_rejected(self, monkeypatch):
+        """只有 message 没有 ok 也不算 —— 别的服务也可能回一段 JSON。"""
+        self._replies(monkeypatch, [FakeResponse({"message": "received"})])
+        ok, _ = remote_sync.writeback_refresh_cookie(
+            self._sync(), "T", "new_api_refresh=sid.gen2")
+        assert ok is False
+
+    def test_json_array_is_rejected(self, monkeypatch):
+        self._replies(monkeypatch, [FakeResponse([{"ok": True}])])
+        ok, detail = remote_sync.writeback_refresh_cookie(
+            self._sync(), "T", "new_api_refresh=sid.gen2")
+        assert ok is False
+        assert "JSON 对象" in detail
+
+    def test_retries_until_the_platform_confirms(self, monkeypatch):
+        """前两次抖了第三次成 —— 漏一次的代价是整条会话，值得多试。"""
+        sent = self._replies(monkeypatch, [
+            RuntimeError("connection reset"),
+            FakeResponse({"ok": False}),
+            FakeResponse({"ok": True}),
+        ])
+        ok, _ = remote_sync.writeback_refresh_cookie(
+            self._sync(), "T", "new_api_refresh=sid.gen2")
+        assert ok is True
+        assert len(sent) == 3
+
+    def test_gives_up_after_the_attempt_budget(self, monkeypatch):
+        sent = self._replies(monkeypatch, [FakeResponse({"ok": False})])
+        ok, detail = remote_sync.writeback_refresh_cookie(
+            self._sync(), "T", "new_api_refresh=sid.gen2")
+        assert ok is False
+        assert len(sent) == remote_sync.WRITEBACK_ATTEMPTS
+        assert f"重试 {remote_sync.WRITEBACK_ATTEMPTS} 次" in detail
+
+    def test_http_error_is_rejected_without_reading_the_body(self, monkeypatch):
+        self._replies(monkeypatch, [FakeResponse({"error": "no such account"},
+                                                 status_code=404)])
+        ok, detail = remote_sync.writeback_refresh_cookie(
+            self._sync(), "T", "new_api_refresh=sid.gen2")
+        assert ok is False
+        assert "HTTP 404" in detail
+
+    def test_guard_conditions_skip_the_request(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(remote_sync.cffi, "request", lambda *a, **kw: called.append(1))
+        from newapi_checkin.config import ConfigSyncConfig
+
+        disabled = ConfigSyncConfig.from_raw({"enabled": False, "url": "https://x.example.com"})
+        assert remote_sync.writeback_refresh_cookie(disabled, "T", "c")[0] is False
+        assert remote_sync.writeback_refresh_cookie(self._sync(), "T", "  ")[0] is False
+        assert called == []

@@ -385,3 +385,93 @@ class TestKeepaliveYield:
         )
         assert runner.run() == 0
         assert order == ["wait", "start", "checkin", "stop"]
+
+
+class TestWritebackVerdict:
+    """回写失败要在汇总里看得见。
+
+    「签到成功但凭据没同步到平台」报成成功是最坏的组合：平台下次拿旧代 refresh 会撞
+    重放、整条会话被撤销，而汇总邮件里一片绿，等发现时账号已经废了。所以宁可让数字
+    难看，也要把这一轮标成失败。
+    """
+
+    @staticmethod
+    def _row(status, name="T"):
+        return runner_mod.log.SummaryRow(name, status, "S1", "签到成功", 100,
+                                         balance=5000, site="https://t.example.com")
+
+    def _runner_with_failure(self, tmp_path, monkeypatch, detail="HTTP 500"):
+        runner = _runner(tmp_path, monkeypatch)
+        account = runner.cfg.accounts[0]
+        monkeypatch.setattr(
+            "newapi_checkin.remote_sync.writeback_refresh_cookie",
+            lambda sync, name, cookie: (False, detail),
+        )
+        runner._writeback_refresh_cookie(account, "new_api_refresh=sid.gen2")
+        return runner, account
+
+    def test_success_is_downgraded_to_failed(self, tmp_path, monkeypatch):
+        runner, account = self._runner_with_failure(tmp_path, monkeypatch)
+        row = runner._apply_writeback_verdict(account, self._row(runner_mod.api.SUCCESS))
+        assert row.status == runner_mod.api.FAILED
+        assert "回写平台失败" in row.detail
+        assert "HTTP 500" in row.detail
+
+    def test_downgrade_keeps_the_quota_and_site_columns(self, tmp_path, monkeypatch):
+        """判失败不等于丢数据：额度/余额/站点还要照常进汇总表。"""
+        runner, account = self._runner_with_failure(tmp_path, monkeypatch)
+        row = runner._apply_writeback_verdict(account, self._row(runner_mod.api.SUCCESS))
+        assert row.quota == 100 and row.balance == 5000
+        assert row.site == "https://t.example.com"
+
+    def test_already_done_is_also_downgraded(self, tmp_path, monkeypatch):
+        """今日已签同样会 refresh 轮转代次，一样要管。"""
+        runner, account = self._runner_with_failure(tmp_path, monkeypatch)
+        row = runner._apply_writeback_verdict(account, self._row(runner_mod.api.ALREADY_DONE))
+        assert row.status == runner_mod.api.FAILED
+
+    def test_existing_failure_keeps_its_own_reason(self, tmp_path, monkeypatch):
+        """本来就失败的行不动 —— 原因比「没回写」更接近根因。"""
+        runner, account = self._runner_with_failure(tmp_path, monkeypatch)
+        original = self._row(runner_mod.api.AUTH_FAILED)
+        row = runner._apply_writeback_verdict(account, original)
+        assert row is original
+
+    def test_successful_writeback_leaves_the_row_alone(self, tmp_path, monkeypatch):
+        runner = _runner(tmp_path, monkeypatch)
+        account = runner.cfg.accounts[0]
+        monkeypatch.setattr(
+            "newapi_checkin.remote_sync.writeback_refresh_cookie",
+            lambda sync, name, cookie: (True, "ep"),
+        )
+        runner._writeback_refresh_cookie(account, "new_api_refresh=sid.gen2")
+        original = self._row(runner_mod.api.SUCCESS)
+        assert runner._apply_writeback_verdict(account, original) is original
+
+    def test_a_later_success_clears_an_earlier_failure(self, tmp_path, monkeypatch):
+        """一轮里可能轮转多次；后一次补上了就不该再判失败。"""
+        runner, account = self._runner_with_failure(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "newapi_checkin.remote_sync.writeback_refresh_cookie",
+            lambda sync, name, cookie: (True, "ep"),
+        )
+        runner._writeback_refresh_cookie(account, "new_api_refresh=sid.gen3")
+        original = self._row(runner_mod.api.SUCCESS)
+        assert runner._apply_writeback_verdict(account, original) is original
+
+    def test_verdict_does_not_leak_into_the_next_round(self, tmp_path, monkeypatch):
+        """取出即清账，否则下一轮这个号会被上一轮的失败误伤。"""
+        runner, account = self._runner_with_failure(tmp_path, monkeypatch)
+        assert runner._apply_writeback_verdict(
+            account, self._row(runner_mod.api.SUCCESS)).status == runner_mod.api.FAILED
+        again = self._row(runner_mod.api.SUCCESS)
+        assert runner._apply_writeback_verdict(account, again) is again
+
+    def test_failures_are_tracked_per_account(self, tmp_path, monkeypatch):
+        """并行签到时几个账号各记自己的账，不能互相顶掉。"""
+        runner, account = self._runner_with_failure(tmp_path, monkeypatch)
+        other = runner_mod.log.SummaryRow("其他号", runner_mod.api.SUCCESS, "S1", "ok")
+        assert runner._apply_writeback_verdict(
+            type(account)(name="其他号", url=account.url), other) is other
+        row = runner._apply_writeback_verdict(account, self._row(runner_mod.api.SUCCESS))
+        assert row.status == runner_mod.api.FAILED
