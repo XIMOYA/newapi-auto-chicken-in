@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -381,5 +384,252 @@ func TestCookieTestBaseURLRejectsNonHTTP(t *testing.T) {
 	}
 	if _, err := url.Parse("https://example.com"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// --------------------------------------------------------------------------- //
+// 代次抢救：Set-Cookie 一旦带回新一代，这一发无论被判成什么都不能丢代次、也不能重试
+//
+// new_api_refresh 是 sid.secret 形态，每 refresh 一次换一代并带重放检测。实测
+// （2026-08-23 对 tabitoken.cc）旧代重放的安全窗口只有 20~45 秒：放 20 秒重放仍幂等
+// 成功，放 45 秒直接 AUTH_SESSION_REVOKED —— 整条会话撤销、所有账号重新签发，中间
+// 没有 AUTH_UNAUTHORIZED 之类的温和过渡。
+//
+// 而 header 里出现 new_api_refresh 就是「源站确实处理了这一发」的铁证（CDN 挑战页不会
+// 下发这个 cookie），它一口气定了两件事：
+//   - 新代次必须落到 rotatedCookie，漏一次平台就永远停在旧代，下一轮保活直接报废；
+//   - 手里那份旧代快照同时作废，retryable 必须关掉 —— 换一轮代理光建连就要几秒到几十
+//     秒，拿旧代重试是在赌整条会话。
+// --------------------------------------------------------------------------- //
+
+// tabiaiRotatedSetCookie 站点轮转时下发的 Set-Cookie，属性照抄实测抓包。
+const tabiaiRotatedSetCookie = "new_api_refresh=sid.gen2; Path=/api/user/auth; " +
+	"Max-Age=2591999; HttpOnly; SameSite=Strict"
+
+// tabiaiRotatedCookie 上面那条 Set-Cookie 归一化后应落库的值。
+const tabiaiRotatedCookie = "new_api_refresh=sid.gen2"
+
+// checkTabiAIAgainst 拿假站点跑一次凭据检测，手里的凭据固定是旧代 sid.gen1。
+func checkTabiAIAgainst(t *testing.T, handler http.HandlerFunc) CookieTestResult {
+	t.Helper()
+	site := httptest.NewServer(handler)
+	defer site.Close()
+	return checkTabiAICookie(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
+		Name: "tabiai", URL: site.URL, Cookie: "new_api_refresh=sid.gen1",
+	}, "")
+}
+
+func TestCheckTabiAICookieNeverDropsRotatedCookie(t *testing.T) {
+	cases := []struct {
+		name        string
+		wantState   string
+		wantMessage string
+		handler     http.HandlerFunc
+	}{
+		{
+			// 最要命的一种：CDN 挑战页的特征和源站的 Set-Cookie 同时出现。
+			// 矛盾信号下只能信 Set-Cookie —— 挑战页不可能凭空造出一个 new_api_refresh
+			name:        "挑战页特征齐全但 header 带回新代次",
+			wantState:   cookieTestStateAbnormal,
+			wantMessage: "疑似 CDN/WAF 拦截",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Server", "cloudflare")
+				w.Header().Set("Cf-Ray", "8f0e1d2c3b4a5678-HKG")
+				w.Header().Add("Set-Cookie", tabiaiRotatedSetCookie)
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte("<html><title>Just a moment...</title>__cf_chl</html>"))
+			},
+		},
+		{
+			// 站点已经撤销整条会话，但这一发照样消耗了代次。不落库的话人工重新签发前
+			// 库里还是旧代，排查时会误以为"平台压根没刷过"
+			name:        "401 AUTH_SESSION_REVOKED 仍带回新代次",
+			wantState:   cookieTestStateInvalid,
+			wantMessage: "会话已被撤销",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Add("Set-Cookie", tabiaiRotatedSetCookie)
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"success":false,"code":"AUTH_SESSION_REVOKED","message":"Unauthorized"}`))
+			},
+		},
+		{
+			name:        "401 AUTH_UNAUTHORIZED 仍带回新代次",
+			wantState:   cookieTestStateInvalid,
+			wantMessage: "凭据已失效",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Add("Set-Cookie", tabiaiRotatedSetCookie)
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"success":false,"code":"AUTH_UNAUTHORIZED","message":"access token 无效"}`))
+			},
+		},
+		{
+			name:        "正常成功",
+			wantState:   cookieTestStateValid,
+			wantMessage: "LIKIQ",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Add("Set-Cookie", tabiaiRotatedSetCookie)
+				_ = json.NewEncoder(w).Encode(tabiaiRefreshBody(8259, "LIKIQ"))
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := checkTabiAIAgainst(t, tc.handler)
+			if result.State != tc.wantState {
+				t.Fatalf("state = %q，期望 %q（message = %q）", result.State, tc.wantState, result.Message)
+			}
+			if !strings.Contains(result.Message, tc.wantMessage) {
+				t.Errorf("message = %q，应包含 %q", result.Message, tc.wantMessage)
+			}
+			if result.rotatedCookie != tabiaiRotatedCookie {
+				t.Errorf("新代次被丢掉了：rotatedCookie = %q，期望 %q",
+					result.rotatedCookie, tabiaiRotatedCookie)
+			}
+			if result.retryable {
+				t.Error("代次已推进，手里的旧代快照是废纸，绝不能换代理重试")
+			}
+		})
+	}
+}
+
+/*
+body 读到一半断了，但 header 里的新代次必须捞出来。
+
+这条是原来最隐蔽的漏点：读 body 失败时早退分支直接 return，而 Set-Cookie 明明已经躺在
+resp.Header 里了 —— 站点侧代次已推进，平台却因为没落库永远停在旧代。
+
+触发手段是劫持连接手写响应：Content-Length 报 4096 却只发十几个字节就断开。客户端解析完
+header（Set-Cookie 到手）再读 body 时必然拿到 unexpected EOF。让 handler 正常写是做不出来
+的 —— net/http 会自己把 Content-Length 对齐上。
+*/
+func TestCheckTabiAICookieBodyReadFailureRescuesRotatedCookie(t *testing.T) {
+	result := checkTabiAIAgainst(t, func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("httptest 的 ResponseWriter 应支持 Hijack")
+			return
+		}
+		conn, buf, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("Hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\n" +
+			"Content-Type: application/json\r\n" +
+			"Set-Cookie: " + tabiaiRotatedSetCookie + "\r\n" +
+			"Content-Length: 4096\r\n\r\n" +
+			`{"success":`)
+		_ = buf.Flush()
+	})
+
+	if result.State != cookieTestStateAbnormal {
+		t.Fatalf("state = %q，期望 %q（message = %q）",
+			result.State, cookieTestStateAbnormal, result.Message)
+	}
+	if !strings.Contains(result.Message, "读取 refresh 响应失败") {
+		t.Fatalf("这一发应判成读响应失败，实际 message = %q", result.Message)
+	}
+	if result.rotatedCookie != tabiaiRotatedCookie {
+		t.Errorf("body 读失败也不能丢代次：rotatedCookie = %q，期望 %q",
+			result.rotatedCookie, tabiaiRotatedCookie)
+	}
+	if result.retryable {
+		t.Error("header 已经带回新代次，说明源站处理过这一发，不能拿旧代重试")
+	}
+}
+
+// 请求已经整条写进连接（handler 都跑起来了），响应一个字节都没回就断开。
+//
+// 站点到底处理没处理无从判断，这种「不可知」绝不能换代理重试：重试用的是本轮开头从库里
+// 读出的旧代快照，站点真处理过的话拿它再发一次就是主动触发重放检测。保活 90 分钟一轮，
+// 少刷一轮毫无损失，赌一次却要重新签发所有账号。
+func TestCheckTabiAICookieMidFlightDisconnectIsNotRetryable(t *testing.T) {
+	result := checkTabiAIAgainst(t, func(w http.ResponseWriter, _ *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("Hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	})
+
+	if result.State != cookieTestStateAbnormal {
+		t.Fatalf("state = %q，期望 %q（message = %q）",
+			result.State, cookieTestStateAbnormal, result.Message)
+	}
+	if !strings.Contains(result.Message, "refresh 网络错误") {
+		t.Fatalf("应记成 refresh 网络错误，实际 message = %q", result.Message)
+	}
+	if result.retryable {
+		t.Error("连接中途断开时站点可能已经处理完了，换代理重试等于拿整条会话赌重放窗口")
+	}
+	if result.rotatedCookie != "" {
+		t.Errorf("压根没收到响应头，不该凭空冒出新代次: %q", result.rotatedCookie)
+	}
+}
+
+// 反过来：拨号阶段就失败（端口 1 没人听）说明请求从未写出，代次绝无可能推进，
+// 换代理重试必须保留 —— 代理池里有死地址是常态，砍掉这层容错保活会频繁白跑。
+func TestCheckTabiAICookieDialFailureStaysRetryable(t *testing.T) {
+	result := checkTabiAICookie(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
+		Name: "dial-fail", URL: "http://127.0.0.1:1", Cookie: "new_api_refresh=sid.gen1",
+	}, "")
+
+	if result.State != cookieTestStateAbnormal {
+		t.Fatalf("state = %q，期望 %q（message = %q）",
+			result.State, cookieTestStateAbnormal, result.Message)
+	}
+	if !result.retryable {
+		t.Fatalf("拨号失败请求从未发出，必须允许换代理重试（message = %q）", result.Message)
+	}
+	if result.rotatedCookie != "" {
+		t.Errorf("连都没连上，不该有新代次: %q", result.rotatedCookie)
+	}
+}
+
+/*
+tabiaiRefreshNeverSent 的分流表。
+
+它决定「client.Do 直接报错（连 header 都没拿到）时能不能换代理重试」，判断从严：只有能
+确认请求字节还没写出去的才算安全。误判成安全的代价是整条会话被撤销，误判成危险只是白跑
+一轮 90 分钟间隔的保活 —— 这个不对称就是这张表的全部依据。
+
+包装层次照抄 net/http 真实形态（*url.Error 裹 *net.OpError），因为生产代码用的是
+errors.As，包少一层就测不到该测的分支。
+*/
+func TestTabiAIRefreshNeverSentSplitsByStage(t *testing.T) {
+	post := func(err error) error {
+		return &url.Error{Op: "Post", URL: "https://tabitoken.cc" + cookieTestRefreshPath, Err: err}
+	}
+	refused := errors.New("connect: connection refused")
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"DNS 解析失败（裹在 dial 里）", post(&net.OpError{Op: "dial", Net: "tcp",
+			Err: &net.DNSError{Err: "no such host", Name: "nope.invalid", IsNotFound: true}}), true},
+		{"裸 DNSError", post(&net.DNSError{Err: "server misbehaving", Name: "tabitoken.cc"}), true},
+		{"拨号被拒", post(&net.OpError{Op: "dial", Net: "tcp", Err: refused}), true},
+		{"连代理失败", post(&net.OpError{Op: "proxyconnect", Net: "tcp", Err: refused}), true},
+		// 各平台底层错误类型不统一（Windows connectex / Linux ECONNREFUSED），
+		// 类型都没匹配上时靠 net/http 的固定前缀兜底
+		{"只有错误串提到 proxyconnect",
+			post(errors.New("proxyconnect tcp: dial tcp 10.0.0.1:8080: i/o timeout")), true},
+		// 下面这些说明连接已经建立、字节已经在路上，站点可能已经处理完了
+		{"读阶段失败", post(&net.OpError{Op: "read", Net: "tcp",
+			Err: errors.New("connection reset by peer")}), false},
+		{"写阶段失败", post(&net.OpError{Op: "write", Net: "tcp",
+			Err: errors.New("broken pipe")}), false},
+		{"整体超时", post(context.DeadlineExceeded), false},
+		{"多层包装的超时", fmt.Errorf("刷新失败: %w", post(context.DeadlineExceeded)), false},
+		{"说不清阶段的普通错误", errors.New("boom"), false},
+	}
+	for _, tc := range cases {
+		if got := tabiaiRefreshNeverSent(tc.err); got != tc.want {
+			t.Errorf("%s: tabiaiRefreshNeverSent(%v) = %v，期望 %v", tc.name, tc.err, got, tc.want)
+		}
 	}
 }

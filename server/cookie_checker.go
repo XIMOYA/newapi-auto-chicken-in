@@ -13,8 +13,10 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -651,24 +653,102 @@ func checkTabiAICookie(ctx context.Context, httpCfg HTTPConfig, account Account,
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return cookieTestProxyIssue(account, "refresh 网络错误: "+shortCookieTestError(err))
+		// 这里必须按「请求字节有没有可能已经写出去」分流，不能一刀切。
+		//
+		// 拨号阶段失败（代理连不通、DNS 挂了、连接被拒）说明请求从未到达站点，代次
+		// 绝无可能推进，换个代理重试完全安全 —— 代理池里有死地址是常态，砍掉这层
+		// 容错保活会频繁白跑。反之超时或连接中途断开时站点可能已经处理完了，此时
+		// 重试就是拿整条会话去赌 20 秒的重放窗口。
+		message := "refresh 网络错误: " + shortCookieTestError(err)
+		if tabiaiRefreshNeverSent(err) {
+			return cookieTestProxyIssue(account, message)
+		}
+		return tabiaiRefreshUnverifiable(account, message)
 	}
 	header := resp.Header
-	body, readErr := readCookieTestBody(resp)
-	if readErr != nil {
-		return cookieTestProxyIssue(account, "读取 refresh 响应失败: "+readErr.Error())
-	}
-	if cookieTestLooksLikeChallenge(resp.StatusCode, header, body) {
-		return cookieTestProxyIssue(account,
-			fmt.Sprintf("站点未放行当前出口（refresh HTTP %d，疑似 CDN/WAF 拦截）", resp.StatusCode))
+	// 代次抢救必须先于任何一次 return。
+	//
+	// 这里踩过一个静默丢代次的坑：body 读失败、或响应被判成挑战页时，早退分支直接
+	// return，而 Set-Cookie 明明已经在 header 里躺着了。站点侧代次已经推进，平台却
+	// 因为没落库而永远停在旧代，90 分钟后下一轮保活拿旧代去 refresh 就是
+	// AUTH_SESSION_REVOKED、整条会话报废。
+	//
+	// 而且 rotated 有没有值本身就是最可靠的判据：**只有源站会下发 new_api_refresh**，
+	// CDN 的挑战页不会。所以它同时回答了两个问题 —— 新代次要不要落库，以及这一轮
+	// 手里的旧代快照还能不能拿去换代理重试。
+	rotated := extractTabiAIRefreshCookie(header.Values("Set-Cookie"))
+	withRotated := func(result CookieTestResult) CookieTestResult {
+		if rotated == "" {
+			return result
+		}
+		result.rotatedCookie = rotated
+		// 代次已经推进，这一轮开头读出来的旧代是废纸。实测旧代重放的安全窗口只有
+		// 20~45 秒，而换一轮代理光建连就要几秒到几十秒 —— 拿它重试是在赌整条会话
+		result.retryable = false
+		return result
 	}
 
-	result := classifyTabiAIRefresh(account, resp.StatusCode, body)
-	// 无论成功与否都把站点下发的新 cookie 带出去：只要服务端确实换了代次就必须落盘
-	if rotated := extractTabiAIRefreshCookie(header.Values("Set-Cookie")); rotated != "" {
-		result.rotatedCookie = rotated
+	body, readErr := readCookieTestBody(resp)
+	if readErr != nil {
+		return withRotated(cookieTestProxyIssue(
+			account, "读取 refresh 响应失败: "+readErr.Error()))
 	}
-	return result
+	if cookieTestLooksLikeChallenge(resp.StatusCode, header, body) {
+		// 被挡在源站外面（CDN/WAF 挑战页）。请求没到源站、代次没推进，换出口重试
+		// 是对的 —— 除非 header 里居然带着新代次，那说明源站其实处理了，withRotated
+		// 会把 retryable 关掉
+		return withRotated(cookieTestProxyIssue(account,
+			fmt.Sprintf("站点未放行当前出口（refresh HTTP %d，疑似 CDN/WAF 拦截）", resp.StatusCode)))
+	}
+
+	return withRotated(classifyTabiAIRefresh(account, resp.StatusCode, body))
+}
+
+// tabiaiRefreshUnverifiable 构造「refresh 已经发出但结果不可知」的结果。
+//
+// 和 cookieTestProxyIssue 的唯一区别是**不标 retryable**，这个区别是要命的：
+// refresh 是不可重放的写操作，实测旧代重放的安全窗口只有 20~45 秒（放 20 秒仍幂等
+// 成功，放 45 秒直接 AUTH_SESSION_REVOKED、整条会话报废，中间没有温和过渡）。
+// 而换一轮代理光建连就要几秒到几十秒，5 轮下来必然出窗。
+//
+// 更关键的是重试用的 cookie 是这一轮开头从库里读的快照，站点侧要是已经推进了代次，
+// 那份快照就是废纸 —— 拿它重试等于主动触发重放检测。
+//
+// 保活是 90 分钟一轮的低频任务，少刷一轮毫无损失，赌一次却要重新签发所有账号。
+// 这个不对称决定了这里宁可放弃本轮。
+func tabiaiRefreshUnverifiable(account Account, message string) CookieTestResult {
+	// 状态仍是 abnormal（界面上仍显示"异常"），只是不再允许换代理重试
+	return cookieTestResult(account, cookieTestStateAbnormal, message, nil)
+}
+
+// tabiaiRefreshNeverSent 判断这个错误是否发生在「请求字节写出之前」。
+//
+// 返回 true 表示 refresh 从未到达站点，代次不可能推进，换代理重试是安全的。
+// 判断从严：拿不准的一律算「可能已发出」，因为误判成安全的代价是整条会话被撤销，
+// 而误判成危险只是白跑一轮 90 分钟间隔的保活。
+func tabiaiRefreshNeverSent(err error) bool {
+	if err == nil {
+		return false
+	}
+	// DNS 解析失败：连地址都没解出来，肯定没发出去
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	// net.OpError 的 Op 直接说明卡在哪个阶段。只有拨号（含连代理）是安全的：
+	// read/write 说明连接已经建立、字节已经在路上
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return opErr.Op == "dial" || opErr.Op == "proxyconnect"
+	}
+	// 上面两类没匹配上时按字符串兜底：net/http 对「连代理都没连上」用的是固定前缀，
+	// 而各平台的底层错误类型不统一（Windows 是 connectex，Linux 是 ECONNREFUSED）
+	if strings.Contains(err.Error(), "proxyconnect") {
+		return true
+	}
+	// 剩下的一律按最坏情况处理。超时（net.Error.Timeout）定位不到卡在哪个阶段，
+	// 未知错误更没有乐观的理由 —— 猜错的代价是整条会话被撤销
+	return false
 }
 
 // classifyTabiAIRefresh 依据 refresh 响应判定凭据状态。
