@@ -37,6 +37,32 @@ TIMEOUT_COOLDOWN = 10.0
 TASK_DEADLINE_FACTOR = 2.0
 MIN_TASK_DEADLINE = 60.0
 
+# 模型「拒答」的特征词。截图不是它以为的那种题时（最常见的是把带 Cloudflare
+# 复选框的仪表盘当成点选题问过去），模型往往不按格式回 found=false，而是用自然
+# 语言纠正前提：'The image isn't a tile-selection captcha — it's a dashboard...'。
+# 这种回答重试多少次都是同一个结果，识别出来当场收手，别再烧视觉 token。
+_REFUSAL_MARKERS = (
+    "can't help", "cannot help", "can't assist", "cannot assist",
+    "can't provide", "cannot provide", "can not help",
+    "isn't a", "is not a", "not a tile", "no tile", "aren't any",
+    "i'm sorry", "i am sorry", "unable to",
+    "无法", "抱歉", "不是点选", "没有点选", "并非", "无需点选",
+)
+
+
+def _looks_refused(text: str) -> bool:
+    """判断模型是不是在用自然语言拒答，而不是输出被截断了。
+
+    两者的处置完全相反：拒答重试没有意义，截断（thinking 把 max_tokens 吃光）
+    再来一次可能就成了。区分靠有没有 JSON 开括号 —— 只要模型动手写了对象，
+    哪怕写残，也说明它接受了任务，那就留给正常重试路径。
+    """
+    if "{" in text:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in _REFUSAL_MARKERS)
+
+
 try:  # curl_cffi 的超时异常层级在不同版本里略有差异，缺失时退回错误码/文案判断
     from curl_cffi.requests.exceptions import Timeout as _CurlTimeout
 except (ImportError, AttributeError):  # pragma: no cover - 取决于依赖版本
@@ -365,6 +391,12 @@ class VisionClient:
                 continue
             parsed = loose_json(text)
             if parsed is None:
+                if _looks_refused(text):
+                    # 拒答不是故障，也不该重试：模型看清了图，只是图里没有它要找的
+                    # 东西。返回 found=false 让各任务照「没找到」处理，另带一个内部
+                    # 标记，好让点选流程知道「别再拿同一张图问了」。
+                    log.debug(f"AI 判定图中没有该任务的目标，跳过重试: {text[:120]}")
+                    return {"found": False, "_refused": True}
                 log.debug(f"AI 输出无法解析为 JSON({used}/{attempts}): {text[:160]}")
                 continue
             log.debug(f"AI 输出: {parsed}")
@@ -426,11 +458,20 @@ class VisionClient:
             return None
         return self._point(data, width, height)
 
-    def locate_grid(self, png: bytes, width: int, height: int, target: str) -> list:
-        """点选式验证码：返回多个归一化坐标。"""
+    def locate_grid(self, png: bytes, width: int, height: int, target: str) -> Optional[list]:
+        """点选式验证码：返回多个归一化坐标。
+
+        返回 None 有特殊含义 —— AI 看过图并明确表示里面没有点选题（例如只有一个
+        Cloudflare 复选框）。调用方据此停手，别对着同一个画面反复问；空列表则只是
+        这一次没拿到有效坐标，还可以再试。
+        """
         prompt = prompts.GRID_PROMPT.format(width=int(width), height=int(height), target=target)
         data = self._ask(prompt, [png], detail="high", max_tokens=400)
-        if not data or not data.get("found"):
+        if not data:
+            return []
+        if data.get("_refused") or data.get("found") is False:
+            return None
+        if not data.get("found"):
             return []
         points = data.get("points")
         if not isinstance(points, list):

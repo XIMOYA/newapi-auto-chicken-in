@@ -740,6 +740,96 @@ class FakeOptions:
     manual = False
 
 
+class GridAI:
+    """只实现 locate_grid：按脚本逐次返回，用完之后重复最后一个。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = 0
+        self.on_call = None
+
+    def locate_grid(self, _png, _w, _h, _target):
+        self.calls += 1
+        if self.on_call:
+            self.on_call(self.calls)
+        idx = min(self.calls - 1, len(self.script) - 1)
+        return self.script[idx]
+
+
+class FakeClock:
+    """可控单调时钟：每次读推进固定步长，让等待循环无需真的睡。"""
+
+    def __init__(self, step=0.5):
+        self.now = 1000.0
+        self.step = step
+
+    def monotonic(self):
+        self.now += self.step
+        return self.now
+
+    def sleep(self, _seconds):
+        pass
+
+
+class TestTurnstileWaitAiBudget:
+    """等 token 的循环不能被「画面里没有点选题」的回答拖着无限烧视觉调用。"""
+
+    @pytest.fixture()
+    def clock(self, monkeypatch):
+        c = FakeClock()
+        monkeypatch.setattr(solver.time, "monotonic", c.monotonic)
+        monkeypatch.setattr(solver.time, "sleep", c.sleep)
+        return c
+
+    def test_stops_asking_after_consecutive_absent_verdicts(self, wired, clock):
+        page = FakePage([CHALLENGE])
+        _, _, driver = build(page)
+        ai = GridAI([None])          # 每次都说「这画面没有点选题」
+        with driver:
+            token = solver._wait_turnstile_token_interactive(driver, ai, 60)
+        assert token == ""
+        assert ai.calls == solver.GRID_ABSENT_GIVEUP
+
+    def test_total_calls_capped_when_ai_keeps_failing(self, wired, clock):
+        """空列表是「这次没识别出来」，允许再试，但总次数必须有上限。"""
+        page = FakePage([CHALLENGE])
+        _, _, driver = build(page)
+        ai = GridAI([[]])
+        with driver:
+            token = solver._wait_turnstile_token_interactive(driver, ai, 120)
+        assert token == ""
+        assert ai.calls == solver.MAX_GRID_AI_CALLS
+
+    def test_absent_streak_resets_after_a_successful_round(self, wired, clock):
+        """先说没有、再给出坐标，说明质询是后来升级出来的，计数要清零。"""
+        page = FakePage([CHALLENGE])
+        _, _, driver = build(page)
+        ai = GridAI([None, [(0.5, 0.5)], None, None])
+        with driver:
+            solver._wait_turnstile_token_interactive(driver, ai, 120)
+        # 没有清零的话第 3 次就停了，拿不到第 4 次
+        assert ai.calls == 4
+        assert page.mouse.clicks == [(640.0, 400.0)]
+
+    def test_returns_token_after_ai_clicks_tiles(self, wired, clock):
+        page = FakePage([CHALLENGE])
+        _, _, driver = build(page)
+        ai = GridAI([[(0.25, 0.75)]])
+        # 点完图块站点才回填 token，用第一次调用后置位来模拟
+        ai.on_call = lambda n: setattr(page, "_turnstile_token", "tok-after-grid")
+        with driver:
+            token = solver._wait_turnstile_token_interactive(driver, ai, 60)
+        assert token == "tok-after-grid"
+        assert ai.calls == 1
+        assert page.mouse.clicks == [(320.0, 600.0)]
+
+    def test_no_ai_client_still_polls_without_crashing(self, wired, clock):
+        page = FakePage([CHALLENGE])
+        _, _, driver = build(page)
+        with driver:
+            assert solver._wait_turnstile_token_interactive(driver, None, 30) == ""
+
+
 class TestSolverRun:
     def test_redirect_to_login_is_terminal_and_does_not_call_ai(self, wired):
         login_html = '<form><label>用户名或电子邮件</label><input type="password"></form>'

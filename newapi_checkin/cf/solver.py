@@ -53,6 +53,14 @@ SHORT_WAIT = 30               # 每次交互后等待质询自解的上限
 AI_ASSIST_BUDGET = 150        # S3 整段（含所有轮次与 AI 请求）的总时长上限
 AI_CALL_RESERVE = 5           # 剩余时间不足这么多秒时不再发起新的 AI 请求
 
+# 等 Turnstile token 的循环里，视觉调用的总次数上限（成败都算）。
+# grid_attempts 只统计「拿到坐标并点下去」的轮数，光靠它拦不住失败的调用：
+# 复选框形态下 AI 每次都答不出点选坐标，循环却每秒一轮，几十次高清截图就出去了。
+MAX_GRID_AI_CALLS = 6
+# AI 连着这么多次明确表示「画面里没有点选题」就不再问。留 2 次而不是 1 次，
+# 是因为 Turnstile 会在点击复选框之后才升级成点选质询，只问一次容易漏掉。
+GRID_ABSENT_GIVEUP = 2
+
 
 @dataclass
 class SolveOutcome:
@@ -419,6 +427,9 @@ def _solve_grid_captcha(driver: BrowserDriver, ai) -> bool:
     if not shot:
         return False
     points = ai.locate_grid(shot, width, height, "题目要求点选的所有图块")
+    if points is None:
+        log.debug("AI 判定当前画面不是点选题，不做点击")
+        return False
     if not points:
         log.debug("AI 未能给出可点击的图块")
         return False
@@ -521,12 +532,19 @@ def _wait_turnstile_token_interactive(driver: BrowserDriver, ai, timeout: int) -
       2. 节流点击复选框（幂等：已通过时点击无害，未通过时是必经第一步）；
       3. 截图让 AI 判断是否出现图片点选质询并代为点选。
 
+    第 3 步只有在真的出现点选题时才有活干，但循环没法从跨域 iframe 里读出当前是
+    哪种形态，只能靠 AI 看图回话。所以 AI 一旦明确说「这画面没有点选题」，就要停
+    手（GRID_ABSENT_GIVEUP），并且不论成败都记调用次数（MAX_GRID_AI_CALLS）——
+    否则复选框形态下会每秒一次高清截图问下去。
+
     截止时间在「发起 AI 请求之前」也要检查一次：一次视觉调用可能占掉几十秒，
     只在循环顶部检查会让实际耗时远远超出传入的 timeout。
     """
     deadline = time.monotonic() + max(1.0, float(timeout))
     last_click = 0.0
     grid_attempts = 0
+    ai_calls = 0        # 视觉调用总次数，成败都计 —— 见 MAX_GRID_AI_CALLS
+    absent_streak = 0   # 连续几次 AI 说「画面里没有点选题」
     while True:
         token = driver.turnstile_token()
         if token:
@@ -547,13 +565,23 @@ def _wait_turnstile_token_interactive(driver: BrowserDriver, ai, timeout: int) -
                     return token
 
         # 2) AI 应对图片点选质询（最多 3 轮，避免烧太多视觉 token）
-        if (ai is not None and grid_attempts < 3
+        if (ai is not None and grid_attempts < 3 and ai_calls < MAX_GRID_AI_CALLS
+                and absent_streak < GRID_ABSENT_GIVEUP
                 and deadline - time.monotonic() > AI_CALL_RESERVE):
             width, height = driver.viewport()
             shot = driver.screenshot()
             if shot:
+                ai_calls += 1
                 points = ai.locate_grid(shot, width, height, "题目要求点选的所有图块")
-                if points:
+                if points is None:
+                    # AI 看过了，画面里没有点选题（最常见的就是只有个复选框，
+                    # 那本来是上面第 1 步的活）。再问一次确认页面没在升级质询，
+                    # 连着两次都说没有就彻底不问了。
+                    absent_streak += 1
+                    log.debug(f"AI 判定画面无点选题（第 {absent_streak} 次），"
+                              f"交给复选框流程")
+                elif points:
+                    absent_streak = 0
                     grid_attempts += 1
                     clicked = 0
                     for nx, ny in points[:9]:

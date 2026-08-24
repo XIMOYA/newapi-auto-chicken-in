@@ -1,7 +1,7 @@
-"""AI 输出的 JSON 容错解析、坐标归一化、代理解析。"""
+"""AI 输出的 JSON 容错解析、坐标归一化、代理解析、拒答识别。"""
 
 from newapi_checkin import utils
-from newapi_checkin.ai.vision import VisionClient
+from newapi_checkin.ai.vision import VisionClient, _looks_refused
 
 
 class TestLooseJson:
@@ -115,3 +115,70 @@ class TestContentExtraction:
 
     def test_broken_json(self):
         assert VisionClient._content_of(self.Resp(None)) == ""
+
+
+class TestRefusalDetection:
+    """模型用自然语言拒答 vs 输出被截断 —— 两者处置相反，必须分得开。"""
+
+    def test_real_case_dashboard_not_a_captcha(self):
+        # 线上实际收到的回复，就是它把重试烧光了
+        raw = ("I can't help with this one. The image isn't a tile-selection captcha "
+               "— it's a dashboard screenshot with a Cloudflare \"verify you are human\" "
+               "checkbox, and identifying...")
+        assert _looks_refused(raw) is True
+
+    def test_chinese_refusal(self):
+        assert _looks_refused("抱歉，这张图里没有点选题，只有一个真人验证复选框。") is True
+
+    def test_truncated_json_is_not_refusal(self):
+        # thinking 吃光 max_tokens 导致的截断，重试有救，不能当拒答
+        assert _looks_refused('{"found": true, "points": [{"x": 0.1, "y": 0.2}') is False
+
+    def test_partial_json_with_prose_is_not_refusal(self):
+        assert _looks_refused('我无法完全确定，不过：{"found": false') is False
+
+    def test_normal_prose_without_markers_is_not_refusal(self):
+        assert _looks_refused("图中有九个方格，分别是……") is False
+
+    def test_empty(self):
+        assert _looks_refused("") is False
+
+    def test_case_insensitive(self):
+        assert _looks_refused("I CANNOT HELP WITH THAT REQUEST") is True
+
+
+class TestLocateGridVerdict:
+    """locate_grid 的三态：坐标 / [] 可重试 / None 画面里就没有点选题。"""
+
+    @staticmethod
+    def _client(reply):
+        client = VisionClient.__new__(VisionClient)
+        client._ask = lambda *a, **k: reply  # type: ignore[method-assign]
+        return client
+
+    def test_refused_returns_none(self):
+        client = self._client({"found": False, "_refused": True})
+        assert client.locate_grid(b"png", 800, 600, "图块") is None
+
+    def test_explicit_not_found_returns_none(self):
+        # 模型守规矩地回 found=false，语义和拒答一样：它看过了，没有点选题
+        client = self._client({"found": False})
+        assert client.locate_grid(b"png", 800, 600, "图块") is None
+
+    def test_ask_failure_returns_empty_list(self):
+        # 请求层全败（超时、HTTP 错误）与「确认无题」不同，还可以再试
+        client = self._client(None)
+        assert client.locate_grid(b"png", 800, 600, "图块") == []
+
+    def test_found_without_points_returns_empty_list(self):
+        client = self._client({"found": True})
+        assert client.locate_grid(b"png", 800, 600, "图块") == []
+
+    def test_points_are_normalised(self):
+        client = self._client({"found": True, "points": [
+            {"x": 400, "y": 300},        # 像素值，要归一化
+            {"x": 0.25, "y": 0.5},       # 已经是比例
+            {"x": "bad", "y": 0.1},      # 脏数据，丢掉
+        ]})
+        points = client.locate_grid(b"png", 800, 600, "图块")
+        assert points == [(0.5, 0.5), (0.25, 0.5)]
