@@ -34,7 +34,8 @@
     "preflight_check": true,
     "preflight_limit": 60,
     "preflight_seconds": 15,
-    "max_accounts_per_ip": 4
+    "max_accounts_per_ip": 4,
+    "speed_test_url": "https://speed.cloudflare.com/__down?bytes=1048576"
   },
   "notify": {
     "email": {

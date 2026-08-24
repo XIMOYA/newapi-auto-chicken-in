@@ -885,12 +885,14 @@ func (s *Server) handleSpeedTestProxies(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	timeout := cfg.ProxyPool.Timeout
+	// 测速地址取配置，空值回落到默认端点。响应里回显它，前端不必自己拼一份
+	speedURL := speedTestURLOf(cfg.ProxyPool)
 	go func() {
 		defer recoverPanic("代理测速任务")
 		// 测速后台使用独立 120 秒 context：不随 HTTP 请求结束/取消而中断
 		ctx, cancel := context.WithTimeout(context.Background(), speedTestBackgroundTimeout)
 		defer cancel()
-		updated, terr := s.proxies.SpeedTest(ctx, req.Proxies, timeout)
+		updated, terr := s.proxies.SpeedTest(ctx, req.Proxies, timeout, speedURL)
 		if terr != nil {
 			log.Printf("[proxy] 测速失败: %v", terr)
 		} else {
@@ -898,7 +900,7 @@ func (s *Server) handleSpeedTestProxies(w http.ResponseWriter, r *http.Request) 
 		}
 	}()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "tested": len(req.Proxies), "url": "https://speed.cloudflare.com/__down?bytes=1048576",
+		"ok": true, "tested": len(req.Proxies), "url": speedURL,
 	})
 }
 

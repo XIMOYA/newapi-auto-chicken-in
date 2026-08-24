@@ -137,6 +137,12 @@ type ProxyPool struct {
 	// 再加固定余量。共用是正常策略而不是降级 —— 4 个账号共用一个出口通常不会招来
 	// 更多质询，换来的是预取与测通量大幅下降。发现盾突然变难过时先把它调小。
 	MaxAccountsPerIP int `json:"max_accounts_per_ip"`
+	// SpeedTestURL 测下载速度用的端点，和 TestURL（只测通不通）是两回事。
+	//
+	// 吞吐按**实际读到的字节数**除以耗时算，所以换成别的地址不需要同步改什么"预期
+	// 大小"。但地址得能稳定吐出足够的数据：几 KB 的页面测出来的数字受握手开销主导，
+	// 排序意义不大。默认那个 Cloudflare 端点专门干这个用，全球都快。
+	SpeedTestURL string `json:"speed_test_url"`
 }
 
 // Notify 通知配置。
@@ -229,6 +235,7 @@ func DefaultConfig() Config {
 			PreflightLimit:    60,
 			PreflightSeconds:  15,
 			MaxAccountsPerIP:  4,
+			SpeedTestURL:      DefaultSpeedTestURL,
 		},
 		Notify: Notify{
 			Email: EmailConfig{

@@ -108,6 +108,14 @@ web/src/views/ProxyPoolSettingsView.vue
             调小更安全但要抓更多 IP
           </span>
         </n-form-item>
+        <n-form-item label="测速 URL">
+          <n-input v-model:value="form.speed_test_url"
+                   :placeholder="`留空用默认：${DEFAULT_SPEED_TEST_URL}`" />
+          <span class="switch-tip">
+            测下载速度用的地址，和上面的连通性测试是两回事。吞吐按实际下载字节数算，
+            换地址不用改别的；但目标要能稳定吐出足够数据，几 KB 的页面测出来受握手开销主导
+          </span>
+        </n-form-item>
       </n-form>
     </config-card>
   </div>
@@ -131,6 +139,11 @@ import type { AppConfig, ProxyPoolConfig } from '@/types'
 
 const configStore = useConfigStore()
 const message = useMessage()
+
+// 和 Go 侧 DefaultSpeedTestURL 保持一致，只用于 placeholder 提示留空会用什么。
+// 不作为表单默认值：留空提交才能让服务端自己回落，写死在前端会把「跟随默认」变成
+// 「固定成这个值」，以后服务端换默认端点前端就跟不上了
+const DEFAULT_SPEED_TEST_URL = 'https://speed.cloudflare.com/__down?bytes=1048576'
 
 const saving = ref(false)
 const initialized = ref(false)
@@ -161,7 +174,8 @@ const form = reactive<ProxyPoolConfig>({
   preflight_check: true,
   preflight_limit: 60,
   preflight_seconds: 15,
-  max_accounts_per_ip: 4
+  max_accounts_per_ip: 4,
+  speed_test_url: ''
 })
 
 function initForm(cfg: AppConfig) {
@@ -187,6 +201,7 @@ function initForm(cfg: AppConfig) {
   form.preflight_limit = p.preflight_limit ?? 60
   form.preflight_seconds = p.preflight_seconds ?? 15
   form.max_accounts_per_ip = p.max_accounts_per_ip ?? 4
+  form.speed_test_url = p.speed_test_url ?? ''
   savedSnapshot.value = JSON.stringify(form)
 }
 

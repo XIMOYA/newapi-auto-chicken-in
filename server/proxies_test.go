@@ -234,3 +234,123 @@ func TestSpeedSurvivesRefreshReplace(t *testing.T) {
 		t.Errorf("有测速值的应排在前面, got %v", addrs)
 	}
 }
+
+/*
+刷新时把老池并进候选：免费源列表天天变，昨天好用的出口今天可能压根不在源里。
+整表替换会让这种代理直接消失——即使它还通着。并进来一起过测通，能通就留、不通淘汰，
+池子于是收敛在「持续可用的那批」而不是「今天恰好被源收录的那批」。
+*/
+func TestMergeExistingCandidates(t *testing.T) {
+	fresh := []proxyCandidate{
+		{"9.9.9.9:80", "src-new"},
+		{"8.8.8.8:80", "src-new"},
+	}
+
+	t.Run("老池不在新源里也要保留并排在前面", func(t *testing.T) {
+		existing := []ProxyEntry{
+			{Addr: "1.1.1.1:80", Source: "src-old"},
+			{Addr: "2.2.2.2:80", Source: "src-old"},
+		}
+		got := mergeExistingCandidates(fresh, existing)
+		if len(got) != 4 {
+			t.Fatalf("合并后 = %d 条, want 4: %+v", len(got), got)
+		}
+		// 前面必须是老的：saveLimit 提前停时先给已验证过的机会
+		if got[0].addr != "1.1.1.1:80" || got[1].addr != "2.2.2.2:80" {
+			t.Fatalf("老池没排在前面: %+v", got)
+		}
+		if got[2].addr != "9.9.9.9:80" || got[3].addr != "8.8.8.8:80" {
+			t.Fatalf("新源候选顺序被打乱: %+v", got)
+		}
+	})
+
+	t.Run("老池保留自己的来源标记", func(t *testing.T) {
+		got := mergeExistingCandidates(fresh, []ProxyEntry{{Addr: "1.1.1.1:80", Source: "src-old"}})
+		if got[0].source != "src-old" {
+			t.Fatalf("来源被改成 %q, want src-old", got[0].source)
+		}
+	})
+
+	t.Run("新源里已有的不重复排队", func(t *testing.T) {
+		existing := []ProxyEntry{
+			{Addr: "9.9.9.9:80", Source: "src-old"}, // 和 fresh 撞了
+			{Addr: "1.1.1.1:80", Source: "src-old"},
+		}
+		got := mergeExistingCandidates(fresh, existing)
+		if len(got) != 3 {
+			t.Fatalf("合并后 = %d 条, want 3（撞的那条只测一次）: %+v", len(got), got)
+		}
+		seen := map[string]int{}
+		for _, c := range got {
+			seen[c.addr]++
+		}
+		if seen["9.9.9.9:80"] != 1 {
+			t.Fatalf("9.9.9.9:80 出现 %d 次, want 1", seen["9.9.9.9:80"])
+		}
+		// 撞的那条按新来源记账，所以它仍留在 fresh 的位置上
+		if got[1].addr != "9.9.9.9:80" || got[1].source != "src-new" {
+			t.Fatalf("撞库那条应保留新来源: %+v", got)
+		}
+	})
+
+	t.Run("老池内部重复也去掉", func(t *testing.T) {
+		existing := []ProxyEntry{
+			{Addr: "1.1.1.1:80", Source: "a"},
+			{Addr: "1.1.1.1:80", Source: "b"},
+		}
+		got := mergeExistingCandidates(nil, existing)
+		if len(got) != 1 || got[0].source != "a" {
+			t.Fatalf("老池去重失败: %+v", got)
+		}
+	})
+
+	t.Run("空地址被跳过", func(t *testing.T) {
+		got := mergeExistingCandidates(nil, []ProxyEntry{{Addr: "", Source: "x"}})
+		if len(got) != 0 {
+			t.Fatalf("空地址不该进候选: %+v", got)
+		}
+	})
+
+	t.Run("老池为空时原样返回", func(t *testing.T) {
+		got := mergeExistingCandidates(fresh, nil)
+		if len(got) != 2 || got[0].addr != "9.9.9.9:80" {
+			t.Fatalf("老池为空时不该改动 fresh: %+v", got)
+		}
+	})
+}
+
+// 只有存活的老代理才参与复测：已经判死的没必要再占测通配额和时间
+func TestRefreshOnlyRecheckesAliveProxies(t *testing.T) {
+	srv := newTestServer(t)
+	if err := srv.proxies.replaceAll([]ProxyEntry{
+		{Source: "s", Addr: "1.1.1.1:80", Alive: true, LastChecked: "now", LastAliveAt: "now"},
+		{Source: "s", Addr: "2.2.2.2:80", Alive: false, LastChecked: "now"},
+	}); err != nil {
+		t.Fatalf("replaceAll: %v", err)
+	}
+	alive, err := srv.proxies.queryProxies(true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := mergeExistingCandidates(nil, alive)
+	if len(got) != 1 || got[0].addr != "1.1.1.1:80" {
+		t.Fatalf("只该复测存活的那条, got %+v", got)
+	}
+}
+
+// 测速地址取配置，空值回落默认端点
+func TestSpeedTestURLOf(t *testing.T) {
+	if got := speedTestURLOf(ProxyPool{}); got != DefaultSpeedTestURL {
+		t.Fatalf("空配置应回落默认, got %q", got)
+	}
+	if got := speedTestURLOf(ProxyPool{SpeedTestURL: "   "}); got != DefaultSpeedTestURL {
+		t.Fatalf("空白配置应回落默认, got %q", got)
+	}
+	custom := "https://agentrouter.org/bigfile"
+	if got := speedTestURLOf(ProxyPool{SpeedTestURL: custom}); got != custom {
+		t.Fatalf("自定义地址应生效, got %q", got)
+	}
+	if got := speedTestURLOf(ProxyPool{SpeedTestURL: "  " + custom + "  "}); got != custom {
+		t.Fatalf("首尾空白应被去掉, got %q", got)
+	}
+}

@@ -100,6 +100,12 @@ export interface ProxyPoolConfig {
   preflight_seconds: number
   /** 同一出口 IP 最多给几个账号用，<=0 不限；客户端据此分配代理并折算预取量 */
   max_accounts_per_ip: number
+  /**
+   * 测下载速度用的端点，和 test_url（只测通不通）是两回事。
+   * 吞吐按实际读到的字节数算，换地址不用改任何"预期大小"；但目标要能稳定吐出
+   * 足够数据，几 KB 的页面测出来的数字受握手开销主导。留空回落到默认端点。
+   */
+  speed_test_url: string
 }
 
 export interface NotifyEmailConfig {

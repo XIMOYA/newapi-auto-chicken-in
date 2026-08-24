@@ -6,7 +6,7 @@ server/proxies.go
 - proxies 表：保存抓取到的代理条目（来源 / host:port / 延迟 / 存活状态 / 时间）
 - FetchProxiesFromSources：并发抓取所有配置的 sources，解析 host:port
 - TestProxyLatency：对单个代理打 test_url 测通并返回延迟（毫秒）
-- RefreshProxies：全量刷新流程（抓取 → 去重 → 并发测通 → 按延迟排序 → 保存；saveLimit<=0 不限制）
+- RefreshProxies：刷新流程（抓取 → 去重 → 并入库里存活的老代理 → 并发测通 → 按延迟排序 → 保存；saveLimit<=0 不限制）
 - 后台协程：按 refresh_minutes 周期调用 RefreshProxies（由 main 启动）
 
 安全边界：测通只打配置的 test_url（默认 agentrouter.org，站长自己的站点），
@@ -408,8 +408,7 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (aliveCount 
 
 	// 2) 按源轮转合并去重：免费代理源普遍把「刚验过/存活率高」的排在列表前面，
 	//    用 map 迭代会把这个顺序打乱，导致提前停时测到的是随机子集。
-	type item struct{ addr, source string }
-	all := make([]item, 0)
+	all := make([]proxyCandidate, 0)
 	seen := map[string]bool{}
 	for round := 0; ; round++ {
 		progressed := false
@@ -423,7 +422,7 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (aliveCount 
 				continue
 			}
 			seen[addr] = true
-			all = append(all, item{addr, sources[i]})
+			all = append(all, proxyCandidate{addr, sources[i]})
 		}
 		if !progressed {
 			break
@@ -434,6 +433,23 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (aliveCount 
 		m.lastErr = "所有代理源均未返回可用条目"
 		m.mu.Unlock()
 		return 0, nil
+	}
+
+	// 2.5) 把库里现存的存活代理也拉进候选，放在最前面。
+	//
+	// 免费代理源的列表天天变，一个昨天还好用的出口今天可能压根不在源里了。原来的
+	// 做法是整表替换，那种代理直接消失——即使它还通着。所以这里先把老池子捞回来，
+	// 让它们和新抓的一起过测通：能通就留下（和新测通的合并去重），不通自然淘汰。
+	if existing, eerr := m.queryProxies(true, 0); eerr == nil {
+		before := len(all)
+		all = mergeExistingCandidates(all, existing)
+		if kept := len(all) - before; kept > 0 {
+			log.Printf("[proxy] 把库里 %d 条存活代理并入候选复测（新源候选 %d 条）",
+				kept, before)
+		}
+	} else {
+		// 读不出老池子不该让整轮刷新失败：退化成原来的「只测新抓的」
+		log.Printf("[proxy] 读取现存代理失败，本轮只测新抓的候选: %v", eerr)
 	}
 
 	// 3) 并发测通（saveLimit > 0 时达标提前停；不限制时测完全部候选）
@@ -478,7 +494,7 @@ dispatch:
 			break dispatch
 		}
 		wg2.Add(1)
-		go func(it item) {
+		go func(it proxyCandidate) {
 			defer wg2.Done()
 			defer recoverPanic("代理测通")
 			defer func() { <-sem }()
@@ -708,11 +724,58 @@ func (m *ProxyManager) queryProxies(aliveOnly bool, limit int) ([]ProxyEntry, er
 	return out, rows.Err()
 }
 
-// SpeedTestURL Cloudflare 官方测速端点（下载 1MB 数据）。
-const SpeedTestURL = "https://speed.cloudflare.com/__down?bytes=1048576"
+// proxyCandidate 一条待测候选：地址 + 它的来源标记。
+type proxyCandidate struct{ addr, source string }
 
-// SpeedTestBytes 期望下载的字节数（与 URL 一致，用于计算吞吐）。
-const SpeedTestBytes = 1048576
+/*
+mergeExistingCandidates 把库里现存的存活代理并进新抓来的候选，老的排在前面。
+
+为什么要并：免费代理源的列表天天变，一个昨天还好用的出口今天可能压根不在源里了。
+原来整表替换的做法会让这种代理直接消失——即使它还通着。并进来一起过测通，能通就留，
+不通自然淘汰，池子于是收敛在「持续可用的那批」而不是「今天恰好被源收录的那批」。
+
+为什么老的放最前面：saveLimit > 0 时测通会「达标提前停」，先测已验证过的能更快凑够
+数，也让稳定的出口优先留下；它们的存活率本来就高于刚从源里抓来的。
+
+去重按地址，新源里已有的不重复排队（保留新来源的记账）。fresh 自身在轮转合并阶段
+已经去过重了，这里只需要防「老池 ∩ 新源」和老池内部的重复。
+*/
+func mergeExistingCandidates(fresh []proxyCandidate, existing []ProxyEntry) []proxyCandidate {
+	if len(existing) == 0 {
+		return fresh
+	}
+	seen := make(map[string]bool, len(fresh)+len(existing))
+	for _, c := range fresh {
+		seen[c.addr] = true
+	}
+	kept := make([]proxyCandidate, 0, len(existing))
+	for _, e := range existing {
+		if e.Addr == "" || seen[e.Addr] {
+			continue
+		}
+		seen[e.Addr] = true
+		kept = append(kept, proxyCandidate{e.Addr, e.Source})
+	}
+	if len(kept) == 0 {
+		return fresh
+	}
+	return append(kept, fresh...)
+}
+
+// DefaultSpeedTestURL 测速端点的默认值：Cloudflare 官方的下行测速接口（1MB）。
+//
+// 可以在网页端改成别的地址（proxy_pool.speed_test_url）。吞吐是按实际读到的字节数
+// 算的，所以换地址不用同步改任何"预期大小"；但目标得能稳定吐出足够数据——几 KB 的
+// 页面测出来的数字受 TLS 握手开销主导，拿它排序没有意义。
+const DefaultSpeedTestURL = "https://speed.cloudflare.com/__down?bytes=1048576"
+
+// speedTestURLOf 取生效的测速地址，空值回落到默认端点。
+func speedTestURLOf(cfg ProxyPool) string {
+	if url := strings.TrimSpace(cfg.SpeedTestURL); url != "" {
+		return url
+	}
+	return DefaultSpeedTestURL
+}
 
 // testProxySpeed 通过代理下载测速数据，返回实际吞吐（字节/秒）；失败返回 -1。
 func testProxySpeed(ctx context.Context, addr, speedURL string, timeout int) int64 {
@@ -763,7 +826,14 @@ const speedTestBackgroundTimeout = 120 * time.Second
 // SpeedTest 对指定代理列表测速并写库（返回成功更新的条目数）。
 // addrs 为空表示对全部可用代理测速。
 // 与 RefreshProxies 共用互斥位：并发刷新/测速时直接拒绝。
-func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout int) (updated int, retErr error) {
+//
+// speedURL 空串时回落到 DefaultSpeedTestURL —— 调用方通常直接传
+// speedTestURLOf(cfg.ProxyPool)。
+func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout int,
+	speedURL string) (updated int, retErr error) {
+	if strings.TrimSpace(speedURL) == "" {
+		speedURL = DefaultSpeedTestURL
+	}
 	if !m.beginRun("speedtest") {
 		return 0, fmt.Errorf("代理池刷新或测速已在进行中")
 	}
@@ -836,7 +906,7 @@ func (m *ProxyManager) SpeedTest(ctx context.Context, addrs []string, timeout in
 			if ctx.Err() != nil {
 				return
 			}
-			speed := testProxySpeed(ctx, e.Addr, SpeedTestURL, timeout)
+			speed := testProxySpeed(ctx, e.Addr, speedURL, timeout)
 			mu.Lock()
 			done++
 			m.updateProgress(func(p *ProxyProgress) {

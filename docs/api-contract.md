@@ -423,6 +423,7 @@ Actions 每 30 个账号拆一个 job 并行跑时，几个 job 拿到同一份�
 | `preflight_limit` | int | `60` | 自筛只测列表最前面多少条；`0` = 不自筛。Python 侧夹到 0..500 |
 | `preflight_seconds` | int | `15` | 自筛整体时间盒（秒），到点就用已有结论。Python 侧夹到 1..120 |
 | `max_accounts_per_ip` | int | `4` | 同一出口 IP 最多给几个账号用，`<=0` 不限。客户端按 `ceil(账号数 / 它) + 50` 折算预取量。Python 侧夹到 0..64 |
+| `speed_test_url` | string | Cloudflare `__down?bytes=1048576` | 测**下载速度**用的端点，和 `test_url`（只测通不通）是两回事。留空回落默认。吞吐按实际读到的字节数算，换地址不用改任何「预期大小」；但目标要能稳定吐出足够数据，几 KB 的页面测出来受 TLS 握手开销主导，拿它排序没意义 |
 
 自筛探测打的仍是 `proxy_pool.test_url`，不碰目标站点。两个语义要点：
 
@@ -673,7 +674,7 @@ tabiai 账号会就地判 `turnstile_required` 失败，整轮白跑。
   "ai": { "enabled": false, "base_url": "", "api_key": "", "model": "gpt-4o-mini", "timeout": 60, "max_retries": 2 },
   "browser": { "driver": "camoufox", "headless": "virtual", "humanize": true, "timeout": 60, "keep_artifacts_on_fail": true, "locale": "zh-CN", "window": [1280, 800], "executable_path": null },
   "http": { "impersonate": "chrome", "timeout": 20, "verify": true },
-  "proxy_pool": { "enabled": false, "test_url": "https://agentrouter.org/", "timeout": 8, "max_workers": 25, "max_proxies": 250, "ip_swap_limit": 10, "sources": [], "refresh_minutes": 30, "save_limit": 0, "auto_test": true, "remote_url": "", "remote_token": "", "remote_token_header": "Authorization", "remote_token_prefix": "Bearer", "report_feedback": true, "preflight_check": true, "preflight_limit": 60, "preflight_seconds": 15, "max_accounts_per_ip": 4 },
+  "proxy_pool": { "enabled": false, "test_url": "https://agentrouter.org/", "timeout": 8, "max_workers": 25, "max_proxies": 250, "ip_swap_limit": 10, "sources": [], "refresh_minutes": 30, "save_limit": 0, "auto_test": true, "remote_url": "", "remote_token": "", "remote_token_header": "Authorization", "remote_token_prefix": "Bearer", "report_feedback": true, "preflight_check": true, "preflight_limit": 60, "preflight_seconds": 15, "max_accounts_per_ip": 4, "speed_test_url": "https://speed.cloudflare.com/__down?bytes=1048576" },
   "notify": { "email": { "enabled": false, "smtp_host": "smtp.aliyun.com", "smtp_port": 465, "use_ssl": true, "username": "", "password": "", "from_addr": "", "to_addrs": [], "subject_prefix": "NewAPI 签到日报", "timeout": 20 } },
   "config_sync": { "enabled": false, "url": "", "method": "GET", "token": "", "token_header": "Authorization", "token_prefix": "Bearer", "headers": {}, "body": null, "response_field": "", "timeout": 20, "auto_before_checkin": true },
   "security": { "encryption_enabled": false, "config_key": "", "encrypted_file": "data/config.encrypted.json" }

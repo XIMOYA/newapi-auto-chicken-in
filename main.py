@@ -291,8 +291,9 @@ def _sweep_proxies(cfg, minutes: int, out_path=None) -> int:
     受益。
 
     out_path 给了就把测通的清单落盘（按延迟升序）。签到 workflow 的前置体检靠它把结果
-    交给各分片直接用 —— 平台的 proxies 表每 30 分钟整表重建一次，指望它替我们记住
-    「Actions 视角谁可用」是不可靠的，同一个 run 内用文件传递才稳。
+    交给各分片直接用 —— 平台那份列表按 refresh_minutes 周期重测重排（老代理能通会留下，
+    但排序和存活标记随时在变），指望它在一小时后还保持「Actions 视角谁可用」不现实，
+    同一个 run 内用文件传递才稳。
     """
     from newapi_checkin.proxy_pool import ProxyPool
 

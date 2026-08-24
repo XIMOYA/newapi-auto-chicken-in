@@ -325,7 +325,7 @@ func TestRefreshSpeedTestMutex(t *testing.T) {
 	if _, err := srv.proxies.RefreshProxies(ProxyPool{}, 0); err == nil {
 		t.Error("互斥期间 RefreshProxies 应报错")
 	}
-	if _, err := srv.proxies.SpeedTest(context.Background(), nil, 5); err == nil {
+	if _, err := srv.proxies.SpeedTest(context.Background(), nil, 5, ""); err == nil {
 		t.Error("互斥期间 SpeedTest 应报错")
 	}
 	srv.proxies.endRun("")
