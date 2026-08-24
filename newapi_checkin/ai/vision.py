@@ -85,7 +85,15 @@ class VisionClient:
         self._local = threading.local()
         # curl_cffi 的 Session 不保证线程安全。用「一线程一 session」而不是加全局锁：
         # 加锁会把几个账号的视觉调用串起来排队，单次预算 60s，排队几分钟很常见。
-        self._sessions: dict[int, object] = {}
+        #
+        # 隔离靠 threading.local 而不是 threading.get_ident() 做字典 key —— 线程 id
+        # 在线程退出后会被系统复用（Linux 上尤其快），复用一发生就有两个后果：新线程
+        # 摸到上一个线程留下的 session（可能已经 close 过，或还绑着别的账号的代理），
+        # 而被顶掉的那个 session 再也没人关，直接泄漏。
+        #
+        # 但 close() 要能收掉「所有线程创建过的」session，threading.local 只看得见
+        # 当前线程，所以另外用一个只增列表登记，专供收尾时统一关闭。
+        self._all_sessions: list = []
         self._sessions_lock = threading.Lock()
         self._session_override = None
         # 强制走代理时用来「再要一个 IP」的回调（由 Runner 注册）
@@ -109,13 +117,15 @@ class VisionClient:
         """当前线程专属的 session（测试可以整体覆盖）。"""
         if self._session_override is not None:
             return self._session_override
-        ident = threading.get_ident()
-        with self._sessions_lock:
-            session = self._sessions.get(ident)
-            if session is None:
-                session = self._new_session()
-                self._sessions[ident] = session
-            return session
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = self._new_session()
+            self._local.session = session
+            # 登记一份供 close() 收尾。线程退出后 threading.local 会丢掉它自己那份
+            # 引用，只有这个列表还攥着，所以 session 不会在没关闭前被回收
+            with self._sessions_lock:
+                self._all_sessions.append(session)
+        return session
 
     @_session.setter
     def _session(self, value) -> None:
@@ -218,8 +228,11 @@ class VisionClient:
     def close(self) -> None:
         """关闭所有线程创建过的 session。"""
         with self._sessions_lock:
-            sessions = list(self._sessions.values())
-            self._sessions.clear()
+            sessions = list(self._all_sessions)
+            self._all_sessions.clear()
+        # 当前线程那份也从 local 里摘掉，免得 close 之后又被复用
+        if getattr(self._local, "session", None) is not None:
+            self._local.session = None
         if self._session_override is not None:
             sessions.append(self._session_override)
         for session in sessions:

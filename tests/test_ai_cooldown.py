@@ -414,6 +414,72 @@ class TestAIRequiresProxy:
 class TestPerThreadSession:
     """一线程一 session：并行签到时几个账号的视觉调用不该互相排队。"""
 
+    @staticmethod
+    def _client(monkeypatch, session_factory=None):
+        cfg = AIConfig(enabled=True, base_url="https://relay.example.com/v1",
+                       api_key="sk-test", model="gpt-4o-mini", timeout=5, max_retries=0)
+        client = VisionClient(cfg)
+        if session_factory is not None:
+            monkeypatch.setattr(client, "_new_session", session_factory)
+        return client
+
+    def test_isolation_does_not_key_off_thread_ids(self, monkeypatch):
+        """隔离绝不能拿 threading.get_ident() 做 key —— 线程 id 会被系统复用。
+
+        这是平台无关的回归闸门。原实现用 ident 做字典 key，Windows 上 id 复用得慢，
+        本地怎么跑都是绿的，只有 Linux CI 会红（那里线程一退出 id 立刻被下一个拿去用），
+        复用一发生就是两个后果：新线程摸到上一个线程留下的 session、被顶掉的那个再也
+        没人关。这里把 get_ident 钉死成常量，谁改回 ident 方案都会立刻失败。
+        """
+        created = []
+        client = self._client(
+            monkeypatch,
+            lambda: created.append(FakeSession([FakeResp()])) or created[-1],
+        )
+        # threading.local 是 C 层按线程对象隔离的，不看 ident，所以这么钉不影响它
+        monkeypatch.setattr(vision_mod.threading, "get_ident", lambda: 4242)
+        seen = []
+
+        def worker():
+            seen.append(id(client._session))
+
+        threads = [threading.Thread(target=worker) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert len(set(seen)) == 3           # ident 全一样，也得一线程一个
+        assert len(created) == 3
+
+    def test_close_releases_sessions_left_by_dead_threads(self, monkeypatch):
+        """线程早就退出了，它创建的 session 仍然必须被关掉。
+
+        threading.local 在线程结束时会丢掉自己那份引用，只靠它收尾就会漏。所以另外
+        用一个只增列表登记——这条断言守的正是那个列表。
+        """
+        closed = []
+
+        class Closable(FakeSession):
+            def close(self):
+                closed.append(self)
+
+        client = self._client(monkeypatch, lambda: Closable([FakeResp()]))
+        threads = [threading.Thread(target=lambda: client._session) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        # 线程全退了，主线程压根没碰过 _session
+        client.close()
+        assert len(closed) == 3
+
+    def test_close_lets_the_current_thread_start_over(self, monkeypatch):
+        """close 之后当前线程再取要拿到新的，不能继续用已关闭的那个。"""
+        client = self._client(monkeypatch, lambda: FakeSession([FakeResp()]))
+        first = client._session
+        client.close()
+        assert client._session is not first
+
     def test_each_thread_gets_its_own_session(self, monkeypatch):
         monkeypatch.setattr(vision_mod, "TIMEOUT_COOLDOWN", 0.01)
         cfg = AIConfig(enabled=True, base_url="https://relay.example.com/v1",
