@@ -20,7 +20,7 @@
   },
   "proxy_pool": {
     "enabled": false,
-    "test_url": "https://api.ipify.org",
+    "test_url": "https://agentrouter.org/",
     "timeout": 8,
     "max_workers": 25,
     "max_proxies": 250,

@@ -56,7 +56,7 @@ class TestProxyPoolConfig:
     def test_defaults(self):
         cfg = ProxyPoolConfig.from_raw(None)
         assert cfg.enabled is False
-        assert cfg.test_url == "https://api.ipify.org"
+        assert cfg.test_url == "https://agentrouter.org/"
         assert cfg.timeout == 8
         assert cfg.max_workers == 25
         assert cfg.max_proxies == 250
@@ -869,3 +869,57 @@ class TestTestManyResultCallback:
                         on_result=lambda p, l: seen.append(p))
         assert len(seen) < len(candidates)          # 确实没测完
         assert len(set(seen)) == len(seen)          # 没有重复记账
+
+
+class TestPresetProxyList:
+    """前置体检清单接管代理来源。
+
+    签到 workflow 的 sweep job 先测一遍、把测通的写成 artifact，各分片下载后直接当池子用。
+    这么绕一趟是因为平台的 proxies 表每 refresh_minutes（默认 30）就整表重建一次，
+    指望它替我们记住「Actions 视角谁可用」几十分钟后就被冲没了 —— 同一个 run 内用文件
+    传递才稳。
+
+    附带解决了分片的老问题：各片共用同一份清单，「本片领到的不够」从根上不存在。代价是
+    单 IP 上限只在单进程内计数，跨 job 的实际共用数可能高于配置值（已知取舍）。
+    """
+
+    def test_preset_skips_the_platform_entirely(self):
+        """给了清单就不该再拉平台 —— 那批几分钟前刚在同一网络环境测通。"""
+        pool = ProxyPool(ProxyPoolConfig(enabled=True, remote_url="https://panel.example.com/x"),
+                         preset=["a:80", "b:80"])
+        pool._fetch_remote = lambda: pytest.fail("给了 preset 还去拉平台")
+        assert pool.refresh() == 2
+
+    def test_preset_skips_preflight(self):
+        """也不该再自筛：刚测通的东西再测一遍纯属重复消耗时间盒。"""
+        pool = ProxyPool(ProxyPoolConfig(enabled=True), preset=["a:80"])
+        pool.preflight = lambda: pytest.fail("给了 preset 还去自筛")
+        assert pool.refresh() == 1
+
+    def test_preset_preserves_order(self):
+        """清单按延迟升序写的，顺序必须原样保留 —— acquire 顺序取优才有意义。"""
+        pool = ProxyPool(ProxyPoolConfig(enabled=True, max_accounts_per_ip=1),
+                         preset=["fast:80", "mid:80", "slow:80"])
+        pool.refresh()
+        assert [pool.acquire() for _ in range(3)] == ["fast:80", "mid:80", "slow:80"]
+
+    def test_preset_ignores_blank_entries(self):
+        pool = ProxyPool(ProxyPoolConfig(enabled=True), preset=["a:80", "  ", "", "b:80"])
+        assert pool.refresh() == 2
+
+    def test_empty_preset_falls_back_to_normal_sources(self):
+        """空清单等于没给：照旧走平台/本地抓取，不能把池子搞成空的。"""
+        pool = ProxyPool(ProxyPoolConfig(enabled=True, remote_url="https://panel.example.com/x"),
+                         preset=[])
+        pool._fetch_remote = lambda: ["from-platform:80"]
+        pool.preflight = lambda: 0
+        assert pool.refresh() == 1
+        assert pool.acquire() == "from-platform:80"
+
+    def test_preset_shares_ip_under_the_configured_cap(self):
+        """共用上限仍按配置生效（跨进程不共享计数是已知取舍，本进程内必须守住）。"""
+        pool = ProxyPool(ProxyPoolConfig(enabled=True, max_accounts_per_ip=2),
+                         preset=["only:80"])
+        pool.refresh()
+        assert [pool.acquire() for _ in range(2)] == ["only:80"] * 2
+        assert pool._share_count["only:80"] == 2

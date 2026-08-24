@@ -165,3 +165,54 @@ class TestProxySweepEntry:
         monkeypatch.setenv("GITHUB_REPOSITORY", "me/repo")
         main._sweep_proxies(self._cfg(), 50)
         assert "me/repo" in calls["source"]
+
+
+class TestProxyListRoundTrip:
+    """--proxy-sweep-out 落盘、--proxy-list 读回：签到 workflow 里靠这一对传递清单。"""
+
+    def test_write_then_load_keeps_order(self, tmp_path):
+        """按延迟升序写的，读回来顺序不能乱 —— acquire 顺序取优依赖它。"""
+        path = tmp_path / "alive.json"
+        assert main._write_alive_proxies(path, ["fast:80", "mid:80", "slow:80"]) == 3
+        assert main._load_proxy_list(str(path)) == ["fast:80", "mid:80", "slow:80"]
+
+    def test_written_shape_matches_the_platform_response(self, tmp_path):
+        """字段名跟 /api/proxies/available 对齐，下游解析能复用同一套。"""
+        import json
+
+        path = tmp_path / "alive.json"
+        main._write_alive_proxies(path, ["a:80"])
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["proxies"] == ["a:80"] and raw["count"] == 1
+        assert raw["checked_at"] and raw["source"]
+
+    def test_empty_result_is_still_written(self, tmp_path):
+        """一条都没测通也要写文件：下游读到空清单才能明确报错，而不是猜上一步崩没崩。"""
+        path = tmp_path / "alive.json"
+        assert main._write_alive_proxies(path, []) == 0
+        assert path.exists()
+
+    def test_missing_file_is_rejected(self, tmp_path):
+        assert main._load_proxy_list(str(tmp_path / "nope.json")) is None
+
+    def test_empty_list_is_rejected(self, tmp_path):
+        """空清单不能当成"有池子"往下走，否则所有账号都会被判无代理跳过。"""
+        path = tmp_path / "empty.json"
+        path.write_text('{"proxies": []}', encoding="utf-8")
+        assert main._load_proxy_list(str(path)) is None
+
+    def test_bare_array_is_accepted(self, tmp_path):
+        """手写清单时直接给数组也认，不强求包一层。"""
+        path = tmp_path / "bare.json"
+        path.write_text('["a:80", "b:80"]', encoding="utf-8")
+        assert main._load_proxy_list(str(path)) == ["a:80", "b:80"]
+
+    def test_garbage_shape_is_rejected(self, tmp_path):
+        path = tmp_path / "bad.json"
+        path.write_text('{"proxies": "a:80"}', encoding="utf-8")
+        assert main._load_proxy_list(str(path)) is None
+
+    def test_broken_json_is_rejected(self, tmp_path):
+        path = tmp_path / "broken.json"
+        path.write_text("{not json", encoding="utf-8")
+        assert main._load_proxy_list(str(path)) is None

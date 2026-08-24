@@ -211,7 +211,7 @@ func DefaultConfig() Config {
 		},
 		ProxyPool: ProxyPool{
 			Enabled:           false,
-			TestURL:           "https://api.ipify.org",
+			TestURL:           "https://agentrouter.org/",
 			Timeout:           8,
 			MaxWorkers:        25,
 			MaxProxies:        250,

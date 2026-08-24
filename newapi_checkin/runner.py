@@ -117,6 +117,10 @@ class RunOptions:
     # 本片汇总结果的落盘路径。给值就写 JSON 并且**不再自己发邮件** —— Actions 分片
     # 并行时各片都发会把一天的结果拆成好几封，改由汇总 job 读齐所有片发一封
     summary_out: Optional[str] = None
+    # 前置体检刚测通的代理清单（地址列表）。给了它就不再向平台拉、也不再自筛：
+    # 这批几分钟前刚在同一网络环境验证过。所有分片共用同一份，所以「本片领到的不够」
+    # 从根上不存在 —— 代价是单 IP 上限只在单进程内计数，跨 job 的实际共用数可能更高
+    proxy_list: Optional[list] = None
 
 
 class Runner:
@@ -176,7 +180,9 @@ class Runner:
         try:
             from .proxy_pool import ProxyPool
 
-            self._pool = ProxyPool(self.cfg.proxy_pool, shard=self.options.proxy_shard)
+            self._pool = ProxyPool(self.cfg.proxy_pool, shard=self.options.proxy_shard,
+                                   preset=self.options.proxy_list)
+
             count = self._pool.refresh(desired=desired)
             if count:
                 log.ok(f"代理池就绪: {count} 个可用代理")

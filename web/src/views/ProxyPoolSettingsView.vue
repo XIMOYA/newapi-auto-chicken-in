@@ -26,7 +26,7 @@ web/src/views/ProxyPoolSettingsView.vue
           <span class="switch-tip">{{ form.enabled ? '已启用' : '已停用' }}</span>
         </n-form-item>
         <n-form-item label="隧道连通性测试 URL">
-          <n-input v-model:value="form.test_url" placeholder="例如 https://api.ipify.org" />
+          <n-input v-model:value="form.test_url" placeholder="例如 https://agentrouter.org/" />
         </n-form-item>
         <n-form-item label="测试超时（秒）">
           <n-input-number v-model:value="form.timeout" :min="1" :max="120" class="num-input" />
@@ -144,7 +144,7 @@ useDirtyGuard(() => isDirty.value)
 
 const form = reactive<ProxyPoolConfig>({
   enabled: false,
-  test_url: 'https://api.ipify.org',
+  test_url: 'https://agentrouter.org/',
   timeout: 8,
   max_workers: 25,
   max_proxies: 250,

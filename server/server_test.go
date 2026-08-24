@@ -133,7 +133,7 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.ProxyPool.Sources == nil || len(cfg.ProxyPool.Sources) != 0 {
 		t.Errorf("ProxyPool.Sources 应为空 slice，得到 %#v", cfg.ProxyPool.Sources)
 	}
-	if cfg.ProxyPool.TestURL != "https://api.ipify.org" {
+	if cfg.ProxyPool.TestURL != "https://agentrouter.org/" {
 		t.Errorf("ProxyPool.TestURL 默认值不符合契约: %q", cfg.ProxyPool.TestURL)
 	}
 	if cfg.ProxyPool.SaveLimit != 0 {

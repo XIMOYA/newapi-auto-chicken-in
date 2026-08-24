@@ -77,6 +77,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="--proxy-sweep 的时间盒（分钟，默认 50）。到点带着已测出的结论收工，"
              "没轮到的不记账",
     )
+    parser.add_argument(
+        "--proxy-sweep-out", metavar="PATH",
+        help="配合 --proxy-sweep：把测通的代理清单（按延迟升序）写成 JSON 到 PATH。"
+             "签到前置体检用它把结果交给各分片，省得每片各测一遍",
+    )
+    parser.add_argument(
+        "--proxy-list", metavar="PATH",
+        help="用 --proxy-sweep-out 落盘的清单当代理池，不再向平台拉取、也不再开跑前自筛"
+             "（那批几分钟前刚测通）。各分片共用同一份，本片领到的不够的问题不复存在",
+    )
     parser.add_argument("--dry-run", action="store_true",
                         help="只验证当前登录方式的凭据与连通性，不执行签到")
     parser.add_argument(
@@ -272,13 +282,17 @@ def _merged_quota_overview(cfg, rows: list) -> str:
         return ""
 
 
-def _sweep_proxies(cfg, minutes: int) -> int:
+def _sweep_proxies(cfg, minutes: int, out_path=None) -> int:
     """全量体检平台上的存活代理，把成败回传平台。不签到、不碰浏览器。
 
     单独跑一趟的理由：平台自己的刷新和测速走的是**服务器出口**，而签到跑在 GitHub
     Actions 上。代理商封机房 IP 段是常事，服务器那边通的代理到了 Actions 手里可能全是
     废的。这趟体检让平台的优选顺序反映「Actions 用起来好不好」，紧接着的签到就能直接
     受益。
+
+    out_path 给了就把测通的清单落盘（按延迟升序）。签到 workflow 的前置体检靠它把结果
+    交给各分片直接用 —— 平台的 proxies 表每 30 分钟整表重建一次，指望它替我们记住
+    「Actions 视角谁可用」是不可靠的，同一个 run 内用文件传递才稳。
     """
     from newapi_checkin.proxy_pool import ProxyPool
 
@@ -300,6 +314,11 @@ def _sweep_proxies(cfg, minutes: int) -> int:
     log.info(f"体检完成：测了 {tested}/{total} 条，通 {ok} 条、不通 {stats['fail']} 条"
              f"（可用率 {rate:.0f}%，耗时 {stats.get('elapsed', 0):.0f}s）")
 
+    if out_path:
+        written = _write_alive_proxies(out_path, stats.get("alive") or [])
+        if written is None:
+            return 1
+
     # 回传是这趟的唯一产出，失败要明确报错 —— 不回传的话平台的排序不会有任何变化，
     # 整趟体检就白跑了
     sent, detail = pool.report_feedback(source=_run_source())
@@ -308,6 +327,53 @@ def _sweep_proxies(cfg, minutes: int) -> int:
         return 1
     log.ok(f"实测结果已回传平台（{detail}）")
     return 0
+
+
+def _write_alive_proxies(out_path, alive: list):
+    """把测通的清单落盘，供签到分片直接当代理池用。返回写入条数，失败返回 None。
+
+    一条都没测通时也要写出空清单：下游 job 读到空文件才能明确报「没有可用代理」，
+    而不是因为文件缺失去猜是上一步崩了还是压根没跑。
+    """
+    from datetime import datetime, timezone
+
+    path = Path(out_path)
+    payload = {
+        # 字段名和平台 /api/proxies/available 的响应对齐，下游解析可以复用同一套
+        "proxies": list(alive),
+        "count": len(alive),
+        "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": _run_source(),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        log.err(f"写代理清单失败: {path} -> {exc}")
+        return None
+    log.ok(f"测通的 {len(alive)} 条已写入 {path}（按延迟升序，供签到分片直接使用）")
+    return len(alive)
+
+
+def _load_proxy_list(path_text: str):
+    """读 --proxy-list 指定的清单。读不出来返回 None，让调用方决定怎么降级。"""
+    path = Path(path_text)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.err(f"代理清单读取失败: {path} -> {type(exc).__name__}: {exc}")
+        return None
+    items = raw.get("proxies") if isinstance(raw, dict) else raw
+    if not isinstance(items, (list, tuple)):
+        log.err(f"代理清单格式不对（期望 {{\"proxies\": [...]}} 或数组）: {path}")
+        return None
+    addrs = [str(p).strip() for p in items if str(p).strip()]
+    if not addrs:
+        log.err(f"代理清单是空的: {path}（前置体检一条都没测通？）")
+        return None
+    log.info(f"从 {path} 读到 {len(addrs)} 条前置体检测通的代理"
+             f"（体检时间 {raw.get('checked_at', '?') if isinstance(raw, dict) else '?'}）")
+    return addrs
 
 
 def _run_source() -> str:
@@ -411,7 +477,7 @@ def main(argv=None) -> int:
     # 代理全量体检：只测代理并回传，不签到。放在远程同步之后，保证 remote_url 和
     # 令牌用的都是平台上的最新值
     if args.proxy_sweep:
-        return _sweep_proxies(cfg, args.proxy_sweep_minutes)
+        return _sweep_proxies(cfg, args.proxy_sweep_minutes, args.proxy_sweep_out)
 
     # 按分片挑出本进程该跑的账号。放在远程同步之后：平台上刚加的账号要能被切进来
     shard_names = None
@@ -456,6 +522,14 @@ def main(argv=None) -> int:
     else:
         log.debug("AI: 未启用")
 
+    # 前置体检的清单：读不出来直接退出而不是静默降级去拉平台。既然显式指定了它，
+    # 说明调用方要的就是「用刚测通的那批」，悄悄换成别的来源等于把问题藏起来
+    preset_proxies = None
+    if args.proxy_list:
+        preset_proxies = _load_proxy_list(args.proxy_list)
+        if preset_proxies is None:
+            return 2
+
     options = RunOptions(
         account_names=shard_names if shard_names is not None else _split_accounts(args.account),
         dry_run=args.dry_run,
@@ -472,6 +546,7 @@ def main(argv=None) -> int:
         browser_parallelism=args.browser_parallel or 0,
         proxy_shard=shard,
         summary_out=args.summary_out,
+        proxy_list=preset_proxies,
     )
 
     try:

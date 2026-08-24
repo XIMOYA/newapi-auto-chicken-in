@@ -1,7 +1,8 @@
 """免费代理池：多源抓取 -> 合并去重 -> 并发测通 -> 随机分配。
 
 设计要点（对应需求）：
-  - 测通只打探活接口（默认 api.ipify.org），绝不打目标站点，避免给站点增压
+  - 测通只打 test_url（默认 agentrouter.org，站长自己的站点），不碰账号所在的
+    第三方签到站 —— 几百个出口 IP 密集访问很容易被对方当成扫描
   - 池空了降级直连签到，绝不中断流程（与 AI 可降级同一哲学）
   - 一个账号对应一个 IP：acquire() 保证同一次运行内不重复分配
   - 目标站点连不上（网络层失败）时 mark_bad() 拉黑该代理，由上层换一个新 IP
@@ -23,7 +24,7 @@ from typing import Optional
 from . import logger as log
 
 # 目标站点无关的纯测通接口
-DEFAULT_TEST_URL = "https://api.ipify.org"
+DEFAULT_TEST_URL = "https://agentrouter.org/"
 
 # 测通不设数量上限，时间盒按工作量推导，这里只是额外留出的余量（秒）
 REFRESH_SLACK_SECONDS = 15
@@ -173,11 +174,16 @@ def _as_bool(value, default: bool = False) -> bool:
 class ProxyPool:
     """抓取/测通/分配一体化。线程安全，可被 Runner 并行使用。"""
 
-    def __init__(self, cfg: ProxyPoolConfig, shard: Optional[tuple] = None):
+    def __init__(self, cfg: ProxyPoolConfig, shard: Optional[tuple] = None,
+                 preset: Optional[list] = None):
         self.cfg = cfg
         # shard = (序号, 总片数)，1-based。Actions 分片并行时透传给平台，让每个 job
         # 拿到互不重叠的一份代理；不传就是整份列表（本机单进程跑的情形）
         self._shard = shard
+        # 预置清单：签到前置体检刚测出来的可用 IP。给了它就不再向平台拉，也不再自筛 ——
+        # 这批地址几分钟前刚在同一个网络环境测通过，比任何来源都新鲜。
+        # 各分片共用同一份，所以「本片领到的不够」这个问题从根上就不存在了
+        self._preset = [str(p).strip() for p in (preset or []) if str(p).strip()]
         self._available: list[str] = []
         self._used: set[str] = set()
         self._bad: set[str] = set()
@@ -202,12 +208,22 @@ class ProxyPool:
         return list(self.cfg.sources or DEFAULT_SOURCES)
 
     def refresh(self, desired: Optional[int] = None) -> int:
-        """获取可用代理。优先服务器预取列表（remote_url），失败降级本地抓源测通。
+        """获取可用代理。优先预置清单 -> 服务器预取列表（remote_url）-> 本地抓源测通。
 
         服务器（配置管理平台）已提前抓取+测通并保存可用列表，直接拉取可以
         省掉「现场抓 6 个源 + 并发测通」的几十秒。连不上的仍由上层 mark_bad
         换 IP 兜底，不会变差。
         """
+        if self._preset:
+            with self._lock:
+                self._available = list(self._preset)
+                self._used.clear()
+                self._bad.clear()
+                self._share_count.clear()
+            # 不走 preflight：这批就是几分钟前在同一个网络环境测通的，再测一遍纯属重复
+            log.ok(f"代理池就绪（前置体检结果）: {len(self._preset)} 个可用代理")
+            return len(self._preset)
+
         if self.cfg.remote_url:
             remote = self._fetch_remote()
             if remote:
@@ -524,7 +540,7 @@ class ProxyPool:
 
         log.step(f"代理全量体检：平台给了 {len(addrs)} 条存活代理，"
                  f"并发 {self.cfg.max_workers}，时间盒 {minutes} 分钟")
-        self._test_many(addrs, need=None, deadline=deadline, on_result=record)
+        alive = self._test_many(addrs, need=None, deadline=deadline, on_result=record)
         tested = counted["ok"] + counted["fail"]
         elapsed = time.monotonic() - started
         if tested < len(addrs):
@@ -534,6 +550,9 @@ class ProxyPool:
             "total": len(addrs), "tested": tested,
             "ok": counted["ok"], "fail": counted["fail"],
             "elapsed": elapsed,
+            # 按延迟升序的可用清单。签到前置体检要把它落盘传给各分片直接用，
+            # 所以顺序有意义：快的在前，acquire() 顺序取优时先拿到好的
+            "alive": alive,
         }
 
     def preflight(self) -> int:

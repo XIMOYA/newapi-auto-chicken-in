@@ -58,6 +58,10 @@ on:
         description: '每个 job 跑多少个账号'
         type: string
         default: '30'
+      sweep_minutes:
+        description: '签到前代理体检的时间盒（分钟）'
+        type: string
+        default: '25'
 
 permissions:
   contents: read
@@ -137,12 +141,80 @@ jobs:
           SHARD_SIZE: ${{ inputs.shard_size || '30' }}
 
   # ---------------------------------------------------------------------- #
+  # 第一段之二：签到前的代理体检
+  #
+  # 和独立的 proxy-sweep.yml（北京 03:00）分工不同：那趟是全量体检 + 回传平台，
+  # 为长期表现数据服务；这趟是**现测现用**——测通的清单直接当 artifact 交给下面各个
+  # 分片，不经过平台。
+  #
+  # 为什么不能靠平台传递：平台的 proxies 表每 refresh_minutes（默认 30）就整表
+  # DELETE + INSERT 重建一次，指望它替我们记住「Actions 视角谁可用」几十分钟后就
+  # 被冲掉了。同一个 run 内用文件传递才稳。
+  #
+  # 各分片共用同一份清单，所以「本片领到的代理不够」这个问题从根上消失了。代价是
+  # 单 IP 账号上限只在单进程内计数，跨 job 的实际共用数可能高于配置值 —— 这是
+  # 明确接受的取舍：跨片共用一个刚测通的好 IP，比在本片内超额共用一个死 IP 划算。
+  # ---------------------------------------------------------------------- #
+  sweep:
+    runs-on: ubuntu-latest
+    # 比时间盒多留 10 分钟给装依赖和落盘
+    timeout-minutes: 35
+    # 体检挂了不该把签到一起拖死：下面的 checkin 会检测清单是否存在，
+    # 缺了就退回原来的「向平台拉 available」路径
+    continue-on-error: true
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖（剔掉浏览器相关，测代理不需要）
+        run: |
+          grep -vE '^(camoufox|patchright)' requirements-ci.txt > /tmp/req-sweep.txt
+          pip install -r /tmp/req-sweep.txt
+
+      - name: 写入配置（来自 GitHub Secrets）
+        env:
+          CONFIG_JSON_B64: ${{ secrets.CONFIG_JSON_B64 }}
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+        run: |
+          if [ -n "$CONFIG_JSON_B64" ]; then
+            printf '%s' "$CONFIG_JSON_B64" | base64 --decode > config.json
+          elif [ -n "$CONFIG_JSON" ]; then
+            printf '%s' "$CONFIG_JSON" > config.json
+          else
+            echo "::error::未设置 CONFIG_JSON_B64 secret"
+            exit 2
+          fi
+          python -c "import json,pathlib;json.loads(pathlib.Path('config.json').read_text(encoding='utf-8'));print('config.json 校验通过')"
+
+      - name: 体检并落盘可用清单
+        # 25 分钟：03:00 那趟已经全量测过并把排序回传平台了，这趟拉到的本就是优选过的
+        # 列表，不需要再花 50 分钟。时间盒到点会带着已测出的结论收工，不会失败
+        run: |
+          python main.py --proxy-sweep --proxy-sweep-minutes "${{ inputs.sweep_minutes || '25' }}" \
+                         --proxy-sweep-out data/alive-proxies.json -v
+
+      - name: 上传可用清单
+        uses: actions/upload-artifact@v4
+        with:
+          name: alive-proxies
+          path: data/alive-proxies.json
+          retention-days: 1
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------- #
   # 第二段：按分片并行签到
   # ---------------------------------------------------------------------- #
   checkin:
-    needs: plan
-    # 一个账号都没启用时整个 checkin 不必展开
-    if: needs.plan.outputs.count != '0'
+    needs: [plan, sweep]
+    # 一个账号都没启用时整个 checkin 不必展开。
+    # 注意 needs 里带了 sweep（continue-on-error），它失败时这里照样要跑
+    if: always() && needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
     name: 签到分片 ${{ matrix.shard }}/${{ needs.plan.outputs.total }}
     # 不设 timeout-minutes：走 GitHub 的默认值 360 分钟（6 小时，也是平台硬上限）。
@@ -229,6 +301,16 @@ jobs:
           print(f"config.json 已写入（来源 {sys.argv[1]}，校验通过）")
           PY
 
+      - name: 下载前置体检的可用清单
+        # 体检 job 是 continue-on-error 的，清单可能压根不存在。这里允许找不到，
+        # 下一步会检测文件再决定用清单还是退回向平台拉
+        if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: alive-proxies
+          path: data
+
       - name: 开始签到（headless 真无头 + 固定 6 账号并发 + 3 浏览器并发）
         if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') }}
         # 两级并发管的不是一回事：
@@ -242,11 +324,23 @@ jobs:
         # 「可能含 secret」而整个跳过，下游 fromJson('') 直接报错。所以这里只传序号，
         # 名单由客户端按同一规则自己切（连续块，各片不重叠且覆盖全部）。
         #
+        # --proxy-list 存在时接管代理来源：那是几分钟前刚测通的清单，各分片共用同一
+        # 份，所以不再走 --shard 的「只领本片代理」，本片不够的问题不复存在。清单缺失
+        # （体检 job 挂了）时不带这个参数，退回原来向平台拉 available 的路径。
+        #
         # --summary-out 让本片把结果写成 JSON 而**不自己发邮件**：几片各发一封会把
         # 一天的结果拆成好几封信，改由下面的 notify job 合并成一封。
         run: |
+          PROXY_ARG=""
+          if [ -s data/alive-proxies.json ]; then
+            PROXY_ARG="--proxy-list data/alive-proxies.json"
+            echo "使用前置体检清单：$(python -c "import json;print(json.load(open('data/alive-proxies.json'))['count'])") 条"
+          else
+            echo "::warning::没拿到前置体检清单，退回向平台拉取可用代理"
+          fi
           python main.py --headless --parallel 6 --browser-parallel 3 -v \
             --shard "${{ matrix.shard }}/${{ needs.plan.outputs.total }}" \
+            $PROXY_ARG \
             --summary-out "data/summary/shard-${{ matrix.shard }}.json" \
             ${{ inputs.dry_run && '--dry-run' || '' }}
 

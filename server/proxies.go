@@ -9,7 +9,8 @@ server/proxies.go
 - RefreshProxies：全量刷新流程（抓取 → 去重 → 并发测通 → 按延迟排序 → 保存；saveLimit<=0 不限制）
 - 后台协程：按 refresh_minutes 周期调用 RefreshProxies（由 main 启动）
 
-安全边界：测通只打配置的 test_url（默认 api.ipify.org），绝不打目标站点。
+安全边界：测通只打配置的 test_url（默认 agentrouter.org，站长自己的站点），
+绝不碰账号所在的第三方签到站 —— 几百个出口 IP 密集访问会被当成扫描。
 */
 package main
 
@@ -379,7 +380,7 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (aliveCount 
 	unlimited := saveLimit <= 0
 	testURL := cfg.TestURL
 	if testURL == "" {
-		testURL = "https://api.ipify.org"
+		testURL = "https://agentrouter.org/"
 	}
 	timeout := cfg.Timeout
 	if timeout <= 0 {
