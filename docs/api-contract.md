@@ -10,6 +10,7 @@
   - 管理端：`Authorization: Bearer <JWT>`（登录后获得）
   - 拉取端：`Authorization: Bearer <API_KEY>`，客户端专用通道：`/api/config/raw`、
     `/api/proxies/available`、`/api/proxies/feedback`、`/api/accounts/{name}/refresh-cookie`、
+    `/api/accounts/{name}/raw`、
     `/api/run-state/start|heartbeat|stop`（这几个只认 API Key，JWT 调返回 401）
 - 错误码：401 未认证 / 403 无权限 / 400 参数错误 / 404 不存在 / 500 服务器错误
 - 配置对象结构 = 完整 config JSON（含 `accounts` / `sites` / `ai` / `browser` / `http` / `proxy_pool` / `notify` / `config_sync` / `security` 顶层键），见 `config.example.json` 为基底
@@ -185,6 +186,9 @@
 错误（401）：`{"error": "无效的 API Key"}`
 
 > 说明：`remote_sync.py` 的 `_select_payload` 能自动识别「对象本身就是配置」的情况，因此直接返回配置对象最兼容。
+
+> 只要一个账号时用 `GET /api/accounts/{name}/raw`（同样只认 API Key，返回该账号的明文
+> Account 对象）。它是凭据回写的读回核实通道，见 [读回核实](#读回核实)。
 
 ## 6. API Key 管理（JWT）
 
@@ -465,6 +469,7 @@ Actions 每 30 个账号拆一个 job 并行跑时，几个 job 拿到同一份�
 - **Go 平台**：Cookie 检测拿到 `Set-Cookie` 后立即定点写回 `accounts[].cookie`（无论本次检测判定成功还是失败）
 - **Python 客户端**：refresh 成功后立刻写 `data/sessions.json`（不走节流落盘），随后尽力回写平台
 - **回写端点**：`POST /api/accounts/{name}/refresh-cookie`（API Key 认证），见下节
+- **读回核实**：回写被验收后再拉 `GET /api/accounts/{name}/raw` 比对，确认新代次真的落库了，见[读回核实](#读回核实)
 
 平台与本机代次不一致时，谁先用旧代次谁就会失败。所以本机签到成功后必须让平台也拿到新值，否则网页端的凭据检测会紧接着报「已失效」。
 
@@ -487,6 +492,49 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
 **全程不走代理**，即使配置了 `proxy_pool` 也一样：目标是自己的平台，没有伪装出口的需要，套代理只会给关键链路多加一个失败点。
 
 三次都没确认成功时，**该账号这一轮会被判为失败**（即使签到本身成了）。本地 `sessions.json` 已经存了新代次，签到确实成功，但平台还持有旧代次，它的保活协程和网页端检测下次 refresh 就会撞重放、整条会话被撤销。报成成功会让这件事在汇总邮件里完全看不见，等发现时账号已经废了 —— 所以宁可让数字难看也要标出来。汇总行的额度/余额/站点列照常保留。
+
+### 读回核实
+
+响应体里的 `ok: true` 是服务端的自述，库里到底存了什么只有读回来才知道。所以回写被验收之后客户端会**再拉一次**做精确比对，堵住「平台收了但没存」这个故障模式。
+
+`GET /api/accounts/{name}/raw`（**API Key** 认证，不是 JWT）
+
+响应（200）：**直接返回该账号的明文 Account 对象**（不是包裹结构）
+
+```json
+{ "name": "Steven", "url": "https://a.com", "login_method": "tabiai", "cookie": "new_api_refresh=sid.secret", "enabled": true }
+```
+
+错误（404）：`{ "error": "账号不存在: <名字>" }`
+
+明文暴露面没有新增：API Key 持有者本来就能用 `GET /api/config/raw` 拉走整份明文，这个端点只是按账号切了一片。
+
+`GET /api/accounts/{name}`（**JWT 或 API Key**）给网页端人工核实用，**cookie 不出明文**，只给核实摘要：
+
+```json
+{
+  "account": { "name": "Steven", "cookie": "***", "github_user_session": "***", "...": "..." },
+  "cookie_digest": { "fingerprint": "9f2a1c7b4e05", "length": 96, "has_refresh": true },
+  "updated_at": "2026-08-24T10:00:00Z"
+}
+```
+
+- `fingerprint`：cookie 明文的 sha256 十六进制**前 12 位**。用来肉眼比对「代次换了没换」，不是防碰撞哈希
+- `length`：明文字节长度
+- `has_refresh`：是否含 `new_api_refresh=` 这个键。这个键只有源站会下发，长度和指纹都对得上但键没了，说明库里那条压根不是可用凭据
+- `updated_at`：整份配置的更新时间（库里没有按账号的时间戳）。凭据轮转不推进 `revision` 但**会**更新它，所以这个值恰好能反映最近一次回写是什么时候落库的
+- cookie 为空时摘要是空值形态：`{ "fingerprint": "", "length": 0, "has_refresh": false }`
+
+账号定位规则与回写端点**完全一致**（路径参数 trim 后与 `accounts[].name` 精确比较，大小写敏感）。两边口径必须同一套，否则会出现「回写找得到、核实找不到」，把成功的回写误判成失败。
+
+客户端侧的两条路径必须严格分开（`newapi_checkin/remote_sync.py` 的 `_verify_writeback`）：
+
+- **确认库里不是这一代**（含被存成空串）→ 真故障，走与「回写失败」相同的判负路径
+- **核实没拿到结论**（推不出读回地址、网络错误、老版本平台 404、响应形状不对）→ 只记一条 debug 放过。回写已被平台明确确认，加固手段失灵不该把成功的轮次判成失败
+
+比对前两边都 `strip()`，并按平台的归一化规则（裸 `sid.secret` 补 `new_api_refresh=` 前缀）兜一层 —— 一个换行或一种等价写法都不该判负。读回请求同样**不走代理**，超时沿用 `config_sync.timeout`。
+
+`config_sync.writeback_url` 被配成第三方网关或 `{name}` 模板时推不出读回地址，此时跳过核实（记 debug），回写结论不受影响。
 
 ### 签到期间锁住网页端凭据操作
 

@@ -275,6 +275,37 @@ export interface AccountOpsResult {
   skipped: string[] | null
 }
 
+// ===== 单账号查询（凭据回写的读回核实）=====
+
+/**
+ * cookie 的核实摘要：不含任何明文，但足够判断平台手里是不是最新那一代。
+ *
+ * 客户端回写新代次后靠读回核实堵「平台收了但没存」——这个摘要是同一件事的人工版本：
+ * 页面上比一眼指纹就知道换没换代，而 cookie 明文不会下发浏览器。
+ * cookie 为空时是空值形态：fingerprint 空串、length 0、has_refresh false。
+ */
+export interface AccountCookieDigest {
+  /** cookie 明文的 sha256 十六进制前 12 位；给人眼比对用，不是防碰撞哈希 */
+  fingerprint: string
+  /** 明文字节长度 */
+  length: number
+  /** 是否含 new_api_refresh= 这个键。只有源站会下发它，键没了说明库里那条不是可用凭据 */
+  has_refresh: boolean
+}
+
+/**
+ * GET /api/accounts/{name} 的响应。
+ *
+ * account 走的是与 GET /api/config 同一套打码规则，cookie / github_user_session
+ * 非空时一律是 "***"。updated_at 是整份配置的更新时间（库里没有按账号的时间戳），
+ * 而凭据轮转不推进 revision 但会更新它 —— 所以它恰好能反映最近一次回写何时落库。
+ */
+export interface AccountDetailResponse {
+  account: Account
+  cookie_digest: AccountCookieDigest
+  updated_at?: string
+}
+
 // ===== 签到运行状态（网页端凭据操作锁）=====
 
 /**

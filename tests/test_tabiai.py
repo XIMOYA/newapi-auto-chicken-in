@@ -361,16 +361,19 @@ class TestWritebackEndpoint:
     def test_successful_writeback_posts_cookie_with_token(self, monkeypatch):
         from newapi_checkin import remote_sync
 
-        seen = {}
+        calls = []
 
         def fake_request(method, url, **kwargs):
-            seen.update({"method": method, "url": url, **kwargs})
+            calls.append({"method": method, "url": url, **kwargs})
             return FakeResponse(200, {"ok": True})
 
         monkeypatch.setattr(remote_sync.cffi, "request", fake_request)
         sync = self.make_sync(token="k1")
         ok, detail = remote_sync.writeback_refresh_cookie(sync, "A", "new_api_refresh=sid.gen2")
         assert ok is True
+        # calls[1] 是回写之后的读回核实（GET /api/accounts/A/raw），本例只关心回写本身；
+        # 假响应里没有 cookie 字段 -> 核实拿不到结论 -> 按加固失灵放过
+        seen = calls[0]
         assert seen["method"] == "POST"
         assert seen["json"] == {"cookie": "new_api_refresh=sid.gen2"}
         assert seen["headers"]["Authorization"] == "Bearer k1"

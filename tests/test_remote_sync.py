@@ -312,7 +312,9 @@ class TestWritebackVerification:
         ok, detail = remote_sync.writeback_refresh_cookie(
             self._sync(), "T", "new_api_refresh=sid.gen2")
         assert ok is True
-        assert len(sent) == 1
+        # 回写只发一次；后面那条 GET 是读回核实（本例的假响应没有 cookie 字段，
+        # 核实拿不到结论，按加固失灵放过）
+        assert [item["method"] for item in sent] == ["POST", "GET"]
         assert sent[0]["json"] == {"cookie": "new_api_refresh=sid.gen2"}
 
     def test_never_goes_through_a_proxy(self, monkeypatch):
@@ -367,7 +369,8 @@ class TestWritebackVerification:
         ok, _ = remote_sync.writeback_refresh_cookie(
             self._sync(), "T", "new_api_refresh=sid.gen2")
         assert ok is True
-        assert len(sent) == 3
+        # 只数回写本身的次数，读回核实的 GET 不算重试
+        assert len([item for item in sent if item["method"] == "POST"]) == 3
 
     def test_gives_up_after_the_attempt_budget(self, monkeypatch):
         sent = self._replies(monkeypatch, [FakeResponse({"ok": False})])
@@ -394,3 +397,139 @@ class TestWritebackVerification:
         assert remote_sync.writeback_refresh_cookie(disabled, "T", "c")[0] is False
         assert remote_sync.writeback_refresh_cookie(self._sync(), "T", "  ")[0] is False
         assert called == []
+
+
+class TestWritebackReadBack:
+    """回写被验收之后的读回核实。
+
+    平台回 `ok: true` 只是它的自述，库里到底存了什么得读回来才知道。这一步专门堵
+    「收了但没存」：那种情况下平台仍攥着旧代次，它的保活下次 refresh 就撞重放、
+    整条会话被 AUTH_SESSION_REVOKED 报废。
+
+    两条路径必须严格分开：
+      - **确认存的不是这一代** → 真故障，和回写失败同一条判负路径
+      - **核实拿不到结论**（网络错、老平台没这个端点、响应形状不对）→ 记日志放过。
+        回写已经被平台明确确认过了，加固失灵不该把成功的轮次判成失败
+    """
+
+    @staticmethod
+    def _sync(**overrides):
+        from newapi_checkin.config import ConfigSyncConfig
+
+        raw = {
+            "enabled": True,
+            "url": "https://panel.example.com/api/config/raw",
+            "token": "k" * 20,
+        }
+        raw.update(overrides)
+        return ConfigSyncConfig.from_raw(raw)
+
+    def _serve(self, monkeypatch, *, writeback=None, readback=None):
+        """按方法分派假响应：POST 是回写，GET 是读回核实。"""
+        sent = []
+
+        def fake_request(method, url, **kwargs):
+            sent.append({"method": method, "url": url, **kwargs})
+            item = writeback if method == "POST" else readback
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        monkeypatch.setattr(remote_sync.cffi, "request", fake_request)
+        monkeypatch.setattr(remote_sync.time, "sleep", lambda _s: None)
+        return sent
+
+    def _writeback(self, monkeypatch, readback, cookie="new_api_refresh=sid.gen2"):
+        sent = self._serve(monkeypatch,
+                           writeback=FakeResponse({"ok": True}),
+                           readback=readback)
+        ok, detail = remote_sync.writeback_refresh_cookie(self._sync(), "T", cookie)
+        return ok, detail, sent
+
+    def test_matching_cookie_is_read_back_from_the_account_endpoint(self, monkeypatch):
+        ok, _, sent = self._writeback(monkeypatch, FakeResponse(
+            {"name": "T", "cookie": "new_api_refresh=sid.gen2"}))
+        assert ok is True
+        assert sent[1]["method"] == "GET"
+        assert sent[1]["url"] == "https://panel.example.com/api/accounts/T/raw"
+
+    def test_trailing_whitespace_is_not_a_mismatch(self, monkeypatch):
+        """一个换行不该让整轮判负。"""
+        ok, _, _ = self._writeback(monkeypatch, FakeResponse(
+            {"cookie": "\n  new_api_refresh=sid.gen2  \n"}))
+        assert ok is True
+
+    def test_platform_side_normalization_is_not_a_mismatch(self, monkeypatch):
+        """平台落库前会给裸 sid.secret 补上 new_api_refresh= 前缀，那仍是同一个值。"""
+        ok, _, _ = self._writeback(monkeypatch,
+                                   FakeResponse({"cookie": "new_api_refresh=sid.gen2"}),
+                                   cookie="sid.gen2")
+        assert ok is True
+
+    def test_another_generation_in_the_store_is_a_failure(self, monkeypatch):
+        """收了但没存 —— 平台还攥着旧代次，必须让调用方按回写失败处理。"""
+        ok, detail, sent = self._writeback(monkeypatch, FakeResponse(
+            {"cookie": "new_api_refresh=sid.gen1"}))
+        assert ok is False
+        assert "读回核实不一致" in detail
+        # 判负后不该再重试回写：平台确实收下了，重发同一个值不会改变结果
+        assert [item["method"] for item in sent] == ["POST", "GET"]
+
+    def test_empty_cookie_in_the_store_is_a_failure(self, monkeypatch):
+        """库里是空串同样是「没存住」，不能当成核实不了。"""
+        ok, detail, _ = self._writeback(monkeypatch, FakeResponse({"cookie": ""}))
+        assert ok is False
+        assert "读回核实不一致" in detail
+
+    def test_network_error_while_verifying_is_not_a_verdict(self, monkeypatch):
+        ok, _, _ = self._writeback(monkeypatch, RuntimeError("connection reset"))
+        assert ok is True
+
+    def test_missing_endpoint_on_an_old_platform_is_not_a_verdict(self, monkeypatch):
+        """老版本平台没有这个端点会 404，那只是核实不了。"""
+        ok, _, _ = self._writeback(monkeypatch,
+                                   FakeResponse({"error": "not found"}, status_code=404))
+        assert ok is True
+
+    def test_unexpected_response_shape_is_not_a_verdict(self, monkeypatch):
+        """网关代答、端点被改：拿不到 cookie 字段就断言库里存错了会造出一批假故障。"""
+        class HtmlPage:
+            status_code = 200
+            text = "<html>gateway ok</html>"
+
+            def json(self):
+                raise ValueError("not json")
+
+        assert self._writeback(monkeypatch, HtmlPage())[0] is True
+        assert self._writeback(monkeypatch, FakeResponse({"name": "T"}))[0] is True
+        assert self._writeback(monkeypatch, FakeResponse([{"cookie": "x"}]))[0] is True
+
+    def test_verification_never_goes_through_a_proxy(self, monkeypatch):
+        """读回打的还是自己的平台，代理只会多一个失败点。"""
+        _, _, sent = self._writeback(monkeypatch, FakeResponse(
+            {"cookie": "new_api_refresh=sid.gen2"}))
+        assert "proxies" in sent[1] and sent[1]["proxies"] is None
+
+    def test_verification_reuses_auth_header_and_timeout(self, monkeypatch):
+        sync = self._sync()
+        _, _, sent = self._writeback(monkeypatch, FakeResponse(
+            {"cookie": "new_api_refresh=sid.gen2"}))
+        assert any("k" * 20 in str(v) for v in sent[1]["headers"].values())
+        assert sent[1]["timeout"] == sync.timeout
+
+    def test_underivable_readback_url_skips_verification(self, monkeypatch):
+        """回写走的是第三方网关模板时推不出读回地址，跳过核实但不影响回写结论。"""
+        sent = self._serve(monkeypatch, writeback=FakeResponse({"ok": True}))
+        sync = self._sync(url="", writeback_url="https://gw.example.com/hook/{name}")
+        ok, _ = remote_sync.writeback_refresh_cookie(sync, "T", "new_api_refresh=sid.gen2")
+        assert ok is True
+        assert [item["method"] for item in sent] == ["POST"]
+
+    def test_failed_writeback_never_reaches_verification(self, monkeypatch):
+        """回写自己都没被确认时不该再去读回：判负原因是回写失败，不是核实。"""
+        sent = self._serve(monkeypatch, writeback=FakeResponse({"ok": False}))
+        ok, detail = remote_sync.writeback_refresh_cookie(
+            self._sync(), "T", "new_api_refresh=sid.gen2")
+        assert ok is False
+        assert "未确认收下" in detail
+        assert all(item["method"] == "POST" for item in sent)

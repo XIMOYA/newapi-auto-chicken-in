@@ -67,6 +67,10 @@ func updateAccountCookie(db *sql.DB, name, cookie string) (bool, error) {
 
 // handleWriteBackRefreshCookie POST /api/accounts/{name}/refresh-cookie（API Key）
 // Python 侧签到 refresh 成功后把新一代 cookie 同步回来，保持平台与本机代次一致。
+//
+// 账号定位规则（路径参数 trim 后与 accounts[].name 精确比较）与读回核实端点
+// lookupAccountByPath 共用一套：客户端写完会立刻拉 GET /api/accounts/{name}/raw 比对，
+// 两边口径不一致就会「写得进、核不到」，把成功的回写误判成失败。
 func (s *Server) handleWriteBackRefreshCookie(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.PathValue("name"))
 	if name == "" {

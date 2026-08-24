@@ -1,10 +1,11 @@
 /*
 web/src/api/config.ts
-配置接口封装（对应契约 §3 获取配置 / §4 保存配置 / §5 拉取配置 / §4.1 账号增量操作）
+配置接口封装（对应契约 §3 获取配置 / §4 保存配置 / §5 拉取配置 / §4.1 账号增量操作 / §4.2 单账号查询）
 */
 import http from './http'
 import type {
-  AccountOp, AccountOpsResult, AppConfig, ConfigResponse, ConfigRevisionResult, SaveConfigResult
+  AccountDetailResponse, AccountOp, AccountOpsResult, AppConfig, ConfigResponse,
+  ConfigRevisionResult, SaveConfigResult
 } from '@/types'
 
 export function getConfig(): Promise<ConfigResponse> {
@@ -34,5 +35,18 @@ export function applyAccountOps(ops: AccountOp[]): Promise<AccountOpsResult> {
 export function getRawConfig(token: string): Promise<AppConfig> {
   return http
     .get<AppConfig>('/config/raw', { headers: { Authorization: `Bearer ${token}` } })
+    .then((r) => r.data)
+}
+
+/**
+ * 单个账号的脱敏配置 + cookie 核实摘要。
+ *
+ * 用途是核实凭据回写有没有真的落库：客户端每轮转一次代次就回写一次，页面靠比对
+ * cookie_digest.fingerprint 判断平台手里是不是最新那一代，明文不会下发浏览器。
+ * 账号名要转义 —— 名字里允许出现斜杠和中文，直接拼进路径会串到别的端点上去。
+ */
+export function getAccountDetail(name: string): Promise<AccountDetailResponse> {
+  return http
+    .get<AccountDetailResponse>(`/accounts/${encodeURIComponent(name)}`)
     .then((r) => r.data)
 }

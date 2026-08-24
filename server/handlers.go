@@ -77,6 +77,12 @@ func (s *Server) routes() http.Handler {
 	// 账号级增量操作：多人同时编辑账号列表走这里，不走整份覆盖
 	mux.HandleFunc("POST /api/accounts/ops", s.requireJWTOrAPIKey(s.handleAccountOps))
 
+	// 单账号查询（凭据回写的读回核实，见 account_query.go）：
+	// 脱敏摘要跟 GET /api/config 同级（双认证，cookie 只给指纹不给明文），
+	// 明文切片跟 GET /api/config/raw 同级（只认 API Key，暴露面不新增）
+	mux.HandleFunc("GET /api/accounts/{name}", s.requireJWTOrAPIKey(s.handleGetAccount))
+	mux.HandleFunc("GET /api/accounts/{name}/raw", s.requireAPIKey(s.handleGetAccountRaw))
+
 	// API Key 的增删查只认 JWT：让一把 Key 能造出新 Key 等于永久提权，
 	// CI secrets 一旦泄露就再也收不回控制权。
 	mux.HandleFunc("GET /api/keys", s.requireJWT(s.handleListKeys))

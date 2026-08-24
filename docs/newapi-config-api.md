@@ -49,8 +49,8 @@ Authorization: Bearer <JWT 或 API Key>
 
 | 范围 | 端点 | 说明 |
 | --- | --- | --- |
-| **双认证**<br>JWT 或 API Key | `GET /api/config`<br>`GET /api/config/revision`<br>`PUT /api/config`<br>`GET /api/export`<br>`POST /api/accounts/ops`<br>`POST /api/cookie-tests/newapi`<br>`POST /api/cookie-tests/tabiai`<br>`GET /api/cookie-tests/status`<br>`POST /api/cookie-tests/stop`<br>`POST /api/tabiai/issue-cookie`<br>`GET /api/run-state`<br>`POST /api/run-state/unlock`<br>`GET /api/proxies`<br>`GET /api/proxies/stats`<br>`POST /api/proxies/refresh`<br>`POST /api/proxies/speedtest` | 日常运维。脚本用一把 API Key 就能干完，不必模拟登录换 JWT |
-| **仅 API Key** | `GET /api/config/raw`<br>`GET /api/proxies/available`<br>`POST /api/proxies/feedback`<br>`POST /api/accounts/{name}/refresh-cookie`<br>`POST /api/run-state/start`<br>`POST /api/run-state/heartbeat`<br>`POST /api/run-state/stop` | 客户端专用通道。JWT 调这些会 401 |
+| **双认证**<br>JWT 或 API Key | `GET /api/config`<br>`GET /api/config/revision`<br>`PUT /api/config`<br>`GET /api/export`<br>`POST /api/accounts/ops`<br>`GET /api/accounts/{name}`<br>`POST /api/cookie-tests/newapi`<br>`POST /api/cookie-tests/tabiai`<br>`GET /api/cookie-tests/status`<br>`POST /api/cookie-tests/stop`<br>`POST /api/tabiai/issue-cookie`<br>`GET /api/run-state`<br>`POST /api/run-state/unlock`<br>`GET /api/proxies`<br>`GET /api/proxies/stats`<br>`POST /api/proxies/refresh`<br>`POST /api/proxies/speedtest` | 日常运维。脚本用一把 API Key 就能干完，不必模拟登录换 JWT |
+| **仅 API Key** | `GET /api/config/raw`<br>`GET /api/accounts/{name}/raw`<br>`GET /api/proxies/available`<br>`POST /api/proxies/feedback`<br>`POST /api/accounts/{name}/refresh-cookie`<br>`POST /api/run-state/start`<br>`POST /api/run-state/heartbeat`<br>`POST /api/run-state/stop` | 客户端专用通道。JWT 调这些会 401 |
 | **仅 JWT** | `POST /api/config/import`<br>`GET /api/keys`<br>`POST /api/keys`<br>`DELETE /api/keys/{id}`<br>`PUT /api/password`<br>`POST /api/auth/verify-password` | 控制平面。一把躺在 CI secrets 里的 Key 若能改密码或造新 Key，泄露就等于永久失守 |
 | **无需认证** | `GET /api/health`<br>`POST /api/login` | |
 
@@ -330,6 +330,69 @@ merge 规则：`accounts` / `sites` 按 `name` 合并（同名整条替换，新
 - **不走代理**，即使启用了 `proxy_pool`。没有伪装出口的需要，套代理只是多一个失败点。
 - 三次都没确认成功时**该账号这一轮判为失败**，即使签到本身成了。因为平台会拿旧代次
   去保活/检测并撞重放，报成成功等于把这个隐患藏进一封全绿的汇总邮件里。
+- 回写被验收后**再读回核实一次**（见下面两个查询端点）：库里确认不是这一代同样判负，
+  核实本身没拿到结论则只记 debug 放过。
+
+### GET /api/accounts/{name}
+
+双认证。单个账号的脱敏配置 + cookie 核实摘要，给网页端**人工核实回写结果**用。
+
+**200**
+
+```json
+{
+  "account": { "name": "Steven", "url": "https://a.com", "login_method": "tabiai",
+               "cookie": "***", "github_user_session": "***", "enabled": true },
+  "cookie_digest": { "fingerprint": "9f2a1c7b4e05", "length": 96, "has_refresh": true },
+  "updated_at": "2026-08-24T10:00:00Z"
+}
+```
+
+`account` 走的是与 `GET /api/config` **同一套打码规则**（`MaskConfig`），所以 cookie 与
+`github_user_session` 非空时一律是 `"***"`，明文一个字节都不下发浏览器。
+
+| 摘要字段 | 含义 |
+| --- | --- |
+| fingerprint | cookie 明文的 sha256 十六进制**前 12 位**；给人眼比对「代次换没换」，不是防碰撞哈希 |
+| length | 明文字节长度 |
+| has_refresh | 是否含 `new_api_refresh=` 这个键。只有源站会下发它，指纹长度都在而键没了说明库里那条不是可用凭据 |
+
+cookie 为空时摘要是空值形态：`{ "fingerprint": "", "length": 0, "has_refresh": false }`
+（此时 `account.cookie` 也保持空串，不打成 `"***"`，否则界面会显示「已设置」）。
+
+`updated_at` 是整份配置的更新时间 —— 库里没有按账号的时间戳。凭据轮转不推进 `revision`
+但**会**更新它，所以这个值恰好能反映「最近一次回写是什么时候落库的」。
+
+| 状态码 | 文案 |
+| --- | --- |
+| 400 | `账号名不能为空` |
+| 404 | `账号不存在: <名字>` |
+| 500 | `服务器内部错误` |
+
+### GET /api/accounts/{name}/raw
+
+**仅 API Key**。返回该账号的**明文** Account 对象（没有包裹层），给客户端做回写后的精确比对。
+
+```json
+{ "name": "Steven", "url": "https://a.com", "login_method": "tabiai",
+  "cookie": "new_api_refresh=sid.secret", "enabled": true }
+```
+
+明文暴露面没有新增：API Key 持有者本来就能 `GET /api/config/raw` 拉走整份明文，
+这里只是按账号切了一片。错误码与上面那个端点一致。
+
+两个端点的账号定位规则与 `POST /api/accounts/{name}/refresh-cookie` **完全一致**：
+路径参数 trim 后与 `accounts[].name` 精确比较，**大小写敏感**，库里的名字不 trim。
+必须同一套口径 —— 否则会出现「回写找得到、核实找不到」，客户端会把成功的回写判成失败。
+
+客户端侧（`newapi_checkin/remote_sync.py` 的 `_verify_writeback`）的三条约定：
+
+- **确认库里不是这一代**（含被存成空串）→ 与「回写失败」同一条判负路径。平台此刻攥着
+  旧代次，它的保活下次 refresh 就会撞重放、整条会话被撤销
+- **核实没拿到结论**（推不出读回地址、网络错、老版本平台 404、响应形状不对）→ 只记
+  一条 debug 放过。回写已被平台的 `ok` 明确确认，加固失灵不该反过来造出一批假故障
+- 比对前两边都 `strip()`，并按平台的归一化规则（裸 `sid.secret` 补 `new_api_refresh=`
+  前缀）兜一层；读回同样**不走代理**，超时沿用 `config_sync.timeout`
 
 ## 4. Cookie 可用性检测
 
@@ -914,12 +977,12 @@ CI secrets 一旦泄露就再也收不回控制权。
 
 规则：
 
-- 打码只发生在 `GET /api/config`，**非空才替换为 `"***"`**，空值原样保留空串
+- 打码只发生在 `GET /api/config` 与 `GET /api/accounts/{name}`，**非空才替换为 `"***"`**，空值原样保留空串
 - 提交时值为 `"***"` = 「未修改，保留库中旧值」
 - accounts 的两个字段按**账号名**匹配还原（不按下标），改名后找不到旧值直接 400，
   不会把字面量 `***` 落库 —— 所以改名请走 `POST /api/accounts/ops` 带 `previous_name`
 - 启动时会把库里遗留的 `"***"` 字面量清空并记日志
-- `GET /api/config/raw` 与 `GET /api/export` **不打码**
+- `GET /api/config/raw`、`GET /api/accounts/{name}/raw` 与 `GET /api/export` **不打码**
 
 ### Config 顶层段落
 
@@ -1036,6 +1099,15 @@ AUTH="Authorization: Bearer $KEY"
 curl -X POST "$BASE/api/accounts/Steven/refresh-cookie" \
   -H "$AUTH" -H "Content-Type: application/json" \
   -d '{"cookie":"new_api_refresh=sid.secret"}'
+```
+
+**核实凭据真的落库了**（回写后紧跟一步；`ok: true` 只是服务端自述）
+
+```bash
+# 明文精确比对（API Key）
+curl "$BASE/api/accounts/Steven/raw" -H "$AUTH"
+# 只想看摘要、不想让明文出现在终端历史里（JWT 或 API Key）
+curl "$BASE/api/accounts/Steven" -H "$AUTH"
 ```
 
 **加一个账号**

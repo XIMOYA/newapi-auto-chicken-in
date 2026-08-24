@@ -1,4 +1,11 @@
-"""远程配置 API 获取、AES-GCM 解密和本地保存（保留本地加密状态）。"""
+"""newapi_checkin/remote_sync.py
+远程配置 API 获取、AES-GCM 解密和本地保存（保留本地加密状态）。
+
+职责：
+- 拉取远程配置并解密、按本地加密状态写回 config.json
+- TaBiAI 凭据轮转后回写管理平台，并**读回核实**新代次确实落了库
+- 签到运行状态上报（start / heartbeat / stop）与查锁
+"""
 
 from __future__ import annotations
 
@@ -251,6 +258,12 @@ def writeback_refresh_cookie(sync: ConfigSyncConfig, account_name: str,
     HTTP 状态码：中间要是有网关或鉴权代理回了自己的 200，请求压根没到服务端，平台
     仍然攥着旧代次，而客户端会以为同步成功。必须读响应体里的 `ok` 字段。
 
+    验收通过后**还要再拉一次读回核实**（GET /api/accounts/{name}/raw）：响应体说收下了
+    也只是服务端的自述，库里到底存了什么只有读回来才知道。核实不一致说明「收了但没存」
+    或「存成了别的值」，和回写失败同等严重，走同一条判负路径；核实本身没拿到结论
+    （网络错、超时、老版本平台没这个端点）只记日志放过 —— 回写已经被明确确认过，
+    加固手段失灵不该反过来把成功的轮次判成失败。
+
     失败会重试（见 WRITEBACK_ATTEMPTS）。这条链路打的是自己的配置管理平台，不是目标
     站点，多试几次没有「加重风控」的顾虑，而漏掉一次的代价是整条会话。
 
@@ -271,6 +284,12 @@ def writeback_refresh_cookie(sync: ConfigSyncConfig, account_name: str,
         if ok:
             if attempt > 1:
                 log.debug(f"凭据回写第 {attempt} 次成功")
+            matched, reason = _verify_writeback(sync, account_name, cookie)
+            if matched is False:
+                # 平台自述收下了，库里却不是这一代 —— 它接下来还会拿旧代去保活
+                return False, f"平台确认收下但读回核实不一致：{reason}"
+            if matched is None:
+                log.debug(f"凭据回写读回核实未取得结论（{reason}）；回写已被平台确认，按成功处理")
             return True, endpoint
         last = detail
         if attempt < WRITEBACK_ATTEMPTS:
@@ -313,6 +332,90 @@ def _writeback_once(sync: ConfigSyncConfig, endpoint: str,
     if body.get("ok") is not True:
         return False, f"HTTP {status} 但平台未确认收下: {str(body)[:120]}"
     return True, ""
+
+
+def _verify_endpoint(sync: ConfigSyncConfig, account_name: str) -> str:
+    """读回核实端点：按拉取 URL 同源推导 /api/accounts/{name}/raw。
+
+    有意不复用 writeback_url：那是「按账号回写」的地址，可能被配成带 {name} 的模板
+    或指向第三方网关，从它身上推不出对应的读回地址。推不出来就不核实 —— 核实是加固，
+    缺了它不能反过来把已被平台确认的回写判负。
+    """
+    from urllib.parse import quote, urlsplit, urlunsplit
+
+    if not sync.url:
+        return ""
+    parts = urlsplit(sync.url)
+    if not parts.scheme or not parts.netloc:
+        return ""
+    path = f"/api/accounts/{quote(account_name, safe='')}/raw"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def _same_refresh_cookie(stored: str, written: str) -> bool:
+    """两条凭据是不是同一代。
+
+    先 strip 再比：中间哪一层多带了个换行都不该被判成「存错了」。
+    仍不相等时再按平台的归一化规则兜一层 —— 平台落库前会给裸 sid.secret 补上
+    new_api_refresh= 前缀（server/cookie_checker.go 的 normalizeTabiAIRefreshCookie），
+    两种写法在平台眼里是同一个值，客户端不能因为表示形式不同就判负。
+    """
+    left, right = str(stored or "").strip(), str(written or "").strip()
+    if left == right:
+        return True
+    from .tabiai import normalize_refresh_cookie
+
+    return normalize_refresh_cookie(left) == normalize_refresh_cookie(right)
+
+
+def _verify_writeback(sync: ConfigSyncConfig, account_name: str,
+                      cookie: str) -> tuple[Optional[bool], str]:
+    """回写被验收后再读回来比一遍。返回 (核实结论, 说明)。
+
+    结论是三态，缺一不可：
+      - True  库里就是刚写进去的那一代
+      - False **确认存的是别的值**（收了没存 / 存成了别的），与回写失败同等严重
+      - None  没拿到结论（推不出地址、网络错、非预期响应），只记日志放过
+
+    把 None 和 False 分开是这一步的全部意义：回写已经被平台的 `ok` 明确确认过，
+    核实只是加固；若把「核实拿不到结果」也当成失败，平台一有抖动就会把本来成功的
+    账号判负，反而制造出一批假故障。
+
+    同样显式直连（proxies=None）：读回打的还是自己的平台，套代理只是多一个失败点。
+    超时沿用 config_sync.timeout，与回写请求同一个量级。
+    """
+    endpoint = _verify_endpoint(sync, account_name)
+    if not endpoint:
+        return None, "无法确定读回地址（config_sync.url 未配置或非法）"
+    try:
+        response = cffi.request(
+            "GET", endpoint,
+            headers=_headers(sync),
+            timeout=sync.timeout,
+            proxies=None,
+        )
+    except Exception as exc:  # noqa: BLE001 - 网络库异常类型不固定
+        return None, f"{type(exc).__name__}: {exc}"[:160]
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status >= 400:
+        # 老版本平台没有这个端点会 404，同样只是「核实不了」而不是「写错了」
+        text = str(getattr(response, "text", "") or "")[:120]
+        return None, f"HTTP {status}: {text}"
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 - 不是 JSON 就说明没到服务端，核实不了
+        text = str(getattr(response, "text", "") or "")[:120]
+        return None, f"HTTP {status} 但响应不是 JSON: {text!r}"
+    if not isinstance(body, dict):
+        return None, f"HTTP {status} 但响应不是 JSON 对象: {str(body)[:120]}"
+    if not isinstance(body.get("cookie"), str):
+        # 缺字段是响应形状不对（网关代答、端点被改），不能据此断言库里存错了
+        return None, f"响应里没有 cookie 字段: {str(body)[:120]}"
+    stored = str(body["cookie"])
+    if _same_refresh_cookie(stored, cookie):
+        return True, ""
+    # 有 cookie 字段但值不是这一代（含被存成空串）：这是真故障，必须判负
+    return False, f"库里存的是另一个值（长度 {len(stored.strip())}，非本次回写的凭据）"
 
 
 # --------------------------------------------------------------------------- #

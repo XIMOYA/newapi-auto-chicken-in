@@ -4,6 +4,7 @@ web/src/views/TabiAIKeepaliveView.vue
 职责：
 - 展示与修改保活策略（开关 + 间隔分钟数，服务端会夹到 15~720）
 - 展示每个 tabiai 账号最后一次刷新的结果、是否真的换了代次、用的哪个代理
+- 支持按需核实平台库里那条凭据的指纹，确认客户端回写的代次确实落了库
 - 凭据失效的账号会被暂停，页面要说清恢复条件：改过凭据后的第一次刷新自动恢复
 - 支持立刻手动刷一轮；签到进行中服务端会整轮避让，此时按钮禁用并给出说明
 为什么需要保活：
@@ -15,6 +16,7 @@ web/src/views/TabiAIKeepaliveView.vue
 - PUT  /api/tabiai/keepalive
 - POST /api/tabiai/keepalive/run
 - GET  /api/run-state
+- GET  /api/accounts/{name}（「核实凭据」按钮：只取 cookie 摘要，明文不下发）
 -->
 <template>
   <div class="page-container keepalive-page">
@@ -81,6 +83,12 @@ web/src/views/TabiAIKeepaliveView.vue
     </n-card>
 
     <n-card title="账号状态" size="small" class="section-card">
+      <template #header-extra>
+        <n-space align="center" :size="8">
+          <span v-if="digestUpdatedAt" class="hint">落库时间 {{ formatTime(digestUpdatedAt) }}</span>
+          <n-button size="tiny" :loading="verifying" @click="verifyDigests">核实凭据</n-button>
+        </n-space>
+      </template>
       <n-data-table
         :columns="columns"
         :data="status.accounts"
@@ -93,6 +101,8 @@ web/src/views/TabiAIKeepaliveView.vue
         <span class="hint">
           「已换代次」为否且状态正常时，说明站点这次没下发新 secret（宽限窗口内幂等），属正常现象；
           长期为否才需要怀疑回写链路。
+          「平台凭据」点上面的按钮才拉取：指纹是 cookie 的 sha256 前 12 位，拿它和客户端日志里
+          回写的那一代比对，一致就说明凭据确实落了库；明文不会下发到浏览器。
         </span>
       </template>
     </n-card>
@@ -127,6 +137,8 @@ import {
   type TabiAIKeepaliveStatus
 } from '@/api/tabiaiKeepalive'
 import { getRunState } from '@/api/runState'
+import { getAccountDetail } from '@/api/config'
+import type { AccountCookieDigest } from '@/types'
 import { extractErrorMessage } from '@/utils/error'
 import { RUN_LOCK_POLL_INTERVAL, idleRunState } from '@/utils/runLock'
 
@@ -135,7 +147,13 @@ const message = useMessage()
 const loading = ref(false)
 const saving = ref(false)
 const running = ref(false)
+const verifying = ref(false)
 const runLock = ref(idleRunState())
+
+// 按账号名存 cookie 摘要：手动点「核实凭据」才填，不跟着状态轮询走
+const digests = ref<Record<string, AccountCookieDigest>>({})
+// 整份配置的更新时间；凭据轮转不推进 revision 但会更新它，所以它就是「最近一次回写落库」的时刻
+const digestUpdatedAt = ref('')
 
 const status = ref<TabiAIKeepaliveStatus>({
   setting: { enabled: true, minutes: 90, updated_at: '' },
@@ -203,6 +221,30 @@ const columns = computed<DataTableColumns<TabiAIKeepaliveRow>>(() => [
     key: 'proxy_addr',
     width: 150,
     render: (row) => (row.state ? row.proxy_addr || '直连' : '—')
+  },
+  {
+    // 平台库里那条凭据长什么样。指纹一致就说明客户端回写的代次确实落了库，
+    // 而 has_refresh 为否比指纹更要紧：键都没了，那条根本不是能用的凭据
+    title: '平台凭据',
+    key: 'digest',
+    width: 150,
+    render: (row) => {
+      const digest = digests.value[row.account_name]
+      if (!digest) return h('span', { class: 'digest-idle' }, '未核实')
+      if (!digest.length) {
+        return h(NTag, { size: 'small', type: 'error', bordered: false }, { default: () => '库里为空' })
+      }
+      return h('div', null, [
+        h('code', { class: 'digest-code' }, digest.fingerprint),
+        digest.has_refresh
+          ? null
+          : h(
+              'div',
+              { style: 'color:#d03050;font-size:12px;margin-top:2px;' },
+              '缺 new_api_refresh 键'
+            )
+      ])
+    }
   },
   {
     title: '说明',
@@ -285,6 +327,45 @@ async function runNow() {
   }
 }
 
+/**
+ * 拉一遍每个账号的 cookie 摘要，用来核实回写有没有真的落库。
+ *
+ * 手动触发而不是并进上面那个轮询：这是一人一次的核对动作，跟着轮询走会给每个账号
+ * 每轮都发一个请求，纯属白费。allSettled 而不是 all —— 某个账号刚被删掉会 404，
+ * 不该让整批核实一起失败。
+ */
+async function verifyDigests() {
+  const names = status.value.accounts.map((row) => row.account_name).filter(Boolean)
+  if (!names.length) {
+    message.info('还没有 tabiai 账号')
+    return
+  }
+  verifying.value = true
+  try {
+    const results = await Promise.allSettled(names.map((name) => getAccountDetail(name)))
+    const next: Record<string, AccountCookieDigest> = {}
+    const failed: string[] = []
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        next[names[index]] = result.value.cookie_digest
+        if (result.value.updated_at) digestUpdatedAt.value = result.value.updated_at
+      } else {
+        failed.push(names[index])
+      }
+    })
+    digests.value = next
+    if (failed.length) {
+      message.warning(`${names.length - failed.length}/${names.length} 个账号核实完成，失败：${failed.join('、')}`)
+    } else {
+      message.success(`${names.length} 个账号的凭据指纹已取回`)
+    }
+  } catch (err) {
+    message.error(extractErrorMessage(err, '核实失败'))
+  } finally {
+    verifying.value = false
+  }
+}
+
 onMounted(async () => {
   await Promise.all([load(true), refreshRunLock()])
   // 轮询只为跟上后台那一轮的进度与签到锁变化，间隔沿用运行锁那套节奏
@@ -320,6 +401,22 @@ onBeforeUnmount(() => {
 .hint.danger {
   margin-left: 0;
   color: #d03050;
+}
+
+/* 指纹是拿来和日志逐字比对的，等宽字体才不会看错 0/O、1/l */
+:deep(.digest-code) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: #334155;
+  background: #f1f5f9;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+/* 表格单元格里的占位文字：不能复用 .hint，那个带 12px 左边距、在格子里会歪 */
+:deep(.digest-idle) {
+  color: #94a3b8;
+  font-size: 12px;
 }
 
 :deep(.row-paused td) {

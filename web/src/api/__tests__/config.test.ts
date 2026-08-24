@@ -6,6 +6,7 @@ web/src/api/__tests__/config.test.ts
 - upsert 带 previous_name 时原样透传（改名靠它还原打码凭据）
 - getConfigRevision 走轻量端点
 - saveConfig 的 revision 可选语义
+- getAccountDetail 的路径转义与脱敏摘要解析
 说明：mock 掉 ../http，只验证「调了哪个地址、带了什么体」，不发真实请求
 */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -22,7 +23,7 @@ vi.mock('../http', () => ({
   }
 }))
 
-import { applyAccountOps, getConfigRevision, saveConfig } from '../config'
+import { applyAccountOps, getAccountDetail, getConfigRevision, saveConfig } from '../config'
 import type { Account, AppConfig } from '@/types'
 
 const account = (name: string): Account => ({
@@ -119,5 +120,55 @@ describe('整份保存的乐观锁', () => {
     await saveConfig({} as AppConfig)
     const body = put.mock.calls[0][1] as Record<string, unknown>
     expect('revision' in body).toBe(false)
+  })
+})
+
+describe('单账号查询（凭据落库核实）', () => {
+  const detail = {
+    data: {
+      account: account('A'),
+      cookie_digest: { fingerprint: 'a1b2c3d4e5f6', length: 128, has_refresh: true },
+      updated_at: '2024-05-01T10:00:00Z'
+    }
+  }
+
+  it('打到 /accounts/{name}，取回指纹与落库时间', async () => {
+    get.mockResolvedValue(detail)
+    const res = await getAccountDetail('A')
+    expect(get).toHaveBeenCalledWith('/accounts/A')
+    expect(res.cookie_digest.fingerprint).toBe('a1b2c3d4e5f6')
+    expect(res.updated_at).toBe('2024-05-01T10:00:00Z')
+  })
+
+  it('账号名转义后再拼路径，斜杠不会串到别的端点', async () => {
+    get.mockResolvedValue(detail)
+    await getAccountDetail('组/A 号')
+    expect(get).toHaveBeenCalledWith('/accounts/%E7%BB%84%2FA%20%E5%8F%B7')
+  })
+
+  it('取的是脱敏端点：cookie 只会是打码值', async () => {
+    get.mockResolvedValue(detail)
+    const res = await getAccountDetail('A')
+    expect(res.account.cookie).toBe('***')
+  })
+
+  it('库里凭据为空时摘要是空值形态', async () => {
+    get.mockResolvedValue({
+      data: {
+        account: { ...account('A'), cookie: '' },
+        cookie_digest: { fingerprint: '', length: 0, has_refresh: false }
+      }
+    })
+    const res = await getAccountDetail('A')
+    expect(res.cookie_digest.length).toBe(0)
+    expect(res.cookie_digest.has_refresh).toBe(false)
+    expect(res.updated_at).toBeUndefined()
+  })
+
+  it('账号不存在时 404 原样抛出', async () => {
+    get.mockRejectedValue({ response: { status: 404, data: { error: '账号不存在: X' } } })
+    await expect(getAccountDetail('X')).rejects.toMatchObject({
+      response: { status: 404 }
+    })
   })
 })
