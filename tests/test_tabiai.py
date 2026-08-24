@@ -447,12 +447,17 @@ class TestRefreshInflightAccounting:
         """必须用 REFRESH_TIMEOUT_SECONDS，不能沿用 http.timeout（默认 20s）。
 
         20s 正好是已证实安全窗口的下界 —— 用它做超时等于一次超时就烧光预算。
+        连接阶段另给一个更短的上限，好让死代理尽快暴露而不是干等满 8 秒。
         """
         client = make_client([refresh_ok()])
         client.refresh()
         sent = client._session.calls[0]
-        assert sent["kwargs"]["timeout"] == tabiai.REFRESH_TIMEOUT_SECONDS
+        assert sent["kwargs"]["timeout"] == (
+            tabiai.REFRESH_CONNECT_TIMEOUT_SECONDS,
+            tabiai.REFRESH_TIMEOUT_SECONDS,
+        )
         assert tabiai.REFRESH_TIMEOUT_SECONDS < client.http.timeout
+        assert tabiai.REFRESH_CONNECT_TIMEOUT_SECONDS < tabiai.REFRESH_TIMEOUT_SECONDS
 
     def test_budget_leaves_room_for_one_retry(self):
         """两次 refresh 超时（8+8）要仍落在 15s 预算内，否则重试机会等于零。"""
@@ -504,3 +509,76 @@ class TestRefreshInflightAccounting:
         client = make_client([refresh_ok()])
         assert client.on_inflight is None and client.on_settled is None
         assert client.refresh().result.kind == api.SUCCESS
+
+
+class TestRefreshStageClassification:
+    """按「请求字节有没有可能已经写出去」给网络错误分阶段。
+
+    这个区分不是锦上添花。第一版一刀切把所有网络错误都当成「可能已发出」，上线后代理池
+    里的死地址直接把签到打瘫：8 秒连接超时 × 换两次 IP 就累计超过 15 秒悬空预算，账号连
+    站点都没碰到就被闸门拦死，日志里刷满「已悬空 21 秒…本轮主动放弃」。
+
+    判据用 curl 错误码而不是异常类型 —— curl_cffi 把 7（连不上，安全）和 56（Recv 失败，
+    危险）都映射成 ConnectionError，靠类型分不开。
+    """
+
+    @staticmethod
+    def _err(message, code):
+        class CurlLike(Exception):
+            def __init__(self):
+                super().__init__(message)
+                self.code = code
+
+        return CurlLike()
+
+    def test_pre_flight_failures_are_safe(self):
+        """连接阶段的失败：请求从未发出，代次一定没动。"""
+        for code, label in ((5, "代理域名没解出来"), (6, "目标域名没解出来"),
+                            (7, "TCP 握手失败"), (35, "TLS 握手失败"),
+                            (97, "代理隧道没建起来")):
+            assert tabiai.refresh_never_sent(self._err(f"curl: ({code})", code)) is True, label
+
+    def test_connection_timeout_is_safe_but_operation_timeout_is_not(self):
+        """curl 28 两种含义共用一个码，必须靠消息分开 —— 这正是线上那条日志。"""
+        connect = self._err(
+            "Failed to perform, curl: (28) Connection timed out after 8002 milliseconds.", 28)
+        operation = self._err(
+            "Failed to perform, curl: (28) Operation timed out after 8001 milliseconds "
+            "with 0 bytes received", 28)
+        assert tabiai.refresh_never_sent(connect) is True
+        assert tabiai.refresh_never_sent(operation) is False
+
+    def test_post_flight_failures_are_dangerous(self):
+        """字节已经在路上：站点可能已经处理完并推进了代次。"""
+        for code in (18, 52, 55, 56):
+            assert tabiai.refresh_never_sent(self._err(f"curl: ({code})", code)) is False
+
+    def test_unknown_errors_default_to_dangerous(self):
+        """判断从严：猜错成安全要重新签发所有账号，猜错成危险只是少刷一轮。"""
+        assert tabiai.refresh_never_sent(None) is False
+        assert tabiai.refresh_never_sent(Exception("boom")) is False          # 没有 code
+        assert tabiai.refresh_never_sent(self._err("weird", 999)) is False
+        assert tabiai.refresh_never_sent(self._err("no code", "abc")) is False  # code 不是数字
+
+    def test_connection_failure_settles_the_account(self):
+        """连接都没建起来，这笔悬空账压根不该存在 —— 当场销掉，闸门才不会误拦。"""
+        client = make_client([self._err(
+            "Failed to perform, curl: (28) Connection timed out after 8002 milliseconds.", 28)])
+        marks, settled = [], []
+        client.on_inflight = marks.append
+        client.on_settled = lambda: settled.append(True)
+        result = client.refresh()
+        assert result.result.kind == api.NETWORK_ERROR
+        assert marks == ["new_api_refresh=sid.gen1"]     # 发出前照旧记账
+        assert settled == [True]                        # 但确认没发出后立刻销账
+
+    def test_response_stage_timeout_still_keeps_the_mark(self):
+        """整体超时仍要留账：站点可能已经推进代次，这一代不能再用。"""
+        client = make_client([self._err(
+            "Failed to perform, curl: (28) Operation timed out after 8001 milliseconds "
+            "with 0 bytes received", 28)])
+        settled = []
+        client.on_inflight = lambda _c: None
+        client.on_settled = lambda: settled.append(True)
+        client.refresh()
+        assert settled == []

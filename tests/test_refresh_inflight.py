@@ -444,7 +444,11 @@ def _fake_curl(monkeypatch, outcome):
 
 class TestRefreshTimeoutAndSettling:
     def test_refresh_overrides_the_session_timeout_with_its_own(self, monkeypatch):
-        """会话默认仍是 http.timeout，唯独 refresh 这一发压到 REFRESH_TIMEOUT_SECONDS。"""
+        """会话默认仍是 http.timeout，唯独 refresh 这一发压到自己的短超时。
+
+        传的是 (连接上限, 整体上限) 元组：死代理靠前者尽快暴露，别把 8 秒整体预算
+        全耗在建连上。
+        """
         cfg = _cfg()
         account = cfg.accounts[0]
         made = _fake_curl(monkeypatch, TimeoutError("connect timeout"))
@@ -455,8 +459,11 @@ class TestRefreshTimeoutAndSettling:
         session = made[0]
         assert step.result.kind == api.NETWORK_ERROR
         assert session.init_kwargs["timeout"] == cfg.http.timeout
-        assert session.calls[0]["kwargs"]["timeout"] == tabiai.REFRESH_TIMEOUT_SECONDS
-        assert session.calls[0]["kwargs"]["timeout"] < cfg.http.timeout
+        assert session.calls[0]["kwargs"]["timeout"] == (
+            tabiai.REFRESH_CONNECT_TIMEOUT_SECONDS,
+            tabiai.REFRESH_TIMEOUT_SECONDS,
+        )
+        assert tabiai.REFRESH_TIMEOUT_SECONDS < cfg.http.timeout
 
     def test_timeout_keeps_the_mark_by_not_settling(self, monkeypatch):
         """超时那一次恰恰最需要记账：标记要打上，且绝不许销账。"""

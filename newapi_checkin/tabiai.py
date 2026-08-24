@@ -48,9 +48,52 @@ BROWSER_UA = (
 # 都是拿整条会话赌运气。8 秒的取舍：一次超时 + 一次重试累计 16 秒，仍落在已证实安全的
 # 20 秒内。代价是慢站点更容易超时，但那属于「这一轮没刷成」，比撤销会话轻得多。
 REFRESH_TIMEOUT_SECONDS = 8
+# 连接阶段单独给一个更短的上限。死代理占了代理池相当一部分，让它们尽快暴露，把 8 秒的
+# 整体预算留给真正在等站点回答的那段 —— 连不上的代理干等 8 秒纯属浪费悬空预算。
+REFRESH_CONNECT_TIMEOUT_SECONDS = 4
 # 代次悬空预算：这一代从第一次送进 refresh 起，超过这个时长就绝不再用。
 # 窗口下界 20 秒，留 5 秒安全边际给发起请求本身的开销。
 INFLIGHT_BUDGET_SECONDS = 15
+
+# 「请求从未发出」的 curl 错误码。这些全都发生在把请求字节写出去之前，站点侧代次绝无
+# 可能推进，所以悬空账要当场销掉、也允许照常换 IP 重试。
+#
+# 这个区分不是锦上添花：第一版一刀切把所有网络错误都当成「可能已发出」，上线后代理池里
+# 的死地址把签到打瘫了 —— 8 秒连接超时 × 换两次 IP 就累计超过 15 秒预算，账号连站点都
+# 没碰到就被闸门拦死。判据必须落在「字节有没有可能已经出去」上。
+_NEVER_SENT_CURL_CODES = frozenset({
+    5,   # COULDNT_RESOLVE_PROXY：代理域名都没解析出来
+    6,   # COULDNT_RESOLVE_HOST：目标域名没解析出来
+    7,   # COULDNT_CONNECT：TCP 握手就失败（连接被拒/不可达）
+    35,  # SSL_CONNECT_ERROR：TLS 握手阶段失败，请求还没发
+    97,  # PROXY：代理隧道没建起来
+})
+# curl 28 两种含义都用同一个码，只能靠消息区分：
+#   "Connection timed out after N milliseconds"           -> 连接阶段，安全
+#   "Operation timed out after N ms with M bytes received" -> 请求已发出，危险
+_CURL_OPERATION_TIMEDOUT = 28
+_CONNECT_TIMEOUT_MARKER = "connection timed out"
+
+
+def refresh_never_sent(exc: Optional[BaseException]) -> bool:
+    """判断这个网络异常是否发生在「请求字节写出之前」。
+
+    返回 True 表示 refresh 从未到达站点、代次一定没动，可以安全销账并重试。
+
+    判断从严：拿不准一律当成「可能已发出」。猜错成安全的代价是整条会话被撤销、所有
+    账号重新签发；猜错成危险只是这一轮少刷一次。
+    """
+    if exc is None:
+        return False
+    try:
+        code = int(getattr(exc, "code", 0) or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code in _NEVER_SENT_CURL_CODES:
+        return True
+    if code == _CURL_OPERATION_TIMEDOUT:
+        return _CONNECT_TIMEOUT_MARKER in str(exc).lower()
+    return False
 
 
 @dataclass
@@ -109,6 +152,9 @@ class TabiAIClient:
         self._cookie = normalize_refresh_cookie(cookie)
         self.user_id = account.user_id
         self.impersonate = api.pick_impersonate(http.impersonate, cf.user_agent if cf else "")
+        # 最近一次请求的底层异常。_request 把异常吞成字符串了，但 refresh 要靠 curl
+        # 错误码判断「请求到底有没有发出去」，所以原始异常必须留一份
+        self._last_error: Optional[BaseException] = None
         self._session = self._build_session()
 
 
@@ -165,9 +211,11 @@ class TabiAIClient:
                 headers["Cookie"] = header_value
         if token:
             headers["Authorization"] = sanitize_header_value(f"Bearer {token}")
+        self._last_error = None
         try:
             resp = self._session.request(method, self.account.api(path), headers=headers, **kwargs)
         except Exception as exc:  # noqa: BLE001
+            self._last_error = exc      # 阶段判断要用 curl 错误码，字符串留不住它
             return api.ApiResult(
                 api.NETWORK_ERROR,
                 message=f"{type(exc).__name__}: {exc}"[:240],
@@ -208,13 +256,18 @@ class TabiAIClient:
         # 必须写在请求之前 —— 超时的那一次恰恰是最需要记账的，事后补写来不及。
         if self.on_inflight is not None:
             self.on_inflight(self._cookie)
-        # 短超时压住悬空时长，见 REFRESH_TIMEOUT_SECONDS 的说明
-        result, resp = self._request("POST", TABIAI_REFRESH_PATH, cookie=self._cookie,
-                                     timeout=REFRESH_TIMEOUT_SECONDS)
-        if resp is not None and self.on_settled is not None:
-            # 拿到响应就说明站点侧状态已确定（哪怕是 401），悬空态结束可以销账。
-            # 反之超时/连接失败时 resp 为 None，标记留着，让上层拒绝预算外的重试。
-            self.on_settled()
+        # 短超时压住悬空时长，见 REFRESH_TIMEOUT_SECONDS 的说明。
+        # 元组是 (连接上限, 整体上限)：死代理 4 秒暴露，剩下的预算留给等站点回答
+        result, resp = self._request(
+            "POST", TABIAI_REFRESH_PATH, cookie=self._cookie,
+            timeout=(REFRESH_CONNECT_TIMEOUT_SECONDS, REFRESH_TIMEOUT_SECONDS))
+        if self.on_settled is not None:
+            # 两种情况都该销账，但理由不同：
+            #   拿到响应   -> 站点侧状态已确定（哪怕是 401），悬空态自然结束
+            #   从未发出   -> 连接都没建起来，代次一定没动，这笔账压根不该存在
+            # 只有「发出去了但不知道结果」才保留标记，让上层拒绝预算外的重试。
+            if resp is not None or refresh_never_sent(self._last_error):
+                self.on_settled()
         if result.kind != api.UNKNOWN:
             return RefreshResult(result)
 

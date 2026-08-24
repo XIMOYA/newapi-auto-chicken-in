@@ -741,9 +741,23 @@ func tabiaiRefreshNeverSent(err error) bool {
 	if errors.As(err, &opErr) {
 		return opErr.Op == "dial" || opErr.Op == "proxyconnect"
 	}
-	// 上面两类没匹配上时按字符串兜底：net/http 对「连代理都没连上」用的是固定前缀，
+	// TLS 握手失败：连接建成了但还没写请求，同样属于「从未发出」。
+	// 和 Python 侧的 curl 35（SSL_CONNECT_ERROR）对应，两端判据要一致
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
+		return true
+	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return true
+	}
+	// 上面几类没匹配上时按字符串兜底：net/http 对「连代理都没连上」用的是固定前缀，
 	// 而各平台的底层错误类型不统一（Windows 是 connectex，Linux 是 ECONNREFUSED）
-	if strings.Contains(err.Error(), "proxyconnect") {
+	text := err.Error()
+	if strings.Contains(text, "proxyconnect") {
+		return true
+	}
+	if strings.Contains(text, "tls: handshake failure") || strings.Contains(text, "x509:") {
 		return true
 	}
 	// 剩下的一律按最坏情况处理。超时（net.Error.Timeout）定位不到卡在哪个阶段，
