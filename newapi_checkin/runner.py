@@ -37,6 +37,9 @@ _RETRYABLE = (api.NETWORK_ERROR, api.UNKNOWN) + _SHIELD_RETRYABLE
 # 源站业务失败/WAF 硬封禁可能是出口 IP 被源站临时风控，允许有限换 IP 后再判定。
 SOURCE_IP_SWAP_LIMIT = 5
 SOURCE_IP_SWAP_BACKOFF_SECONDS = 5
+# 一个账号累计换满这么多 IP 后，换 IP 优先复用本轮签到成功过的出口（见 _swap_proxy）。
+# 前几个 IP 是扫雷阶段，过早复用会一个坑反复踩；过了阈值再启用才有意义。
+PROVEN_REUSE_THRESHOLD = 10
 _SOURCE_IP_RETRYABLE = (api.FAILED, api.WAF_BLOCKED)
 # 源站/凭据/环境已经给出不可恢复结论：不再浪费重试，直接把账号标记为跳过。
 _SKIP_ON_FAILURE = (
@@ -135,6 +138,11 @@ class Runner:
         self._pool = None
         # 记录「由代理池分配」的代理：手动配置的代理出错时不换，池分配的才换
         self._pooled_proxies: dict[str, str] = {}
+        # 本账号累计换过的 IP 个数。换满 PROVEN_REUSE_THRESHOLD 后，换 IP 不再
+        # 只从池子里拿没试过的，而是优先复用本轮 mark_ok 过的成功出口
+        self._swap_total: dict[str, int] = {}
+        # 本轮签到成功过的池内代理（mark_ok 记录），供换 IP 复用
+        self._proven_proxies: set[str] = set()
         # 并行签到时这些状态会被多个工作线程同时读写
         self._state_lock = threading.RLock()
         self._browser_attempts: dict[str, int] = {}
@@ -234,24 +242,67 @@ class Runner:
             log.err("代理池里没有任何可用代理，且已要求必须走代理")
 
     def _swap_proxy(self, account: Account, reason: str = "net") -> Optional[str]:
-        """换一个新代理。拿不到替代品时保留原代理，绝不清空成直连。"""
+        """换一个新代理。拿不到替代品时保留原代理，绝不清空成直连。
+
+        换 IP 超过 PROVEN_REUSE_THRESHOLD 个之后（本账号累计），优先复用本轮
+        mark_ok 过的代理 —— 源站/盾大概率是某个具体出口 IP 的声誉问题，换掉它
+        不代表别的 IP 就通。已证明成功的出口通常比没试过的更能直接成事。
+        复用候选从「还没被拉黑」的成功 IP 里选，所以一个 IP 要么「证明过可用」、
+        要么「已死」，不会出现把刚换下来的死 IP 又捞回来的情况。
+        """
         if self._pool is None:
             return None
         with self._state_lock:
             old = self._pooled_proxies.get(account.name)
         if old:
             self._pool.mark_bad(old, reason)
-        # 先拿到替代品再切换：拿不到就继续用原来的，宁可重试失败也不直连
+        # 先拿可用代理；没有才走成功 IP 复用。拿不到就继续用原来的，宁可重试失败也不直连
         proxy = self._pool.acquire()
+        if proxy is None:
+            proxy = self._reuse_proven_proxy(account)
         if proxy:
+            self._swap_total[account.name] = self._swap_total.get(account.name, 0) + 1
             account.proxy = proxy
             with self._state_lock:
                 self._pooled_proxies[account.name] = proxy
-            log.warn(f"代理 {old or '<手动>'} 连目标站点失败，换用 {proxy}")
+            log.warn(f"代理 {old or '<手动>'} 连目标站点失败，换用 {proxy}"
+                     + (f"（复用本轮已成功 IP，本账号累计已换 "
+                        f"{self._swap_total[account.name]} 个）"
+                        if proxy in self._proven_proxies else ""))
             return proxy
         log.warn(f"代理 {old or '<手动>'} 连目标站点失败，但池里已无其他可用代理，"
                  f"继续用它重试（不降级直连）")
         return None
+
+    def _can_reuse_proven(self, account: Account) -> bool:
+        """是否允许启用成功 IP 复用。
+
+        换满阈值后才开：前几个 IP 还在扫雷，过早复用会一个坑反复踩。复用成功后
+        若再失败，旧 IP 仍被 mark_bad 拉黑、自动退出候选，不会无限震荡。
+        """
+        if self._swap_total.get(account.name, 0) < PROVEN_REUSE_THRESHOLD:
+            return False
+        return bool(self._proven_reuse_candidates())
+
+    def _proven_reuse_candidates(self, exclude: Optional[str] = None) -> list[str]:
+        """本轮签到成功过、且还没被拉黑的可复用代理。
+
+        真池与测试用的 FakePool 都以 _bad 集合表达拉黑，这里直接读 _bad，
+        不要求池子暴露 is_bad 接口。
+        """
+        if self._pool is None:
+            return []
+        bad = self._pool._bad if hasattr(self._pool, "_bad") else set()
+        return [p for p in self._proven_proxies if p != exclude and p not in bad]
+
+    def _reuse_proven_proxy(self, account: Account) -> Optional[str]:
+        """换满阈值后从成功 IP 里挑一个复用，保持池子现有的优选顺序。"""
+        if not self._can_reuse_proven(account):
+            return None
+        candidates = self._proven_reuse_candidates()
+        if not candidates:
+            return None
+        return candidates[0]
 
     def exit_ip(self, proxy: Optional[str]) -> Optional[str]:
         key = proxy or ""
@@ -788,6 +839,7 @@ class Runner:
         只补成功这一个方向：失败已经在 _swap_proxy 换 IP 时当场记过了。中途换过 IP 的
         话，成功记在最后那个代理名下，前面失败的几个各自记在自己名下，正好是我们想让
         平台看到的因果。手动配置的代理不记 —— 它不参与池子的优选排序。
+        成功的代理同时进 _proven_proxies：该账号或任何账号后续换 IP 超阈值时优先复用。
         """
         if self._pool is None or row.status not in log.OK_STATUSES:
             return
@@ -795,6 +847,7 @@ class Runner:
             proxy = self._pooled_proxies.get(account.name)
         if proxy:
             self._pool.mark_ok(proxy)
+            self._proven_proxies.add(proxy)
 
     def _report_proxy_feedback(self) -> None:
         """把本轮各代理的成败计数回传给平台，供下次预取时优选。
@@ -1292,7 +1345,12 @@ class Runner:
             )
 
         def _call_bound():
-            """AI 请求也走该账号的代理，别让视觉调用泄露真实出口 IP。"""
+            """AI 请求也走该账号的代理，别让视觉调用泄露真实出口 IP。
+
+            这里绑定的是**当前这一轮**的账号代理：账号在重试循环里换过 IP 后，
+            account.proxy 已更新，AI 会跟着用新的；而上一轮的旧代理在 _swap_proxy
+            里已经 mark_bad，不会再被 AI 捡回去。
+            """
             binder = getattr(ai, "use_proxy", None)
             if binder is None or not account.proxy:
                 return _call()

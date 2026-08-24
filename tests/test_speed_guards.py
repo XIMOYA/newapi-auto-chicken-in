@@ -6,6 +6,7 @@
 import math
 import threading
 import time
+from contextlib import contextmanager
 
 from newapi_checkin import client as api
 from newapi_checkin import config as cfgmod
@@ -654,6 +655,71 @@ class TestBrowserQueueDoesNotEatDeadline:
         runner._add_gate_wait(0.0)
         runner._add_gate_wait(-5.0)
         assert runner._take_gate_wait() == 0.0
+
+
+class TestAiProxyFollowsAccount:
+    """过盾流程里 AI 请求必须走账号当前的代理。
+
+    _call_bound 在每次 _solve_guarded 进入时读取 account.proxy 并绑定。
+    账号在重试循环里换过 IP 后，account.proxy 已更新，下一次过盾 AI 就
+    跟着新 IP 走 —— 视觉调用不会泄露旧出口。AI 请求自身连不上端点时仍
+    可破例自换，那是 VisionClient._ask 的事，本类只验证绑定语义。
+    """
+
+    def test_ai_uses_current_account_proxy(self, tmp_path, monkeypatch):
+        runner = _make_runner(tmp_path, monkeypatch)
+        account = runner.cfg.accounts[0]
+        account.proxy = "10.0.0.1:8080"
+        seen = {}
+
+        class FakeAI:
+            @contextmanager
+            def use_proxy(self, proxy):
+                seen["bound"] = proxy
+                yield
+
+        runner._ai = FakeAI()
+        monkeypatch.setattr(runner_mod.Runner, "ai", lambda self: runner._ai)
+        out = runner._solve_guarded(lambda **_kw: "done", account, None)
+        assert out == "done"
+        assert seen.get("bound") == "10.0.0.1:8080"
+
+    def test_ai_uses_updated_proxy_after_swap(self, tmp_path, monkeypatch):
+        """账号换过 IP 后，过盾再进时绑的是新 IP 而不是旧代理。"""
+        runner = _make_runner(tmp_path, monkeypatch)
+        account = runner.cfg.accounts[0]
+        account.proxy = "old:80"
+        seen = {}
+
+        class FakeAI:
+            @contextmanager
+            def use_proxy(self, proxy):
+                seen.setdefault("bound", []).append(proxy)
+                yield
+
+        runner._ai = FakeAI()
+        monkeypatch.setattr(runner_mod.Runner, "ai", lambda self: runner._ai)
+        runner._solve_guarded(lambda **_kw: "round-1", account, None)
+        account.proxy = "new:80"          # 模拟 _swap_proxy 换掉的出口
+        runner._solve_guarded(lambda **_kw: "round-2", account, None)
+        assert seen["bound"] == ["old:80", "new:80"]
+
+    def test_ai_not_bound_when_no_proxy(self, tmp_path, monkeypatch):
+        """账号没配池内代理时不绑定，保持原行为（不强制 AI 走任何代理）。"""
+        runner = _make_runner(tmp_path, monkeypatch)
+        account = runner.cfg.accounts[0]
+        account.proxy = None
+        called = []
+
+        class FakeAI:
+            def use_proxy(self, proxy):
+                called.append(proxy)
+                yield
+
+        runner._ai = FakeAI()
+        monkeypatch.setattr(runner_mod.Runner, "ai", lambda self: runner._ai)
+        runner._solve_guarded(lambda **_kw: "done", account, None)
+        assert called == []
 
 
 class TestShieldRetriesWithoutNewIP:

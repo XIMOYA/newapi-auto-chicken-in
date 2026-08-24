@@ -166,7 +166,12 @@ class VisionClient:
 
     @contextmanager
     def use_proxy(self, proxy: Optional[str]) -> Iterator[None]:
-        """在代码块内让**本线程**的 AI 请求走指定代理，退出时还原。"""
+        """在代码块内让**本线程**的 AI 请求走指定代理，退出时还原。
+
+        正常情况下 AI 全程跟着账号的出口 IP（调用方在过盾流程里绑定），
+        这里只是临时切换。绑定后的代理若连不上 AI 端点，_ask 的换 IP 分支
+        仍会破例另选 —— 保视觉调用可用，不因一个端点故障拖垮整个过盾。
+        """
         previous = self.current_proxy()
         self._local.proxy = proxy or None
         try:

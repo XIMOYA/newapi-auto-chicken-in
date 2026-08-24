@@ -670,6 +670,83 @@ class TestOneProxyPerAccount:
 
 
 # --------------------------------------------------------------------------- #
+# 成功 IP 复用（换满阈值后，优先复用本轮签到成功的出口）
+# --------------------------------------------------------------------------- #
+
+
+class TestProvenProxyReuse:
+    """账号换 IP 超过 PROVEN_REUSE_THRESHOLD 个后，池里没有新 IP 时复用
+    本轮 mark_ok 过的代理。旧 IP 仍走 mark_bad，绝不复用已拉黑的出口。"""
+
+    def _runner_with_proven(self, monkeypatch, tmp_path, proven):
+        runner = _make_runner(monkeypatch, tmp_path, pool_proxies=[])
+        # 池已耗尽：acquire 拿不到任何新 IP，只能靠成功 IP 复用
+        runner._proven_proxies = set(proven)
+        return runner
+
+    def test_below_threshold_never_reuses(self, monkeypatch, tmp_path):
+        runner = self._runner_with_proven(monkeypatch, tmp_path, ["ok:80"])
+        account = runner.cfg.accounts[0]
+        runner._swap_total[account.name] = runner_mod.PROVEN_REUSE_THRESHOLD - 1
+        assert runner._reuse_proven_proxy(account) is None
+        assert account.proxy != "ok:80"
+
+    def test_at_threshold_reuses_proven(self, monkeypatch, tmp_path):
+        runner = self._runner_with_proven(monkeypatch, tmp_path, ["ok:80"])
+        account = runner.cfg.accounts[0]
+        runner._swap_total[account.name] = runner_mod.PROVEN_REUSE_THRESHOLD
+        assert runner._reuse_proven_proxy(account) == "ok:80"
+
+    def test_swap_prefers_fresh_then_falls_back_to_proven(self, monkeypatch, tmp_path):
+        """有没用过的新 IP 时先换新的；池空了才复用成功 IP。"""
+        runner = _make_runner(monkeypatch, tmp_path, pool_proxies=["fresh:80"])
+        runner._proven_proxies = {"ok:80"}
+        account = runner.cfg.accounts[0]
+        runner._swap_total[account.name] = runner_mod.PROVEN_REUSE_THRESHOLD
+        runner._assign_proxy(account)
+        assert account.proxy == "fresh:80"
+        runner._swap_proxy(account)
+        assert account.proxy == "ok:80"
+        assert "fresh:80" in runner._pool._bad
+
+    def test_reuse_is_blocked_for_mark_bad_proxy(self, monkeypatch, tmp_path):
+        """成功 IP 一旦被拉黑就退出复用候选，不会反复踩同一个坑。"""
+        runner = _make_runner(monkeypatch, tmp_path, pool_proxies=[])
+        runner._proven_proxies = {"ok:80"}
+        runner._pool.mark_bad("ok:80")
+        account = runner.cfg.accounts[0]
+        runner._swap_total[account.name] = runner_mod.PROVEN_REUSE_THRESHOLD
+        assert runner._reuse_proven_proxy(account) is None
+
+    def test_reused_proxy_failure_kills_it_permanently(self, monkeypatch, tmp_path):
+        """复用成功 IP 后又失败 -> 被 mark_bad，彻底退出候选，不会无限震荡。"""
+        runner = _make_runner(monkeypatch, tmp_path, pool_proxies=["fresh:80"])
+        runner._proven_proxies = {"ok:80"}
+        account = runner.cfg.accounts[0]
+        runner._swap_total[account.name] = runner_mod.PROVEN_REUSE_THRESHOLD
+        runner._assign_proxy(account)
+        runner._swap_proxy(account)          # fresh 失败 -> 复用 ok
+        assert account.proxy == "ok:80"
+        runner._swap_proxy(account)          # ok 也失败 -> 拉黑，且无任何替代可用
+        assert "ok:80" in runner._pool._bad
+        # 拿不到替代品时保留原代理继续重试（绝不降级直连）—— 这是既定行为
+        assert account.proxy == "ok:80"
+        # 但 ok 已拉黑，复用候选里不可能再出现它
+        assert runner._reuse_proven_proxy(account) is None
+
+    def test_proven_success_tracks_ok_and_reuse_updates_swap_total(self, monkeypatch, tmp_path):
+        """mark_ok 记录进 _proven_proxies；每次换 IP 都累计 _swap_total。"""
+        runner = _make_runner(monkeypatch, tmp_path, pool_proxies=["fresh:80"])
+        account = runner.cfg.accounts[0]
+        runner._swap_total[account.name] = runner_mod.PROVEN_REUSE_THRESHOLD
+        runner._assign_proxy(account)
+        # 模拟该账号在 fresh 上签到成功：此时 fresh 尚未进 proven
+        assert "fresh:80" not in runner._proven_proxies
+        runner._record_proxy_success(account, runner_mod.log.SummaryRow(account.name, "success", "S0", ""))
+        assert "fresh:80" in runner._proven_proxies
+
+
+# --------------------------------------------------------------------------- #
 # 单 IP 多账号共用
 # --------------------------------------------------------------------------- #
 
