@@ -3,8 +3,10 @@
 # New API 每日自动签到（GitHub Actions）
 #
 # 触发方式：
-#   1. schedule —— 每天北京时间 00:05（GitHub Actions 的 cron 使用 UTC，
-#      UTC 16:05 = 北京 00:05）。注意：schedule 触发不保证准点，可能有延迟。
+#   1. schedule —— 每天北京时间 04:00（GitHub Actions 的 cron 使用 UTC，
+#      UTC 20:00 = 北京 04:00）。注意：schedule 触发不保证准点，可能有延迟。
+#      排在 proxy-sweep.yml（北京 03:00 代理体检）之后一小时：那趟把 Actions 视角的
+#      代理成败回传平台了，这里拉 /api/proxies/available 就能吃上最新的优选排序。
 #   2. workflow_dispatch —— 仓库 Actions 页面手动运行，可选 dry-run 只验连通性，
 #      也可临时改分片大小。
 #
@@ -43,8 +45,9 @@ name: 每日签到
 
 on:
   schedule:
-    # UTC 16:05 = 北京时间 00:05
-    - cron: '5 16 * * *'
+    # UTC 20:00 = 北京时间 04:00。比代理体检（北京 03:00）晚一小时，
+    # 好让体检回传的实测排序先落到平台上
+    - cron: '0 20 * * *'
   workflow_dispatch:
     inputs:
       dry_run:

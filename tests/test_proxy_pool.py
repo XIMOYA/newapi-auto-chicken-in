@@ -775,3 +775,97 @@ class TestDesiredProxyCount:
     def test_never_asks_for_zero(self, monkeypatch, tmp_path):
         runner = self._runner(monkeypatch, tmp_path, 4)
         assert runner._desired_proxies(0) == 51
+
+
+class TestProxySweep:
+    """代理全量体检：从本机（Actions）视角把平台上的存活代理测一遍再回传。
+
+    存在的理由是出口不同：平台自己的 refresh/speedtest 走服务器出口，而签到跑在
+    Actions 上，代理商封机房 IP 段是常事。所以「服务器那边最优」不等于「Actions 能用」。
+
+    这组断言里最要紧的一条是「时间盒到了，没轮到的代理不记账」——把没测的记成失败会
+    诬陷好代理，反而把平台的优选排序搞坏，比不体检更糟。
+    """
+
+    @staticmethod
+    def _pool(addrs, alive, **cfg_kw):
+        kw = {"enabled": True, "max_workers": 4, "timeout": 1,
+              "remote_url": "https://panel.example.com/api/proxies/available"}
+        kw.update(cfg_kw)
+        pool = ProxyPool(ProxyPoolConfig(**kw))
+        pool._fetch_remote = lambda: list(addrs)
+        pool._test_one = lambda p: 0.05 if p in alive else None
+        return pool
+
+    def test_every_proxy_gets_a_verdict(self):
+        pool = self._pool([f"p{i}:80" for i in range(6)], {"p0:80", "p3:80"})
+        stats = pool.sweep_remote(minutes=1)
+        assert stats["total"] == 6 and stats["tested"] == 6
+        assert stats["ok"] == 2 and stats["fail"] == 4
+        assert len(pool.feedback_snapshot()) == 6      # 六条都有账
+
+    def test_alive_counts_ok_dead_counts_net_fail(self):
+        """记的是 report_feedback 要导出的那三个计数，平台按它们分档排序。"""
+        pool = self._pool(["good:80", "bad:80"], {"good:80"})
+        pool.sweep_remote(minutes=1)
+        snap = {i["addr"]: i for i in pool.feedback_snapshot()}
+        assert (snap["good:80"]["ok"], snap["good:80"]["net_fail"]) == (1, 0)
+        assert (snap["bad:80"]["ok"], snap["bad:80"]["net_fail"]) == (0, 1)
+        # 体检测的是连通性，不该往「被站点拦」那一栏记
+        assert all(i["block_fail"] == 0 for i in snap.values())
+
+    def test_empty_remote_list_reports_a_reason(self):
+        """平台一条都没给时要说清原因，不能静默返回成功。"""
+        pool = self._pool([], set())
+        pool._fetch_remote = lambda: None
+        pool.last_error = "远程代理预取 HTTP 500"
+        stats = pool.sweep_remote(minutes=1)
+        assert stats["total"] == 0
+        assert "500" in stats["reason"]
+
+    def test_sweep_does_not_stop_early_like_refresh(self):
+        """refresh 凑够量就收手，体检必须每条都测 —— 否则回传的样本是偏的。"""
+        pool = self._pool([f"p{i}:80" for i in range(20)], {f"p{i}:80" for i in range(20)})
+        stats = pool.sweep_remote(minutes=1)
+        assert stats["tested"] == 20 and stats["ok"] == 20
+
+
+class TestTestManyResultCallback:
+    """_test_many 的逐条回调：体检靠它记账，所以「哪条测了」必须精确。"""
+
+    def test_callback_fires_for_alive_and_dead_alike(self):
+        pool = ProxyPool(ProxyPoolConfig(enabled=True, max_workers=2, timeout=1))
+        pool._test_one = lambda p: 0.01 if p.startswith("ok") else None
+        seen = {}
+        pool._test_many(["ok1:80", "bad1:80", "ok2:80"], on_result=lambda p, l: seen.update({p: l}))
+        assert set(seen) == {"ok1:80", "bad1:80", "ok2:80"}
+        assert seen["bad1:80"] is None and seen["ok1:80"] is not None
+
+    def test_callback_fires_even_when_need_is_reached(self):
+        """凑够 need 会 break，但那一条的结论已经出来了，不能漏记。"""
+        pool = ProxyPool(ProxyPoolConfig(enabled=True, max_workers=1, timeout=1))
+        pool._test_one = lambda p: 0.01
+        seen = []
+        alive = pool._test_many(["a:80", "b:80", "c:80"], need=1,
+                                on_result=lambda p, l: seen.append(p))
+        assert len(alive) == 1
+        assert len(seen) >= 1                       # 至少把命中的那条记上了
+        assert set(seen) <= {"a:80", "b:80", "c:80"}
+
+    def test_untested_proxies_get_no_callback_when_deadline_hits(self):
+        """时间盒到了就收工，没轮到的一条都不该回调 —— 记成失败等于诬陷。"""
+        import time as _t
+
+        pool = ProxyPool(ProxyPoolConfig(enabled=True, max_workers=1, timeout=1))
+
+        def slow(proxy):
+            _t.sleep(0.05)
+            return 0.01
+
+        pool._test_one = slow
+        seen = []
+        candidates = [f"p{i}:80" for i in range(40)]
+        pool._test_many(candidates, deadline=_t.monotonic() + 0.12,
+                        on_result=lambda p, l: seen.append(p))
+        assert len(seen) < len(candidates)          # 确实没测完
+        assert len(set(seen)) == len(seen)          # 没有重复记账

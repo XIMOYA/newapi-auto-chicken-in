@@ -47,9 +47,11 @@ python main.py -v
 python desktop.py                 # 图形面板
 python desktop.py --daemon        # 后台常驻
 
-# 3) GitHub Actions（见 .github/workflows/checkin.yml）
+# 3) GitHub Actions（见 .github/workflows/）
 #    把 config.json 的 base64 放进 CONFIG_JSON_B64 secret 即可
-#    账号多时自动切片并行，跑完只发一封汇总邮件
+#    checkin.yml      北京 04:00 签到，账号多时自动切片并行，跑完只发一封汇总邮件
+#    proxy-sweep.yml  北京 03:00 代理体检，实测结果回传平台，供一小时后的签到优选
+#    test.yml         每次 push 跑 pytest / go test / vue-tsc 三端回归
 ```
 
 另有一个**配置管理平台**（`server/` + `web/`，单二进制含前端）：网页端管账号与凭据、
@@ -62,6 +64,10 @@ python desktop.py --daemon        # 后台常驻
   跑完把每个 IP 的真实成败回传平台供优选排序。同一出口默认最多服务 4 个账号
   （`proxy_pool.max_accounts_per_ip`），预取量按这个上限折算，几百个账号也不用抓
   几百个代理
+- **代理体检**：签到前一小时（北京 03:00）单独跑一趟，把平台上的存活代理从
+  **Actions 自己的出口**全量实测再回传。平台自带的 refresh/speedtest 走的是服务器
+  出口，而代理商封机房 IP 段是常事 —— 服务器那边通的代理到了 Actions 手里可能全是
+  废的，光靠平台自测选出来的「最优」名不副实。入口是 `main.py --proxy-sweep`
 - **分片并行**：账号按每片 N 个切开并行跑，各片不重叠、各自维护代理池
 - **邮件日报**：HTML 汇总表 + 按站点的额度总览（下面第二、三章详说）
 - **凭据保活**：定时主动 refresh 让代次滚动，避免隔天被判重放（下面第一章详说）

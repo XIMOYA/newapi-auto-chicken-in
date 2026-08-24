@@ -407,7 +407,7 @@ class ProxyPool:
         return out
 
     def _test_many(self, candidates: list[str], need: Optional[int] = None,
-                   deadline: Optional[float] = None) -> list[str]:
+                   deadline: Optional[float] = None, on_result=None) -> list[str]:
         """受控派发并发测通，结果按延迟升序排列。
 
         不一次性 submit 全部候选：候选常以千计，一次全提交会把几万个 future
@@ -417,6 +417,10 @@ class ProxyPool:
         返回的可用代理按延迟从小到大排序（快的在前），这样 acquire() 顺序
         取优时拿到的就是响应最快的出口 IP。凑够 need 条或到达 deadline 就
         立刻收手，不等剩下的慢连接超时。
+
+        on_result(proxy, latency) 每测完一条回调一次，latency 为 None 表示不通。
+        全量体检（sweep_remote）靠它逐条记账 —— 只看返回值分不清「测了但没通」和
+        「时间盒到了压根没测」，把后者也记成失败会诬陽好代理。
         """
         if not candidates:
             return []
@@ -434,6 +438,14 @@ class ProxyPool:
                 futures[pool.submit(self._test_one, proxy)] = proxy
                 next_idx += 1
             while futures:
+                # 硬检查放在最前面：下面给 as_completed 的 timeout 有 0.1 秒下限
+                # （不能传负数），而外层循环每完成一批就重进一次。少了这道检查，
+                # 每轮都会白给 0.1 秒，探测比这还快时 deadline 就形同虚设 ——
+                # 时间盒到点不停，全量候选会被一路测到底
+                if deadline is not None and time.monotonic() >= deadline:
+                    log.debug(f"代理测通到达时间盒，已测 {tested}/{len(candidates)} 条，"
+                              f"收到 {len(alive)} 条可用")
+                    break
                 timeout = None if deadline is None else max(0.1, deadline - time.monotonic())
                 try:
                     for future in as_completed(futures, timeout=timeout):
@@ -443,6 +455,10 @@ class ProxyPool:
                             latency = future.result()
                         except Exception:  # noqa: BLE001 - 探测失败一律按不通
                             latency = None
+                        if on_result is not None:
+                            # 回调放在最前面：下面可能因为凑够 need 而 break，
+                            # 但这一条的结论已经出来了，不能漏记
+                            on_result(proxy, latency)
                         if latency is not None:
                             alive.append((latency, proxy))
                             if need is not None and len(alive) >= need:
@@ -471,6 +487,54 @@ class ProxyPool:
         """当前还能独占分配的代理数量（未使用且未拉黑）。"""
         with self._lock:
             return sum(1 for p in self._available if p not in self._used and p not in self._bad)
+
+    def sweep_remote(self, minutes: int = 50) -> dict:
+        """把平台上的存活代理从本机视角全量体检一遍，结果记进计数供 report_feedback 回传。
+
+        为什么值得单独跑一趟：平台自己的刷新和测速用的是**服务器的出口**，而签到跑在
+        GitHub Actions 上。同一个代理在服务器那边通、在 Actions 这边未必通（代理商封
+        机房 IP 段是常事），光靠平台自测选出来的"最优"到了 Actions 手里可能全是废的。
+        这趟体检的产出就是让平台的优选顺序反映「Actions 用起来好不好」。
+
+        和 refresh() 的区别是目标不同：refresh 凑够够用的量就收手，这里要每条都有结论，
+        所以不设 need。时间盒到了就带着已有结论收工 —— 已测出来的那部分照样有价值，
+        没轮到的那些不记账（记成失败会诬陷好代理）。
+
+        返回统计字典，供调用方打日志。这里不负责回传，回传仍走 report_feedback。
+        """
+        addrs = self._fetch_remote()
+        if not addrs:
+            return {"total": 0, "tested": 0, "ok": 0, "fail": 0,
+                    "reason": self.last_error or "平台没有返回存活代理"}
+
+        budget = max(1, int(minutes)) * 60
+        deadline = time.monotonic() + budget
+        started = time.monotonic()
+        counted = {"ok": 0, "fail": 0}
+
+        def record(proxy: str, latency) -> None:
+            # 复用签到那套记账：mark_ok / mark_bad 写的就是 report_feedback 要导出的计数，
+            # 平台侧 sortProxiesByFeedback 也是按这三个字段分档的
+            if latency is None:
+                self.mark_bad(proxy, "net")
+                counted["fail"] += 1
+            else:
+                self.mark_ok(proxy)
+                counted["ok"] += 1
+
+        log.step(f"代理全量体检：平台给了 {len(addrs)} 条存活代理，"
+                 f"并发 {self.cfg.max_workers}，时间盒 {minutes} 分钟")
+        self._test_many(addrs, need=None, deadline=deadline, on_result=record)
+        tested = counted["ok"] + counted["fail"]
+        elapsed = time.monotonic() - started
+        if tested < len(addrs):
+            log.warn(f"时间盒用尽，{len(addrs) - tested} 条没轮到（不计入回传，"
+                     "免得把没测的记成失败）")
+        return {
+            "total": len(addrs), "tested": tested,
+            "ok": counted["ok"], "fail": counted["fail"],
+            "elapsed": elapsed,
+        }
 
     def preflight(self) -> int:
         """开跑前自筛：在本机快测预取来的代理，当场剔掉连不上的，返回剔除数量。

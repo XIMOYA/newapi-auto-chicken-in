@@ -1,0 +1,85 @@
+# ============================================================================ #
+# .github/workflows/proxy-sweep.yml
+# 代理全量体检（GitHub Actions）
+#
+# 干什么：把配置管理平台上的存活代理，从 **Actions 自己的出口** 实测一遍，把成败
+# 回传平台，让平台的优选顺序反映「Actions 用起来好不好」。
+#
+# 为什么不能靠平台自测：平台已经有 /api/proxies/refresh 和 /api/proxies/speedtest，
+# 但那是**服务器的出口**在测。代理商封机房 IP 段是常事，服务器那边通的代理到了
+# Actions 手里可能全是废的。选出来的"最优"名不副实，签到就会一上来连吃几个死代理。
+#
+# 触发方式：
+#   1. schedule —— 每天北京时间 03:00（cron 用 UTC，19:00 UTC = 北京 03:00）。
+#      故意排在签到（北京 04:00）前一小时：体检结果一回传，紧接着的签到拉
+#      /api/proxies/available 就能直接吃上最新排序。
+#      注意 schedule 不保证准点，所以时间盒必须留足余量。
+#   2. workflow_dispatch —— 手动跑，可临时改时间盒。
+#
+# 时间盒：默认 50 分钟，硬上限由 timeout-minutes 兜住。到点带着已测出的结论收工，
+# 没轮到的代理不记账 —— 把没测的记成失败会诬陷好代理，反而把平台排序搞坏。
+#
+# 配置来源与签到完全一致（CONFIG_JSON_B64 secret），所以 proxy_pool.remote_url
+# 和令牌不用另外配一份。
+# ============================================================================ #
+
+name: 代理体检
+
+on:
+  schedule:
+    # 北京 03:00 = UTC 19:00，比签到（北京 04:00）早一小时
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: '时间盒（分钟），到点带着已有结论收工'
+        required: false
+        default: '50'
+
+permissions:
+  contents: read
+
+# 和签到用不同的 group：体检慢一点不该把签到挤掉，签到也不该取消体检
+concurrency:
+  group: proxy-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    # 比时间盒多留 10 分钟给装依赖和回传，避免 job 被砍在回传之前 ——
+    # 测了一小时却没传出去是最糟的结果
+    timeout-minutes: 60
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖（剔掉浏览器相关，测代理不需要）
+        run: |
+          # 版本仍取自 requirements-ci.txt，只是去掉两个几百 MB 的浏览器包
+          grep -vE '^(camoufox|patchright)' requirements-ci.txt > /tmp/req-sweep.txt
+          pip install -r /tmp/req-sweep.txt
+
+      - name: 写入配置（来自 GitHub Secrets）
+        env:
+          CONFIG_JSON_B64: ${{ secrets.CONFIG_JSON_B64 }}
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+        run: |
+          if [ -n "$CONFIG_JSON_B64" ]; then
+            printf '%s' "$CONFIG_JSON_B64" | base64 --decode > config.json
+          elif [ -n "$CONFIG_JSON" ]; then
+            printf '%s' "$CONFIG_JSON" > config.json
+          else
+            echo "::error::未设置 CONFIG_JSON_B64 secret。请添加完整 config.json 的 base64 文本；旧 CONFIG_JSON 仍兼容"
+            exit 2
+          fi
+          python -c "import json,pathlib;json.loads(pathlib.Path('config.json').read_text(encoding='utf-8'));print('config.json 校验通过')"
+
+      - name: 全量体检并回传
+        run: python main.py --proxy-sweep --proxy-sweep-minutes "${{ inputs.minutes || '50' }}" -v

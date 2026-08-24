@@ -67,6 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="不签到：递归读 DIR 下各分片的结果 JSON，合并成一封邮件发出。"
              "缺片会在邮件里明确标注，不会静默少人",
     )
+    parser.add_argument(
+        "--proxy-sweep", action="store_true",
+        help="不签到：把平台上的存活代理从本机视角全量实测一遍，把成败回传平台供优选"
+             "排序。平台自测用的是服务器出口，Actions 的出口未必一样，所以要单独跑",
+    )
+    parser.add_argument(
+        "--proxy-sweep-minutes", type=int, default=50, metavar="N",
+        help="--proxy-sweep 的时间盒（分钟，默认 50）。到点带着已测出的结论收工，"
+             "没轮到的不记账",
+    )
     parser.add_argument("--dry-run", action="store_true",
                         help="只验证当前登录方式的凭据与连通性，不执行签到")
     parser.add_argument(
@@ -262,7 +272,58 @@ def _merged_quota_overview(cfg, rows: list) -> str:
         return ""
 
 
+def _sweep_proxies(cfg, minutes: int) -> int:
+    """全量体检平台上的存活代理，把成败回传平台。不签到、不碰浏览器。
+
+    单独跑一趟的理由：平台自己的刷新和测速走的是**服务器出口**，而签到跑在 GitHub
+    Actions 上。代理商封机房 IP 段是常事，服务器那边通的代理到了 Actions 手里可能全是
+    废的。这趟体检让平台的优选顺序反映「Actions 用起来好不好」，紧接着的签到就能直接
+    受益。
+    """
+    from newapi_checkin.proxy_pool import ProxyPool
+
+    if not cfg.proxy_pool.enabled:
+        log.err("proxy_pool.enabled 为 false，没有代理池可体检")
+        return 2
+    if not cfg.proxy_pool.remote_url:
+        log.err("proxy_pool.remote_url 未配置：体检的对象是平台上的代理，必须能拉到它")
+        return 2
+
+    pool = ProxyPool(cfg.proxy_pool)
+    stats = pool.sweep_remote(minutes)
+    if not stats.get("total"):
+        log.err(f"没有可体检的代理：{stats.get('reason', '未知原因')}")
+        return 1
+
+    ok, tested, total = stats["ok"], stats["tested"], stats["total"]
+    rate = (ok / tested * 100) if tested else 0.0
+    log.info(f"体检完成：测了 {tested}/{total} 条，通 {ok} 条、不通 {stats['fail']} 条"
+             f"（可用率 {rate:.0f}%，耗时 {stats.get('elapsed', 0):.0f}s）")
+
+    # 回传是这趟的唯一产出，失败要明确报错 —— 不回传的话平台的排序不会有任何变化，
+    # 整趟体检就白跑了
+    sent, detail = pool.report_feedback(source=_run_source())
+    if not sent:
+        log.err(f"实测结果回传平台失败：{detail}")
+        return 1
+    log.ok(f"实测结果已回传平台（{detail}）")
+    return 0
+
+
+def _run_source() -> str:
+    """回传时标注来源，方便在平台日志里区分是哪个环境测的。"""
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if repo:
+        return f"github-actions（{repo}）"
+    import socket
+
+    return socket.gethostname() or "proxy-sweep"
+
+
 def _send_merged_report(cfg, directory) -> int:
+
+
+
 
     """把各分片落盘的结果合并成一封邮件发出（Actions 汇总 job 的入口）。
 
@@ -346,6 +407,11 @@ def main(argv=None) -> int:
     # 同样放在远程同步之后 —— SMTP 配置也可能是从远程配置平台拉下来的
     if args.send_summary:
         return _send_merged_report(cfg, args.send_summary)
+
+    # 代理全量体检：只测代理并回传，不签到。放在远程同步之后，保证 remote_url 和
+    # 令牌用的都是平台上的最新值
+    if args.proxy_sweep:
+        return _sweep_proxies(cfg, args.proxy_sweep_minutes)
 
     # 按分片挑出本进程该跑的账号。放在远程同步之后：平台上刚加的账号要能被切进来
     shard_names = None

@@ -91,3 +91,77 @@ def test_headless_cli_overrides_config(monkeypatch):
     assert seen["options"].headful is False
     assert seen["options"].manual is False
     assert seen["options"].parallelism == 1
+
+
+def test_parser_supports_proxy_sweep():
+    args = main.build_parser().parse_args(["--proxy-sweep"])
+    assert args.proxy_sweep is True
+    assert args.proxy_sweep_minutes == 50          # 默认时间盒
+    args = main.build_parser().parse_args(["--proxy-sweep", "--proxy-sweep-minutes", "20"])
+    assert args.proxy_sweep_minutes == 20
+
+
+class TestProxySweepEntry:
+    """--proxy-sweep 的入口：体检平台上的代理并回传，不签到。
+
+    回传是这趟的唯一产出 —— 测得再准，传不上去平台排序就一点没变，整趟白跑。
+    所以回传失败必须以非 0 退出，让 Actions 亮红而不是静静地"成功"。
+    """
+
+    @staticmethod
+    def _cfg(enabled=True, remote_url="https://panel.example.com/api/proxies/available"):
+        from newapi_checkin.config import build_config
+
+        return build_config({
+            "proxy_pool": {"enabled": enabled, "remote_url": remote_url},
+            "accounts": [{"name": "A", "url": "https://a.example.com", "cookie": "c"}],
+        })
+
+    def _fake_pool(self, monkeypatch, stats, feedback=(True, "已回传 3 条")):
+        calls = {}
+
+        class FakePool:
+            def __init__(self, cfg):
+                calls["cfg"] = cfg
+
+            def sweep_remote(self, minutes):
+                calls["minutes"] = minutes
+                return stats
+
+            def report_feedback(self, source="github-actions"):
+                calls["source"] = source
+                return feedback
+
+        monkeypatch.setattr("newapi_checkin.proxy_pool.ProxyPool", FakePool)
+        return calls
+
+    def test_disabled_pool_is_refused(self):
+        assert main._sweep_proxies(self._cfg(enabled=False), 50) == 2
+
+    def test_missing_remote_url_is_refused(self):
+        """体检的对象是平台上的代理，拉不到就没得测。"""
+        assert main._sweep_proxies(self._cfg(remote_url=""), 50) == 2
+
+    def test_happy_path_reports_and_returns_zero(self, monkeypatch):
+        calls = self._fake_pool(monkeypatch, {"total": 9, "tested": 9, "ok": 7,
+                                              "fail": 2, "elapsed": 12.0})
+        assert main._sweep_proxies(self._cfg(), 30) == 0
+        assert calls["minutes"] == 30              # 时间盒透传下去了
+        assert calls["source"]                     # 带了来源标注
+
+    def test_failed_feedback_exits_nonzero(self, monkeypatch):
+        """传不上去就等于没体检，不能报成功。"""
+        self._fake_pool(monkeypatch, {"total": 9, "tested": 9, "ok": 7, "fail": 2},
+                        feedback=(False, "HTTP 500"))
+        assert main._sweep_proxies(self._cfg(), 50) == 1
+
+    def test_empty_target_list_exits_nonzero(self, monkeypatch):
+        self._fake_pool(monkeypatch, {"total": 0, "tested": 0, "ok": 0, "fail": 0,
+                                      "reason": "平台没有返回存活代理"})
+        assert main._sweep_proxies(self._cfg(), 50) == 1
+
+    def test_source_marks_github_actions(self, monkeypatch):
+        calls = self._fake_pool(monkeypatch, {"total": 1, "tested": 1, "ok": 1, "fail": 0})
+        monkeypatch.setenv("GITHUB_REPOSITORY", "me/repo")
+        main._sweep_proxies(self._cfg(), 50)
+        assert "me/repo" in calls["source"]
