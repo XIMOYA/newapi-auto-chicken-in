@@ -15,10 +15,18 @@ name: CI
 
 on:
   push:
+    # 纯文档和重建产物不改变任何行为，没必要占三个 runner 跑全套。
+    # 注意 paths-ignore 是「全部文件都命中才跳过」，混合提交照样会跑
+    paths-ignore:
+      - '**.md'
+      - 'server/newapi-config-server'
+      - 'server/newapi-config-server-linux-amd64'
+      - 'assets/**'
   pull_request:
 
 permissions:
   contents: read
+  checks: write        # 发布测试报告注解要写 checks
 
 # 同一 ref 有新提交时自动取消旧的 CI 运行，避免排队浪费 runner
 concurrency:
@@ -27,8 +35,13 @@ concurrency:
 
 jobs:
   python:
-    name: Python pytest
+    name: Python pytest (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false        # 一个版本挂掉也要看另一个的结果，否则分不清是版本问题还是代码问题
+      matrix:
+        # 3.10 是开发机在用的版本，3.11 是 checkin.yml 线上跑签到的版本，两个都得保证
+        python-version: ['3.10', '3.11']
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -36,16 +49,32 @@ jobs:
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
-      - name: 安装依赖（CI 精简依赖 + pytest）
+      - name: 安装依赖（CI 精简依赖 + 锁定版本的 pytest）
         run: |
           pip install -r requirements-ci.txt
-          pip install pytest
+          # pytest 版本必须和 requirements.txt 锁的一致。装最新版会让 CI 随上游发版
+          # 随机变红：pytest 8.2 就改过 importorskip 的语义（只对 ModuleNotFoundError
+          # 跳过），这类变化本地复现不出来。版本只在 requirements.txt 维护一份
+          PYTEST_PIN=$(grep -E '^pytest==' requirements.txt)
+          test -n "$PYTEST_PIN" || { echo "requirements.txt 里找不到锁定的 pytest 版本"; exit 1; }
+          echo "使用 $PYTEST_PIN"
+          pip install "$PYTEST_PIN"
 
       - name: 运行 pytest
-        run: pytest -q
+        # JUnit 报告让失败明细能出现在 PR/提交的注解里。原来只有一句
+        # "Process completed with exit code 1"，排查得去翻原始日志
+        run: pytest -q --junitxml=junit/results-${{ matrix.python-version }}.xml
+
+      - name: 发布测试报告
+        if: always()          # 失败时才最需要它
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: junit/results-${{ matrix.python-version }}.xml
+          check_name: pytest 明细 (${{ matrix.python-version }})
+          fail_on_failure: false      # 失败与否由上一步的退出码决定，这里只负责展示
 
   go:
     name: Go vet & test
