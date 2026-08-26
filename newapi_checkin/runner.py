@@ -150,6 +150,9 @@ class Runner:
         # 凭据回写平台失败的账号 -> 原因。轮转发生在 refresh 回调深处，那里改不了最终
         # 汇总行，所以先记下来，账号跑完时统一把这一轮判成失败
         self._writeback_failures: dict[str, str] = {}
+        # 本轮已尝试过「用 GitHub user_session 重新签发凭据」的账号。签发会换出全新
+        # sid 把上一条当场作废，失败了再签只是继续耗 GitHub 那把会话的信誉，所以限一次
+        self._reissued: set[str] = set()
         # 排队等浏览器槽位的耗时。并行签到时每个账号 worker 记自己的，
         # 由重试主循环取走并加回时间盒：等全局资源不该算这个账号的过盾时间。
         self._gate_waits = threading.local()
@@ -1090,6 +1093,26 @@ class Runner:
             return self._row(account, result, "S1")
         if result.kind == api.NETWORK_ERROR:
             return self._row(account, result, "S1")
+
+        # 凭据过期是可自救的：用账号的 GitHub user_session 走 OAuth 签发一条新的，
+        # 再跑一轮。签发和签到共用同一个出口代理，站点看到的是同一个 IP 在换会话。
+        if self._tabiai_refresh_expired(result):
+            reissued, why = self._reissue_tabiai_cookie(account, record)
+            if not reissued:
+                # why 会进邮件：user_session 也失效这种情况必须让人看见
+                return self._row(account, result, "S1", detail=why)
+            result = self._tabiai_api_call(account, None)
+            if result.kind in _SETTLED:
+                return self._row(account, result, "S1",
+                                 detail="原凭据已失效，已用 GitHub user_session 重新签发")
+            if result.kind == api.NETWORK_ERROR:
+                return self._row(account, result, "S1")
+            if self._tabiai_refresh_expired(result):
+                # 新签发的凭据当场又被拒：再签也是同样结果，交给人看
+                return self._row(account, result, "S1",
+                                 detail="重新签发的凭据仍被站点拒绝，请检查 GitHub "
+                                        "user_session 是否属于该站点账号")
+            # 其余情况（最典型是 TURNSTILE_REQUIRED）落到下面的分支照原链路继续处理
         # Turnstile 不是 CF 盾，但脚本浏览器（S2/S3 那套 + AI）能代为点选拿 token。
         # 首选仍是 CDP 接管本机真实 Chrome；走到这里说明那条路没给出 token
         # （最典型的是 Actions 云端根本没有 Chrome 可接管），于是把这一轮交给过盾链，
@@ -1229,6 +1252,52 @@ class Runner:
         if configured:
             return configured
         return normalize_refresh_cookie(self.store.get(account.slug).refresh_cookie or "")
+
+    @staticmethod
+    def _tabiai_refresh_expired(result: api.ApiResult) -> bool:
+        """这次失败是不是「refresh 凭据不能用了」。
+
+        判据用 path 而不是 message 文字：refresh 那一步失败时 ApiResult.path 一定是
+        TABIAI_REFRESH_PATH（见 tabiai.TabiAIClient.refresh），而站点的提示文案随时
+        会改。AUTH_UNAUTHORIZED（过期/被新代次取代）和 AUTH_SESSION_REVOKED（判重放
+        或别处登出）都归到这里 —— 两者都只有重新签发一条才能救回来。
+        """
+        from .tabiai import TABIAI_REFRESH_PATH
+
+        return result.kind == api.AUTH_FAILED and result.path == TABIAI_REFRESH_PATH
+
+    def _reissue_tabiai_cookie(self, account: Account, record) -> tuple[bool, str]:
+        """凭据过期时用账号的 GitHub user_session 走 OAuth 重新签发一条。
+
+        返回 (是否签发成功, 失败原因)。失败原因会进汇总行的 detail，也就是会出现在
+        邮件里 —— user_session 自己也过期这种情况必须让人看见，否则每天都白跑一轮。
+
+        全程走该账号的代理（见 github_oauth，代理配错就失败而不是偷偷直连）：签发换
+        出来的会话和后面签到用的必须是同一个出口 IP，站点会把两者关联起来看。
+
+        新凭据一到手就走 _tabiai_rotate_callback —— 落本地盘 + 回写平台是同一套流程，
+        少写一处，平台下一次保活就会拿着已作废的旧代次去撞重放检测。
+        """
+        with self._state_lock:
+            if account.name in self._reissued:
+                return False, "凭据已失效，且本轮已尝试过重新签发"
+            self._reissued.add(account.name)
+
+        if not str(getattr(account, "github_user_session", "") or "").strip():
+            return False, ("凭据已失效，且账号未填写 GitHub user_session，"
+                           "无法自动签发；请在管理端补上 user_session 或手动粘贴新凭据")
+
+        from .github_oauth import issue_refresh_cookie
+
+        log.warn("TaBiAI 凭据已失效，尝试用 GitHub user_session 重新签发一条")
+        cookie, error = issue_refresh_cookie(account, self.cfg.http,
+                                             record.cf if record is not None else None)
+        if error or not cookie:
+            return False, f"凭据已失效且自动签发失败：{error or '未取得新凭据'}"
+        # 与轮转共用落盘 + 回写链路，保证本机与平台代次一致
+        self._tabiai_rotate_callback(account)(cookie)
+        log.ok("已重新签发 TaBiAI 凭据并同步到平台，重试本轮签到")
+        return True, ""
 
     def _writeback_refresh_cookie(self, account: Account, cookie: str) -> None:
         """把轮转后的凭据同步回管理平台，避免网页端下次检测踩旧代。"""
