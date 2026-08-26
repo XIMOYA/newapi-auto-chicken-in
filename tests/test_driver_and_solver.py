@@ -505,6 +505,86 @@ class TestTurnstileClick:
         assert page.mouse.clicks == [(320.0, 400.0)]
 
 
+class TestPresetFirstTurnstileClick:
+    """预设几何位置优先，没生效才花钱问 AI。"""
+
+    BOX = {"x": 100.0, "y": 200.0, "width": 300.0, "height": 65.0}
+
+    def _page_with_widget(self, frames, token=""):
+        return FakePage(frames,
+                        boxes={"iframe[src*='challenges.cloudflare.com']": self.BOX},
+                        turnstile_token=token)
+
+    def test_preset_click_that_works_never_calls_ai(self, wired):
+        """点完就拿到 token：一次视觉调用都不该发生。"""
+        page = self._page_with_widget([TURNSTILE], token="tok")
+        _, _, driver = build(page)
+
+        class AI:
+            calls = 0
+
+            def locate(self, *_a, **_k):
+                type(self).calls += 1
+                return 0.5, 0.5
+
+        ai = AI()
+        with driver:
+            assert solver._click_turnstile_preset_first(driver, ai) is True
+        assert AI.calls == 0
+        assert page.mouse.clicks == [(130.0, 232.5)]   # 几何法算出来的坐标
+
+    def test_falls_back_to_ai_when_preset_click_has_no_effect(self, wired, monkeypatch):
+        """点了但盾没放行、也没 token —— 这才轮到 AI。"""
+        page = self._page_with_widget([TURNSTILE])
+        _, _, driver = build(page)
+        monkeypatch.setattr(solver, "PRESET_CLICK_SETTLE_SECONDS", 0.5)
+
+        class AI:
+            def locate(self, _png, _w, _h, _target):
+                return 0.5, 0.5
+
+        with driver:
+            assert solver._click_turnstile_preset_first(driver, AI()) is True
+        # 先几何后 AI：两次点击都发生了，第二次是 AI 给的坐标
+        assert page.mouse.clicks[0] == (130.0, 232.5)
+        assert len(page.mouse.clicks) == 2
+
+    def test_falls_back_to_ai_when_widget_not_found(self, wired):
+        """预设选择器找不到组件时直接交给 AI，不白等。"""
+        page = FakePage([CHALLENGE])
+        _, _, driver = build(page)
+
+        class AI:
+            def locate(self, _png, width, height, _target):
+                assert (width, height) == (1280, 800)   # 整页图
+                return 0.25, 0.5
+
+        with driver:
+            assert solver._click_turnstile_preset_first(driver, AI()) is True
+        assert page.mouse.clicks == [(320.0, 400.0)]
+
+    def test_without_ai_preset_failure_is_final(self, wired, monkeypatch):
+        """没有 AI 时点击没生效就返回 False，不能假装成功。"""
+        page = self._page_with_widget([TURNSTILE])
+        _, _, driver = build(page)
+        monkeypatch.setattr(solver, "PRESET_CLICK_SETTLE_SECONDS", 0.3)
+        with driver:
+            assert solver._click_turnstile_preset_first(driver, None) is False
+
+    def test_took_effect_accepts_passed_page_without_token(self, wired):
+        """质询页放行也算生效 —— 过 CF 拦截页时压根不会有 turnstile token。"""
+        page = FakePage([TURNSTILE, NORMAL])
+        _, _, driver = build(page)
+        with driver:
+            assert solver._turnstile_took_effect(driver, 2.0) is True
+
+    def test_took_effect_times_out_when_nothing_changes(self, wired, monkeypatch):
+        page = FakePage([CHALLENGE])
+        _, _, driver = build(page)
+        with driver:
+            assert solver._turnstile_took_effect(driver, 0.3) is False
+
+
 class TestImageCaptcha:
     def test_ocr_fill_and_submit(self, wired):
         page = FakePage([CHALLENGE], boxes={

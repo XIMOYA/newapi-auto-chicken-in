@@ -53,6 +53,11 @@ SHORT_WAIT = 30               # 每次交互后等待质询自解的上限
 AI_ASSIST_BUDGET = 150        # S3 整段（含所有轮次与 AI 请求）的总时长上限
 AI_CALL_RESERVE = 5           # 剩余时间不足这么多秒时不再发起新的 AI 请求
 
+# 按预设几何位置点完复选框后，等这么久看盾有没有放行。没放行才退到 AI 定位。
+# 4 秒是权衡：Turnstile 正常在点击后 1~3 秒内回填 token，等太短会白白多花一次
+# 视觉调用，等太长则在预设点击本来就没用的场景里干耗账号时间盒。
+PRESET_CLICK_SETTLE_SECONDS = 4.0
+
 # 等 Turnstile token 的循环里，视觉调用的总次数上限（成败都算）。
 # grid_attempts 只统计「拿到坐标并点下去」的轮数，光靠它拦不住失败的调用：
 # 复选框形态下 AI 每次都答不出点选坐标，循环却每秒一轮，几十次高清截图就出去了。
@@ -330,7 +335,8 @@ def _ai_assist(driver: BrowserDriver, cfg: Config, ai, state: PageState,
             continue
 
         if verdict.state == prompts.TURNSTILE_CHECKBOX:
-            if _click_turnstile_with_ai(driver, ai):
+            # 预设几何位置优先：复选框位置固定，能省掉一次视觉调用；没生效才问 AI
+            if _click_turnstile_preset_first(driver, ai):
                 state = driver.wait_until_passed(timeout=wait)
                 if state.passed:
                     return state
@@ -360,6 +366,44 @@ def _ai_assist(driver: BrowserDriver, cfg: Config, ai, state: PageState,
             return state
 
     return driver.state()
+
+
+def _turnstile_took_effect(driver: BrowserDriver, seconds: float) -> bool:
+    """点完复选框后短等，看这一下有没有真生效。
+
+    「点击动作执行了」和「盾放行了」是两件事，click_turnstile() 只能告诉你前者。
+    两个信号都算生效：拿到 token（签到接口要的就是它），或者质询页已经放行
+    （quick_state 比整页 state 轻，这里只需要粗判）。
+    """
+    deadline = time.monotonic() + max(0.5, float(seconds))
+    while True:
+        if driver.turnstile_token():
+            return True
+        if driver.quick_state().passed:
+            return True
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(0.5, left))
+
+
+def _click_turnstile_preset_first(driver: BrowserDriver, ai) -> bool:
+    """先按预设几何位置点，没生效才花钱问 AI。
+
+    复选框在 Turnstile 组件里的位置极其固定（组件左侧约 30px、垂直居中，
+    见 driver_base.click_turnstile），绝大多数情况这一下就过了，没必要每次
+    都先烧一次高清截图的视觉调用。AI 是兜底，不是首选。
+    """
+    if driver.click_turnstile():
+        if _turnstile_took_effect(driver, PRESET_CLICK_SETTLE_SECONDS):
+            log.debug("预设位置点击已生效，省下一次 AI 调用")
+            return True
+        log.debug("预设位置点击后仍未放行，改用 AI 定位")
+    else:
+        log.debug("按预设选择器找不到 Turnstile 组件，改用 AI 定位")
+    if ai is None:
+        return False
+    return _click_turnstile_with_ai(driver, ai)
 
 
 def _click_turnstile_with_ai(driver: BrowserDriver, ai) -> bool:
