@@ -130,6 +130,11 @@
 
 `POST /api/accounts/ops` （JWT 或 API Key）
 
+配套的两个只读端点构成「找名字 → 查数据 → 改数据」的链路：
+`GET /api/accounts`（清单，双认证，不含任何凭据）→ `GET /api/accounts/{name}`
+（详情，双认证，凭据只给指纹）→ 回到这里用 `upsert` 改。清单响应里的 `revision`
+与 `GET /api/config/revision` 同值，可直接用作乐观锁参数。
+
 请求体：
 ```json
 {

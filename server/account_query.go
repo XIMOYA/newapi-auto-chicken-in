@@ -113,3 +113,55 @@ func (s *Server) handleGetAccountRaw(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, account)
 }
+
+// accountSummary 清单里的一条：够筛选和展示，但**一个凭据字节都不带**。
+//
+// HasCookie 只回布尔而不回摘要：清单是拿来找名字的，算 N 次 sha256 纯属浪费，
+// 真要核对某一条就去 GET /api/accounts/{name} 拿指纹。
+type accountSummary struct {
+	Name        string `json:"name"`
+	URL         string `json:"url"`
+	LoginMethod string `json:"login_method"`
+	Enabled     bool   `json:"enabled"`
+	HasCookie   bool   `json:"has_cookie"`
+	// Proxy 是账号自带的固定出口（没配时为 null，表示走代理池或直连）。
+	// 它不是凭据，但排查「这个账号从哪出去」时最常要看，所以放进清单。
+	Proxy *string `json:"proxy"`
+}
+
+// handleListAccounts GET /api/accounts（JWT 或 API Key）
+// 账号名清单 + 常用元数据。配对 GET /api/accounts/{name}：先在这里找到名字，
+// 再按名字查详情或改内容（改走 POST /api/accounts/ops 的 upsert）。
+//
+// 存在的理由：在这之前想知道「有哪些账号」只能拉整份 GET /api/config —— 为了几个
+// 名字搬走几十 KB 配置，脚本侧尤其别扭。这里只回名字和筛选用得上的字段。
+//
+// 顺带回 revision：调用方可以据此判断手里这份清单是不是最新的，也能直接拿去做
+// PUT /api/config 的乐观锁参数，省一次 GET /api/config/revision。
+func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
+	cfg, updatedAt, revision, err := LoadConfigWithRevision(s.db)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "服务器内部错误")
+		return
+	}
+	items := make([]accountSummary, 0, len(cfg.Accounts))
+	for i := range cfg.Accounts {
+		account := cfg.Accounts[i]
+		items = append(items, accountSummary{
+			Name:        account.Name,
+			URL:         account.URL,
+			LoginMethod: account.LoginMethod,
+			Enabled:     account.Enabled,
+			HasCookie:   strings.TrimSpace(account.Cookie) != "",
+			Proxy:       account.Proxy,
+		})
+	}
+	// 顺序与配置里的顺序一致，不排序 —— 网页端的账号列表就按这个顺序显示，
+	// 这里再排一遍会让「清单第 3 个」和「界面第 3 个」对不上
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accounts":   items,
+		"count":      len(items),
+		"updated_at": updatedAt,
+		"revision":   revision,
+	})
+}

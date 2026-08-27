@@ -49,7 +49,7 @@ Authorization: Bearer <JWT 或 API Key>
 
 | 范围 | 端点 | 说明 |
 | --- | --- | --- |
-| **双认证**<br>JWT 或 API Key | `GET /api/config`<br>`GET /api/config/revision`<br>`PUT /api/config`<br>`GET /api/export`<br>`POST /api/accounts/ops`<br>`GET /api/accounts/{name}`<br>`POST /api/cookie-tests/newapi`<br>`POST /api/cookie-tests/tabiai`<br>`GET /api/cookie-tests/status`<br>`POST /api/cookie-tests/stop`<br>`POST /api/tabiai/issue-cookie`<br>`GET /api/run-state`<br>`POST /api/run-state/unlock`<br>`GET /api/proxies`<br>`GET /api/proxies/stats`<br>`POST /api/proxies/refresh`<br>`POST /api/proxies/speedtest` | 日常运维。脚本用一把 API Key 就能干完，不必模拟登录换 JWT |
+| **双认证**<br>JWT 或 API Key | `GET /api/config`<br>`GET /api/config/revision`<br>`PUT /api/config`<br>`GET /api/export`<br>`GET /api/accounts`<br>`POST /api/accounts/ops`<br>`GET /api/accounts/{name}`<br>`POST /api/cookie-tests/newapi`<br>`POST /api/cookie-tests/tabiai`<br>`GET /api/cookie-tests/status`<br>`POST /api/cookie-tests/stop`<br>`POST /api/tabiai/issue-cookie`<br>`GET /api/run-state`<br>`POST /api/run-state/unlock`<br>`GET /api/proxies`<br>`GET /api/proxies/stats`<br>`POST /api/proxies/refresh`<br>`POST /api/proxies/speedtest` | 日常运维。脚本用一把 API Key 就能干完，不必模拟登录换 JWT |
 | **仅 API Key** | `GET /api/config/raw`<br>`GET /api/accounts/{name}/raw`<br>`GET /api/proxies/available`<br>`POST /api/proxies/feedback`<br>`POST /api/accounts/{name}/refresh-cookie`<br>`POST /api/run-state/start`<br>`POST /api/run-state/heartbeat`<br>`POST /api/run-state/stop` | 客户端专用通道。JWT 调这些会 401 |
 | **仅 JWT** | `POST /api/config/import`<br>`GET /api/keys`<br>`POST /api/keys`<br>`DELETE /api/keys/{id}`<br>`PUT /api/password`<br>`POST /api/auth/verify-password`<br>`GET /api/tabiai/keepalive`<br>`PUT /api/tabiai/keepalive`<br>`POST /api/tabiai/keepalive/run` | 控制平面 + 网页端专属。一把躺在 CI secrets 里的 Key 若能改密码或造新 Key，泄露就等于永久失守；保活三个接口客户端没有调它的场合 |
 | **无需认证** | `GET /api/health`<br>`POST /api/login` | |
@@ -247,6 +247,46 @@ merge 规则：`accounts` / `sites` 按 `name` 合并（同名整条替换，新
 写入会让 `revision` +1，但导入本身不参与乐观锁。
 
 ## 3. 账号管理
+
+这一章的三个端点是配对使用的，构成「找名字 → 查数据 → 改数据」的完整链路：
+
+| 想做什么 | 用哪个 |
+| --- | --- |
+| 列出有哪些账号 | `GET /api/accounts` |
+| 按名字查一个账号 | `GET /api/accounts/{name}`（脱敏）/ `/raw`（明文，仅 API Key） |
+| 按名字改一个账号 | `POST /api/accounts/ops` 的 `upsert` |
+
+### GET /api/accounts
+
+双认证。账号名清单 + 常用元数据，**不含任何凭据字段**（连打码占位符都不会出现）。
+
+在这之前想知道「有哪些账号」只能拉整份 `GET /api/config` —— 为了几个名字搬走几十 KB
+配置，脚本侧尤其别扭。
+
+**200**
+
+```json
+{
+  "accounts": [
+    { "name": "Steven", "url": "https://a.com", "login_method": "tabiai",
+      "enabled": true, "has_cookie": true, "proxy": null }
+  ],
+  "count": 1,
+  "updated_at": "2026-08-24T10:00:00Z",
+  "revision": 42
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| has_cookie | 只回布尔，不回摘要。清单是拿来找名字的，为每个账号算一次 sha256 纯属浪费；真要核对某一条的代次就去 `GET /api/accounts/{name}` 拿指纹 |
+| proxy | 账号自带的固定出口，**没配时是 `null`**（表示走代理池或直连），不是空串 |
+| revision | 与 `GET /api/config/revision` 同一个值，可以直接拿去做 `PUT /api/config` 的乐观锁参数，省一次往返 |
+
+账号顺序**与配置里的顺序一致，不排序** —— 网页端的账号列表就按这个顺序显示，
+这里再排一遍会让「清单第 3 个」和「界面第 3 个」对不上。
+
+空配置时 `accounts` 是 `[]` 而不是 `null`。
 
 ### POST /api/accounts/ops
 
@@ -1149,8 +1189,47 @@ KEY="ncf_你的APIKey"
 AUTH="Authorization: Bearer $KEY"
 ```
 
-**填 / 换某个账号的 TaBiAI 凭据**（最常用）
+**列出所有账号名**（不带任何凭据，可以放心贴日志）
 
+```bash
+curl "$BASE/api/accounts" -H "$AUTH"
+# 只要名字
+curl -s "$BASE/api/accounts" -H "$AUTH" | jq -r '.accounts[].name'
+# 只看 tabiai 且启用的
+curl -s "$BASE/api/accounts" -H "$AUTH" \
+  | jq -r '.accounts[] | select(.login_method=="tabiai" and .enabled) | .name'
+```
+
+**按名字改一个账号**（改 URL、代理、启停等；改凭据用上面那个专门端点）
+
+先拉当前值，改完把**完整对象**放进一条 `upsert`。打码字段（`cookie` /
+`github_user_session`）保持 `"***"` 原样回传即可 —— 服务端按账号名找回真值，
+不必重填凭据：
+
+```bash
+ACCT=$(curl -s "$BASE/api/accounts/Steven" -H "$AUTH" | jq '.account')
+NEW=$(echo "$ACCT" | jq '.proxy="http://1.2.3.4:8080"')
+curl -X POST "$BASE/api/accounts/ops" -H "$AUTH" -H "Content-Type: application/json" \
+  -d "$(jq -n --argjson a "$NEW" '{ops:[{type:"upsert",account:$a}]}')"
+```
+
+改名要额外带 `previous_name`，否则会被当成新增一个账号：
+
+```bash
+curl -X POST "$BASE/api/accounts/ops" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"ops":[{"type":"upsert","previous_name":"Steven",
+               "account":{"name":"Steven-新","url":"https://a.com",
+                          "login_method":"tabiai","cookie":"***","enabled":true}}]}'
+```
+
+只想启停某个账号时不必传整条，用 `set_enabled` 更省事：
+
+```bash
+curl -X POST "$BASE/api/accounts/ops" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"ops":[{"type":"set_enabled","name":"Steven","enabled":false}]}'
+```
+
+**填 / 换某个账号的 TaBiAI 凭据**（最常用）
 ```bash
 curl -X POST "$BASE/api/accounts/Steven/refresh-cookie" \
   -H "$AUTH" -H "Content-Type: application/json" \

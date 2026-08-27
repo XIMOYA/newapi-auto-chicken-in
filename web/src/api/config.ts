@@ -1,11 +1,11 @@
 /*
 web/src/api/config.ts
-配置接口封装（对应契约 §3 获取配置 / §4 保存配置 / §5 拉取配置 / §4.1 账号增量操作 / §4.2 单账号查询）
+配置接口封装（对应契约 §3 获取配置 / §4 保存配置 / §5 拉取配置 / §4.1 账号增量操作 / §4.2 账号清单与单账号查询）
 */
 import http from './http'
 import type {
-  AccountDetailResponse, AccountOp, AccountOpsResult, AppConfig, ConfigResponse,
-  ConfigRevisionResult, SaveConfigResult
+  AccountDetailResponse, AccountListResponse, AccountOp, AccountOpsResult, AppConfig,
+  ConfigResponse, ConfigRevisionResult, SaveConfigResult
 } from '@/types'
 
 export function getConfig(): Promise<ConfigResponse> {
@@ -36,6 +36,16 @@ export function getRawConfig(token: string): Promise<AppConfig> {
   return http
     .get<AppConfig>('/config/raw', { headers: { Authorization: `Bearer ${token}` } })
     .then((r) => r.data)
+}
+
+/**
+ * 账号名清单 + 常用元数据，不含任何凭据。
+ *
+ * 用途是「先找名字、再按名字查改」：详情走 getAccountDetail，改内容走
+ * applyAccountOps 的 upsert。比拉整份 getConfig 轻得多，也不必解析其他配置段。
+ */
+export function listAccounts(): Promise<AccountListResponse> {
+  return http.get<AccountListResponse>('/accounts').then((r) => r.data)
 }
 
 /**

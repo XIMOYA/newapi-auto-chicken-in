@@ -278,6 +278,36 @@ export interface AccountOpsResult {
 // ===== 单账号查询（凭据回写的读回核实）=====
 
 /**
+ * 账号清单里的一条：够筛选和展示，**不含任何凭据字段**（连打码占位符也没有）。
+ *
+ * has_cookie 只回布尔不回摘要 —— 清单是拿来找名字的，为每个账号算一次 sha256
+ * 纯属浪费；要核对某一条的代次就去查 AccountDetailResponse 拿指纹。
+ */
+export interface AccountSummary {
+  name: string
+  url: string
+  login_method: string
+  enabled: boolean
+  /** 是否配了凭据。只表示有没有，不给值 */
+  has_cookie: boolean
+  /** 账号自带的固定出口；null 表示走代理池或直连（不是空串） */
+  proxy: string | null
+}
+
+/**
+ * GET /api/accounts 的响应。
+ *
+ * revision 与 GET /api/config/revision 是同一个值，可以直接拿去做 PUT /api/config
+ * 的乐观锁参数。accounts 顺序与配置一致，不排序 —— 界面按这个顺序显示。
+ */
+export interface AccountListResponse {
+  accounts: AccountSummary[]
+  count: number
+  updated_at: string
+  revision: number
+}
+
+/**
  * cookie 的核实摘要：不含任何明文，但足够判断平台手里是不是最新那一代。
  *
  * 客户端回写新代次后靠读回核实堵「平台收了但没存」——这个摘要是同一件事的人工版本：

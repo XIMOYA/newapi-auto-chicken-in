@@ -6,6 +6,7 @@ web/src/api/__tests__/config.test.ts
 - upsert 带 previous_name 时原样透传（改名靠它还原打码凭据）
 - getConfigRevision 走轻量端点
 - saveConfig 的 revision 可选语义
+- listAccounts 的清单解析与「不含凭据」约束
 - getAccountDetail 的路径转义与脱敏摘要解析
 说明：mock 掉 ../http，只验证「调了哪个地址、带了什么体」，不发真实请求
 */
@@ -23,7 +24,7 @@ vi.mock('../http', () => ({
   }
 }))
 
-import { applyAccountOps, getAccountDetail, getConfigRevision, saveConfig } from '../config'
+import { applyAccountOps, getAccountDetail, getConfigRevision, listAccounts, saveConfig } from '../config'
 import type { Account, AppConfig } from '@/types'
 
 const account = (name: string): Account => ({
@@ -120,6 +121,59 @@ describe('整份保存的乐观锁', () => {
     await saveConfig({} as AppConfig)
     const body = put.mock.calls[0][1] as Record<string, unknown>
     expect('revision' in body).toBe(false)
+  })
+})
+
+describe('账号清单', () => {
+  const list = {
+    data: {
+      accounts: [
+        { name: 'Steven', url: 'https://a.com', login_method: 'tabiai',
+          enabled: true, has_cookie: true, proxy: null },
+        { name: '组/B 号', url: 'https://b.com', login_method: 'newapi_cookie',
+          enabled: false, has_cookie: false, proxy: 'http://1.2.3.4:8080' }
+      ],
+      count: 2,
+      updated_at: '2024-05-01T10:00:00Z',
+      revision: 42
+    }
+  }
+
+  it('打到 /accounts，解出清单与 revision', async () => {
+    get.mockResolvedValue(list)
+    const res = await listAccounts()
+    expect(get).toHaveBeenCalledWith('/accounts')
+    expect(res.count).toBe(2)
+    expect(res.revision).toBe(42)
+    expect(res.accounts.map((a) => a.name)).toEqual(['Steven', '组/B 号'])
+  })
+
+  it('没配代理的账号是 null，不是空串', async () => {
+    get.mockResolvedValue(list)
+    const res = await listAccounts()
+    expect(res.accounts[0].proxy).toBeNull()
+    expect(res.accounts[1].proxy).toBe('http://1.2.3.4:8080')
+  })
+
+  it('清单里不带任何凭据字段，连打码占位符都没有', async () => {
+    get.mockResolvedValue(list)
+    const res = await listAccounts()
+    const serialized = JSON.stringify(res)
+    expect(serialized).not.toContain('***')
+    expect(res.accounts[0]).not.toHaveProperty('cookie')
+    expect(res.accounts[0]).not.toHaveProperty('github_user_session')
+    // 只表示「有没有配」，不给值
+    expect(res.accounts[0].has_cookie).toBe(true)
+    expect(res.accounts[1].has_cookie).toBe(false)
+  })
+
+  it('空配置时是空数组而不是 null', async () => {
+    get.mockResolvedValue({
+      data: { accounts: [], count: 0, updated_at: '', revision: 1 }
+    })
+    const res = await listAccounts()
+    expect(res.accounts).toEqual([])
+    expect(res.count).toBe(0)
   })
 })
 

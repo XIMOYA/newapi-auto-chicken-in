@@ -80,6 +80,8 @@ func (s *Server) routes() http.Handler {
 	// 单账号查询（凭据回写的读回核实，见 account_query.go）：
 	// 脱敏摘要跟 GET /api/config 同级（双认证，cookie 只给指纹不给明文），
 	// 明文切片跟 GET /api/config/raw 同级（只认 API Key，暴露面不新增）
+	// 清单只回名字与元数据、不含任何凭据，所以走双认证
+	mux.HandleFunc("GET /api/accounts", s.requireJWTOrAPIKey(s.handleListAccounts))
 	mux.HandleFunc("GET /api/accounts/{name}", s.requireJWTOrAPIKey(s.handleGetAccount))
 	mux.HandleFunc("GET /api/accounts/{name}/raw", s.requireAPIKey(s.handleGetAccountRaw))
 

@@ -245,3 +245,158 @@ func TestAccountLookupMatchesWritebackRule(t *testing.T) {
 		t.Error("指纹没变化，人工核实就看不出代次换了没换")
 	}
 }
+
+// accountListResponse 清单端点的响应形状。
+type accountListResponse struct {
+	Accounts []struct {
+		Name        string  `json:"name"`
+		URL         string  `json:"url"`
+		LoginMethod string  `json:"login_method"`
+		Enabled     bool    `json:"enabled"`
+		HasCookie   bool    `json:"has_cookie"`
+		Proxy       *string `json:"proxy"`
+	} `json:"accounts"`
+	Count     int    `json:"count"`
+	UpdatedAt string `json:"updated_at"`
+	Revision  int64  `json:"revision"`
+}
+
+func TestListAccountsGivesNamesWithoutAnyCredential(t *testing.T) {
+	srv := newTestServer(t)
+	seedQueryAccounts(t, srv)
+	jwt := loginToken(t, srv)
+
+	rr := doReq(t, srv, http.MethodGet, "/api/accounts", jwt, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("清单查询失败 = %d, %s", rr.Code, rr.Body.String())
+	}
+	// 清单连打码占位符都不该出现：它压根不包含凭据字段
+	body := rr.Body.String()
+	for _, leaked := range []string{testTabiCookie, "gh-session-明文", MaskPlaceholder} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("清单不该出现 %q：%s", leaked, body)
+		}
+	}
+
+	var resp accountListResponse
+	decodeJSON(t, rr, &resp)
+	if resp.Count != 2 || len(resp.Accounts) != 2 {
+		t.Fatalf("应返回 2 个账号，实际 count=%d len=%d", resp.Count, len(resp.Accounts))
+	}
+	// 顺序与配置一致：界面按这个顺序显示，重排会让「第 N 个」对不上
+	if resp.Accounts[0].Name != "tabi" || resp.Accounts[1].Name != "空凭据" {
+		t.Fatalf("顺序应与配置一致: %q, %q", resp.Accounts[0].Name, resp.Accounts[1].Name)
+	}
+	first := resp.Accounts[0]
+	if first.URL != "https://a.com" || first.LoginMethod != LoginMethodTabiAI || !first.Enabled {
+		t.Errorf("元数据不对: %+v", first)
+	}
+	if !first.HasCookie {
+		t.Error("配了凭据的账号 has_cookie 应为 true")
+	}
+	if second := resp.Accounts[1]; second.HasCookie || second.Enabled {
+		t.Errorf("空凭据且停用的账号: has_cookie=%v enabled=%v", second.HasCookie, second.Enabled)
+	}
+	if resp.UpdatedAt == "" {
+		t.Error("应带出配置更新时间")
+	}
+}
+
+func TestListAccountsRevisionMatchesConfigRevision(t *testing.T) {
+	srv := newTestServer(t)
+	seedQueryAccounts(t, srv)
+	jwt := loginToken(t, srv)
+
+	list := doReq(t, srv, http.MethodGet, "/api/accounts", jwt, nil)
+	var listResp accountListResponse
+	decodeJSON(t, list, &listResp)
+
+	rev := doReq(t, srv, http.MethodGet, "/api/config/revision", jwt, nil)
+	var revResp struct {
+		Revision int64 `json:"revision"`
+	}
+	decodeJSON(t, rev, &revResp)
+
+	// 两处必须一致：调用方拿清单里的 revision 直接去做 PUT /api/config 的乐观锁参数
+	if listResp.Revision != revResp.Revision {
+		t.Fatalf("清单 revision=%d 与 /api/config/revision=%d 不一致",
+			listResp.Revision, revResp.Revision)
+	}
+}
+
+func TestListAccountsAcceptsAPIKeyAndRequiresAuth(t *testing.T) {
+	srv := newTestServer(t)
+	seedQueryAccounts(t, srv)
+	jwt := loginToken(t, srv)
+	key := apiKeyToken(t, srv, jwt)
+
+	// 双认证：JWT 和 API Key 都该放行（脚本侧要用 Key 遍历账号）
+	if withKey := doReq(t, srv, http.MethodGet, "/api/accounts", key, nil); withKey.Code != http.StatusOK {
+		t.Fatalf("清单应对 API Key 放行，实际 %d: %s", withKey.Code, withKey.Body.String())
+	}
+	if anon := doReq(t, srv, http.MethodGet, "/api/accounts", "", nil); anon.Code != http.StatusUnauthorized {
+		t.Fatalf("清单必须鉴权，实际 %d", anon.Code)
+	}
+}
+
+func TestListAccountsOnEmptyConfigReturnsEmptyArray(t *testing.T) {
+	srv := newTestServer(t)
+	seedConfig(t, srv, []Account{}, nil)
+	jwt := loginToken(t, srv)
+
+	rr := doReq(t, srv, http.MethodGet, "/api/accounts", jwt, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("空配置查询失败 = %d, %s", rr.Code, rr.Body.String())
+	}
+	// 必须是 []，不能是 null —— 前端 v-for 拿到 null 会炸
+	if !strings.Contains(rr.Body.String(), `"accounts":[]`) {
+		t.Fatalf("空账号列表应序列化成 []：%s", rr.Body.String())
+	}
+	var resp accountListResponse
+	decodeJSON(t, rr, &resp)
+	if resp.Count != 0 {
+		t.Errorf("count = %d, 期望 0", resp.Count)
+	}
+}
+
+func TestListAccountsCarriesPerAccountProxy(t *testing.T) {
+	srv := newTestServer(t)
+	fixed := "http://1.2.3.4:8080"
+	seedConfig(t, srv, []Account{
+		{Name: "带代理", URL: "https://a.com", LoginMethod: LoginMethodNewAPICookie,
+			Cookie: "c", Proxy: &fixed, Enabled: true},
+		{Name: "走池子", URL: "https://b.com", LoginMethod: LoginMethodNewAPICookie,
+			Cookie: "c", Enabled: true},
+	}, nil)
+	jwt := loginToken(t, srv)
+
+	var resp accountListResponse
+	decodeJSON(t, doReq(t, srv, http.MethodGet, "/api/accounts", jwt, nil), &resp)
+	if resp.Accounts[0].Proxy == nil || *resp.Accounts[0].Proxy != fixed {
+		t.Fatalf("账号自带代理应原样返回: %+v", resp.Accounts[0].Proxy)
+	}
+	// 没配代理时是 null，表示走代理池或直连 —— 不能变成空串，那会被当成「配了个空代理」
+	if resp.Accounts[1].Proxy != nil {
+		t.Fatalf("没配代理应为 null，实际 %q", *resp.Accounts[1].Proxy)
+	}
+}
+
+// TestListAndDetailShareTheSameNames 清单里的名字必须能直接拿去查详情。
+// 这两个端点是配对使用的：先列名字，再按名字查数据、按名字改数据。
+func TestListAndDetailShareTheSameNames(t *testing.T) {
+	srv := newTestServer(t)
+	seedQueryAccounts(t, srv)
+	jwt := loginToken(t, srv)
+
+	var list accountListResponse
+	decodeJSON(t, doReq(t, srv, http.MethodGet, "/api/accounts", jwt, nil), &list)
+	if len(list.Accounts) == 0 {
+		t.Fatal("清单为空，无法验证配对关系")
+	}
+	for _, item := range list.Accounts {
+		path := "/api/accounts/" + url.PathEscape(item.Name)
+		if rr := doReq(t, srv, http.MethodGet, path, jwt, nil); rr.Code != http.StatusOK {
+			t.Fatalf("清单里的名字 %q 查详情失败 = %d, %s", item.Name, rr.Code, rr.Body.String())
+		}
+	}
+}
