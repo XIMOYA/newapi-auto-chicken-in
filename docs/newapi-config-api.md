@@ -51,7 +51,7 @@ Authorization: Bearer <JWT 或 API Key>
 | --- | --- | --- |
 | **双认证**<br>JWT 或 API Key | `GET /api/config`<br>`GET /api/config/revision`<br>`PUT /api/config`<br>`GET /api/export`<br>`POST /api/accounts/ops`<br>`GET /api/accounts/{name}`<br>`POST /api/cookie-tests/newapi`<br>`POST /api/cookie-tests/tabiai`<br>`GET /api/cookie-tests/status`<br>`POST /api/cookie-tests/stop`<br>`POST /api/tabiai/issue-cookie`<br>`GET /api/run-state`<br>`POST /api/run-state/unlock`<br>`GET /api/proxies`<br>`GET /api/proxies/stats`<br>`POST /api/proxies/refresh`<br>`POST /api/proxies/speedtest` | 日常运维。脚本用一把 API Key 就能干完，不必模拟登录换 JWT |
 | **仅 API Key** | `GET /api/config/raw`<br>`GET /api/accounts/{name}/raw`<br>`GET /api/proxies/available`<br>`POST /api/proxies/feedback`<br>`POST /api/accounts/{name}/refresh-cookie`<br>`POST /api/run-state/start`<br>`POST /api/run-state/heartbeat`<br>`POST /api/run-state/stop` | 客户端专用通道。JWT 调这些会 401 |
-| **仅 JWT** | `POST /api/config/import`<br>`GET /api/keys`<br>`POST /api/keys`<br>`DELETE /api/keys/{id}`<br>`PUT /api/password`<br>`POST /api/auth/verify-password` | 控制平面。一把躺在 CI secrets 里的 Key 若能改密码或造新 Key，泄露就等于永久失守 |
+| **仅 JWT** | `POST /api/config/import`<br>`GET /api/keys`<br>`POST /api/keys`<br>`DELETE /api/keys/{id}`<br>`PUT /api/password`<br>`POST /api/auth/verify-password`<br>`GET /api/tabiai/keepalive`<br>`PUT /api/tabiai/keepalive`<br>`POST /api/tabiai/keepalive/run` | 控制平面 + 网页端专属。一把躺在 CI secrets 里的 Key 若能改密码或造新 Key，泄露就等于永久失守；保活三个接口客户端没有调它的场合 |
 | **无需认证** | `GET /api/health`<br>`POST /api/login` | |
 
 > 控制平面的边界不是绝对隔离：`PUT /api/config` 已放开给 API Key，它能整份覆盖配置，
@@ -301,7 +301,15 @@ merge 规则：`accounts` / `sites` 按 `name` 合并（同名整条替换，新
 
 ### POST /api/accounts/{name}/refresh-cookie
 
-**仅 API Key**。定点更新某个账号的 `new_api_refresh`，供客户端轮转后回写。
+**仅 API Key**。定点更新某个账号的 `new_api_refresh`，供客户端回写。
+
+两种场合都会调它，走的是同一条落盘 + 回写链路（`runner._tabiai_rotate_callback`）：
+
+- **代次轮转后** —— 每次 refresh 成功站点都会下发下一代 secret
+- **客户端自行签发后** —— refresh 被拒时客户端用账号的 `github_user_session` 走
+  GitHub OAuth 签发一条新凭据（与平台 `POST /api/tabiai/issue-cookie` 同一套三步协议，
+  但出口是客户端自己的代理），签发结果必须立刻同步过来，否则平台的保活会拿着
+  已作废的旧代次去撞重放检测
 
 ```json
 { "cookie": "new_api_refresh=sid.secret" }
@@ -531,6 +539,54 @@ OAuth 失败文案按阶段分布，都是 400：
 成功后新 cookie 直接写进该账号，**不推进 `revision`**。
 
 ⚠ 签发会换出全新 sid，**签到进程手里那条当场作废** —— 这就是它被签到锁拦住的原因。
+
+### GET /api/tabiai/keepalive
+
+**仅 JWT**（网页端专属，客户端没有调它的场合）。保活策略与每个 tabiai 账号最近一轮的结果。
+
+```json
+{
+  "setting": { "enabled": true, "minutes": 90, "updated_at": "2026-08-21T10:00:00Z" },
+  "accounts": [
+    { "account_name": "TaBiAI-1", "last_run_at": "2026-08-21T10:00:00Z",
+      "state": "valid", "message": "凭据有效", "rotated": true,
+      "paused": false, "paused_at": "", "proxy_addr": "1.2.3.4:8080" }
+  ],
+  "last_run_at": "2026-08-21T10:00:00Z",
+  "running": false,
+  "skipped_by_checkin": false,
+  "next_run_at": "2026-08-21T11:30:00Z"
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| state | 沿用 Cookie 检测的状态词（`valid` / `invalid` / `proxy_issue` / `abnormal`）；空串表示这个账号还没被刷过 |
+| rotated | 这一轮站点有没有真的下发新代次。为 false 且 state 正常属正常现象（宽限窗口内幂等），长期为 false 才该怀疑回写链路 |
+| paused | 凭据失效后被暂停自动刷新。改过凭据后的第一次刷新自动恢复 |
+| skipped_by_checkin | 上一轮因为签到正在运行而整轮避让。这是刻意设计，不是故障 |
+
+### PUT /api/tabiai/keepalive
+
+**仅 JWT**。请求体 `{ "enabled": true, "minutes": 90 }`，响应同 GET。
+
+间隔被夹在 **15~720 分钟**（默认 90，见 `tabiaiKeepaliveMinMinutes` / `MaxMinutes`）：刷太勤只是
+多消耗代次，超过半天就失去压缩暴露窗口的意义。**关闭保活用 `enabled: false` 表达，不要传
+`minutes: 0`** —— 0 和负数一律被当成「没填」按默认值 90 处理。
+
+### POST /api/tabiai/keepalive/run
+
+**仅 JWT**。立刻同步跑一轮。
+
+**200** `{ "ok_count": 3, "paused_count": 1, "failed_count": 0, "status": { ... } }`
+（`status` 与 GET 的响应体同构）
+
+| 状态码 | 文案 |
+| --- | --- |
+| 409 | 签到进行中被锁（响应体带 `run_state`，同其他被锁操作） |
+| 500 | `服务器内部错误` |
+
+保活的设计背景、暂停/恢复规则与代理策略见根目录 `README.md` 的「凭据保活与额度报告」一节。
 
 ## 6. 签到运行状态锁
 
