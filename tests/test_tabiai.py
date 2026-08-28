@@ -674,3 +674,73 @@ class TestRefreshExpiredReissue:
         assert second_ok is False
         assert "本轮已尝试过" in second_why
         assert len(calls) == 1
+
+    # --- 集成级：确认签发真的被主流程接上（refresh 过期是 AUTH_FAILED ∈ _SETTLED，
+    #     曾因提前 return 而永远走不到签发） ---
+
+    @staticmethod
+    def _expired_at_refresh():
+        return api.ApiResult(api.AUTH_FAILED, message="凭据已失效",
+                            status=401, path=tabiai.TABIAI_REFRESH_PATH)
+
+    def test_attempt_tabiai_reissues_on_expiry_then_succeeds(self, monkeypatch, tmp_path):
+        """refresh 过期 → 签发新凭据 → 重跑签到成功，全程不被 _SETTLED 提前拦截。"""
+        from newapi_checkin import runner as runner_mod
+
+        _, runner, account = self._runner(monkeypatch, tmp_path)
+        record = runner.store.get(account.slug)  # cf 默认 None，直接走 S1 路径
+
+        calls = {"api": 0, "issue": 0}
+
+        def fake_api_call(_account, _cf, turnstile_token=""):
+            calls["api"] += 1
+            # 第一次 refresh 过期，签发后第二次成功
+            if calls["api"] == 1:
+                return self._expired_at_refresh()
+            return api.ApiResult(api.SUCCESS, message="签到成功", status=200,
+                                 path=tabiai.TABIAI_CHECKIN_PATH)
+
+        def fake_issue(*_a, **_k):
+            calls["issue"] += 1
+            return "new_api_refresh=sid.reissued", ""
+
+        monkeypatch.setattr(runner, "_tabiai_api_call", fake_api_call)
+        monkeypatch.setattr("newapi_checkin.github_oauth.issue_refresh_cookie", fake_issue)
+        monkeypatch.setattr(runner_mod.Runner, "_writeback_refresh_cookie",
+                            lambda self, acc, cookie: None)
+
+        row = runner._attempt_tabiai(account, record, None)
+        assert row.status == api.SUCCESS, f"应最终签到成功，实际 {row.status}: {row.detail}"
+        assert calls["issue"] == 1, "签发必须被调用一次（bug 时为 0）"
+        assert calls["api"] == 2, "应在签发后重跑一次签到"
+        assert "重新签发" in row.detail
+
+    def test_attempt_tabiai_expiry_without_session_fails_with_reason(self, monkeypatch, tmp_path):
+        """没填 user_session：refresh 过期后判负，原因进 detail（会出现在邮件里）。"""
+        _, runner, account = self._runner(monkeypatch, tmp_path, user_session="")
+        record = runner.store.get(account.slug)
+
+        monkeypatch.setattr(runner, "_tabiai_api_call",
+                            lambda *a, **k: self._expired_at_refresh())
+
+        row = runner._attempt_tabiai(account, record, None)
+        assert row.status == api.AUTH_FAILED
+        assert "user_session" in row.detail and "签发" in row.detail
+
+    def test_attempt_tabiai_reissue_failure_surfaces_reason(self, monkeypatch, tmp_path):
+        """签发失败（user_session 也失效）：判负且带具体原因，不假装成功。"""
+        from newapi_checkin import runner as runner_mod
+
+        _, runner, account = self._runner(monkeypatch, tmp_path)
+        record = runner.store.get(account.slug)
+
+        monkeypatch.setattr(runner, "_tabiai_api_call",
+                            lambda *a, **k: self._expired_at_refresh())
+        monkeypatch.setattr("newapi_checkin.github_oauth.issue_refresh_cookie",
+                            lambda *a, **k: ("", "GitHub 要求重新登录，user_session 已失效"))
+        monkeypatch.setattr(runner_mod.Runner, "_writeback_refresh_cookie",
+                            lambda self, acc, cookie: None)
+
+        row = runner._attempt_tabiai(account, record, None)
+        assert row.status == api.AUTH_FAILED
+        assert "user_session 已失效" in row.detail

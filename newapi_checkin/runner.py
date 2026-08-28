@@ -1078,7 +1078,9 @@ class Runner:
             log.debug(f"TaBiAI S0 缓存判定: {reason}")
             if usable:
                 result = self._tabiai_api_call(account, record.cf)
-                if result.kind in _SETTLED:
+                # refresh 过期要放行到下面的签发逻辑，不能在这里当「已定局」return —— 它虽然
+                # 是 AUTH_FAILED（∈ _SETTLED），但恰恰是唯一能自救的一类失败
+                if result.kind in _SETTLED and not self._tabiai_refresh_expired(result):
                     return self._row(account, result, "S0")
                 if result.kind == api.CF_BLOCKED:
                     log.warn("缓存的 cf_clearance 已被拒绝，作废后重新过盾")
@@ -1089,7 +1091,8 @@ class Runner:
                 record.cf = None
 
         result = self._tabiai_api_call(account, None)
-        if result.kind in _SETTLED:
+        # 同上：refresh 过期不在这里 return，落到下面用 github_user_session 重新签发
+        if result.kind in _SETTLED and not self._tabiai_refresh_expired(result):
             return self._row(account, result, "S1")
         if result.kind == api.NETWORK_ERROR:
             return self._row(account, result, "S1")
