@@ -47,6 +47,63 @@ class TestParseProxyLines:
         assert parse_proxy_lines(None) == []
 
 
+class TestParseProxyJSON:
+    """结构化代理源（站大爷 zdaye 等）：ip/port 分开字段，正则抓不到，走 JSON 分支。"""
+
+    ZDAYE = (
+        '{"code":"10001","msg":"获取成功。警告声明：仅供学习测试...",'
+        '"data":{"count":3,"proxy_list":['
+        '{"ip":"103.136.106.5","port":1081,"adr":"亚太地区","protocol":"socks5","level":"高匿"},'
+        '{"ip":"147.45.221.112","port":8080,"adr":"俄罗斯","protocol":"http","level":"高匿"},'
+        '{"ip":"176.53.182.170","port":1080,"adr":"俄罗斯","protocol":"socks5","level":"高匿"}]}}'
+    )
+
+    def test_zdaye_socks5_gets_scheme_prefix(self):
+        # socks5 必须带前缀，否则下游按 http 连、必然测不通
+        assert parse_proxy_lines(self.ZDAYE) == [
+            "socks5://103.136.106.5:1081",
+            "147.45.221.112:8080",          # http 保持裸地址
+            "socks5://176.53.182.170:1080",
+        ]
+
+    def test_socks4_is_dropped(self):
+        # net/http 与本地测通都不认 socks4，留着只会浪费测通配额
+        text = '{"data":{"proxy_list":[{"ip":"1.2.3.4","port":9999,"protocol":"socks4"}]}}'
+        assert parse_proxy_lines(text) == []
+
+    def test_missing_protocol_defaults_to_bare(self):
+        text = '{"data":{"proxy_list":[{"ip":"1.2.3.4","port":8080}]}}'
+        assert parse_proxy_lines(text) == ["1.2.3.4:8080"]
+
+    def test_port_as_string_is_accepted(self):
+        # 有的源把 port 写成字符串，两种都要吃得下
+        text = '{"proxy_list":[{"ip":"1.2.3.4","port":"3128","protocol":"http"}]}'
+        assert parse_proxy_lines(text) == ["1.2.3.4:3128"]
+
+    def test_top_level_array(self):
+        text = '[{"ip":"1.2.3.4","port":1080,"protocol":"socks5"}]'
+        assert parse_proxy_lines(text) == ["socks5://1.2.3.4:1080"]
+
+    def test_invalid_ip_or_port_filtered(self):
+        text = ('{"data":{"proxy_list":['
+                '{"ip":"999.1.1.1","port":80,"protocol":"http"},'
+                '{"ip":"1.2.3.4","port":70000,"protocol":"http"},'
+                '{"ip":"5.6.7.8","port":80,"protocol":"http"}]}}')
+        assert parse_proxy_lines(text) == ["5.6.7.8:80"]
+
+    def test_empty_proxy_list_does_not_fall_back_to_regex(self):
+        # 空列表是「JSON 已处理但没有可用条目」，不能回落正则去 JSON 文本里乱抓
+        assert parse_proxy_lines('{"data":{"count":0,"proxy_list":[]}}') == []
+
+    def test_non_proxy_json_falls_back_to_regex(self):
+        # 不含 proxy_list 的 JSON：回落正则，正则在这段里抓不到 ip:port
+        assert parse_proxy_lines('{"code":"10001","msg":"no data"}') == []
+
+    def test_malformed_json_falls_back_to_regex(self):
+        # 半段 JSON 但内嵌了 ip:port 连写：JSON 解析失败后正则仍能救回来
+        assert parse_proxy_lines('{broken 1.2.3.4:8080 json') == ["1.2.3.4:8080"]
+
+
 # --------------------------------------------------------------------------- #
 # 配置
 # --------------------------------------------------------------------------- #

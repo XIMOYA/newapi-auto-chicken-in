@@ -5,8 +5,98 @@ server/proxies_test.go
 package main
 
 import (
+	"context"
+	"net/http"
 	"testing"
 )
+
+// zdayeSample 站大爷（zdaye）风格的 JSON 源：ip 与 port 是分开字段，
+// 混有 socks5 / http / socks4 三种协议。
+const zdayeSample = `{
+  "code": "10001",
+  "msg": "获取成功。警告声明：免费代理仅供学习测试...",
+  "data": {
+    "count": 4,
+    "proxy_list": [
+      {"ip": "103.136.106.5", "port": 1081, "adr": "亚太地区", "protocol": "socks5", "level": "高匿"},
+      {"ip": "147.45.221.112", "port": 8080, "adr": "俄罗斯", "protocol": "http", "level": "高匿"},
+      {"ip": "176.53.182.170", "port": 1080, "adr": "俄罗斯", "protocol": "socks5", "level": "高匿"},
+      {"ip": "1.2.3.4", "port": 9999, "adr": "测试", "protocol": "socks4", "level": "高匿"}
+    ]
+  }
+}`
+
+func TestParseProxyJSON_Zdaye(t *testing.T) {
+	got := parseProxyLines(zdayeSample)
+	want := []string{
+		"socks5://103.136.106.5:1081", // socks5 必须带前缀，否则下游按 http 连必然失败
+		"147.45.221.112:8080",         // http 保持裸地址，兼容库里历史数据
+		"socks5://176.53.182.170:1080",
+		// socks4 被丢弃：net/http 的 Proxy 不认它，留着只会白占测通配额
+	}
+	if len(got) != len(want) {
+		t.Fatalf("解析 zdaye JSON = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("第 %d 条 = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestParseProxyJSON_PortAsStringAndTopLevelArray(t *testing.T) {
+	// port 写成字符串、以及顶层直接是数组，两种都要吃得下
+	got := parseProxyLines(`[{"ip":"1.2.3.4","port":"3128","protocol":"http"},
+	                          {"ip":"5.6.7.8","port":1080,"protocol":"socks5"}]`)
+	if len(got) != 2 || got[0] != "1.2.3.4:3128" || got[1] != "socks5://5.6.7.8:1080" {
+		t.Fatalf("解析 = %v", got)
+	}
+}
+
+func TestParseProxyJSON_EmptyListNoRegexFallback(t *testing.T) {
+	// 空 proxy_list 是「已按 JSON 处理但无可用条目」，不能回落正则去 JSON 文本里乱抓
+	if got := parseProxyLines(`{"data":{"count":0,"proxy_list":[]}}`); len(got) != 0 {
+		t.Fatalf("空列表应返回空，实际 %v", got)
+	}
+}
+
+func TestParseProxyJSON_NonProxyJSONFallsBackToRegex(t *testing.T) {
+	// 不含 proxy_list 的 JSON 回落正则；正则在这段纯文本里抓不到 ip:port
+	if got := parseProxyLines(`{"code":"10001","msg":"no data"}`); len(got) != 0 {
+		t.Fatalf("无 proxy_list 的 JSON 应解析为空，实际 %v", got)
+	}
+}
+
+func TestParseProxyJSON_InvalidEntriesFiltered(t *testing.T) {
+	got := parseProxyLines(`{"data":{"proxy_list":[
+		{"ip":"999.1.1.1","port":80,"protocol":"http"},
+		{"ip":"1.2.3.4","port":70000,"protocol":"http"},
+		{"ip":"5.6.7.8","port":80,"protocol":"http"}]}}`)
+	if len(got) != 1 || got[0] != "5.6.7.8:80" {
+		t.Fatalf("过滤非法后 = %v, want 仅 5.6.7.8:80", got)
+	}
+}
+
+func TestProxyFromRequest_SchemeHandling(t *testing.T) {
+	cases := []struct {
+		addr string
+		want string
+	}{
+		{"1.2.3.4:8080", "http://1.2.3.4:8080"},            // 裸地址默认 http
+		{"socks5://1.2.3.4:1080", "socks5://1.2.3.4:1080"}, // 已带 scheme 原样解析
+	}
+	for _, c := range cases {
+		ctx := context.WithValue(context.Background(), ctxKeyProxyAddr{}, c.addr)
+		req := &http.Request{}
+		u, err := proxyFromRequest(req.WithContext(ctx))
+		if err != nil {
+			t.Fatalf("addr %q: 解析出错 %v", c.addr, err)
+		}
+		if u == nil || u.String() != c.want {
+			t.Fatalf("addr %q -> %v, want %q", c.addr, u, c.want)
+		}
+	}
+}
 
 func TestParseProxyLines_Plain(t *testing.T) {
 	lines := parseProxyLines("1.2.3.4:8080\n5.6.7.8:3128\n")

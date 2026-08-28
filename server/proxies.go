@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -33,9 +34,11 @@ import (
 
 // ProxyEntry 一条代理记录。
 type ProxyEntry struct {
-	ID          int64  `json:"id"`
-	Source      string `json:"source"`
-	Addr        string `json:"addr"` // host:port
+	ID     int64  `json:"id"`
+	Source string `json:"source"`
+	// Addr 代理地址。多数是裸 host:port（默认按 http 代理使用）；socks5 源解析出来的
+	// 会带 scheme 前缀（socks5://host:port），测通与下发全链路按完整地址处理。
+	Addr        string `json:"addr"`
 	LatencyMs   int    `json:"latency_ms"`
 	Alive       bool   `json:"alive"`
 	LastChecked string `json:"last_checked_at"`
@@ -96,7 +99,15 @@ func createProxiesTable(db *sql.DB) error {
 }
 
 // parseProxyLines 从文本/HTML 提取 host:port 列表（兼容纯文本行与 89ip HTML）。
+//
+// 先尝试按 JSON 结构化源解析（站大爷 zdaye 等：{data:{proxy_list:[{ip,port,protocol}]}}）——
+// 那种响应里 ip 与 port 是分开的字段，正则的 ip:port 连写模式一条都抓不到。不是 JSON
+// 或没有 proxy_list 字段时才回落到正则，纯文本/HTML 源行为完全不变。
 func parseProxyLines(text string) []string {
+	if items := parseProxyJSON(text); items != nil {
+		// 是可识别的 JSON 代理列表（哪怕过滤后为空）就以它为准，不再回落正则乱抓
+		return items
+	}
 	out := []string{}
 	for _, m := range ipPortRe.FindAllStringSubmatch(text, -1) {
 		ip, port := m[1], m[2]
@@ -104,6 +115,80 @@ func parseProxyLines(text string) []string {
 			continue
 		}
 		out = append(out, ip+":"+port)
+	}
+	return out
+}
+
+// proxyJSONItem 结构化代理源里的一条。port 用 json.Number 兼容数字与字符串两种写法。
+type proxyJSONItem struct {
+	IP       string      `json:"ip"`
+	Port     json.Number `json:"port"`
+	Protocol string      `json:"protocol"`
+}
+
+// normalize 把一条 JSON 记录转成可用的代理地址；无法使用时返回空串。
+//
+// 协议决定前缀：
+//   - socks5 → socks5://host:port（Go http.Transport 与 curl_cffi/Playwright 都原生支持）
+//   - http/https/空 → 裸 host:port（沿用现状，池子里绝大多数是 http 代理）
+//   - 其余（socks4 等）→ 跳过。net/http 的 Proxy 只认 socks5，socks4 即便留下也测不通，
+//     不如当场丢掉，省下测通配额
+func (it proxyJSONItem) normalize() string {
+	ip := strings.TrimSpace(it.IP)
+	port := strings.TrimSpace(it.Port.String())
+	if !validIP(ip) || !validPort(port) {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(it.Protocol)) {
+	case "socks5", "socks5h", "socks":
+		return "socks5://" + ip + ":" + port
+	case "", "http", "https":
+		return ip + ":" + port
+	default:
+		return ""
+	}
+}
+
+// parseProxyJSON 解析结构化代理源。返回 nil 表示「不是可识别的 JSON 代理列表」
+// （交回正则处理）；返回非 nil（可能是空切片）表示「已按 JSON 处理完」，此时即使
+// 过滤后为空也不该再回落正则，否则会在 JSON 文本里乱抓出 IP 片段。
+func parseProxyJSON(text string) []string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return nil
+	}
+	// 同时兼容 {data:{proxy_list}}（站大爷）、顶层 {proxy_list} 以及顶层就是数组
+	var doc struct {
+		ProxyList []proxyJSONItem `json:"proxy_list"`
+		Data      struct {
+			ProxyList []proxyJSONItem `json:"proxy_list"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &doc); err == nil {
+		items := doc.Data.ProxyList
+		if items == nil {
+			items = doc.ProxyList
+		}
+		if items != nil {
+			return normalizeProxyItems(items)
+		}
+	}
+	// 顶层直接是数组的情况：[{ip,port,protocol}, ...]
+	if trimmed[0] == '[' {
+		var arr []proxyJSONItem
+		if err := json.Unmarshal([]byte(trimmed), &arr); err == nil && arr != nil {
+			return normalizeProxyItems(arr)
+		}
+	}
+	return nil
+}
+
+func normalizeProxyItems(items []proxyJSONItem) []string {
+	out := []string{}
+	for _, it := range items {
+		if addr := it.normalize(); addr != "" {
+			out = append(out, addr)
+		}
 	}
 	return out
 }
@@ -316,8 +401,14 @@ var proxyTestTransport = &http.Transport{
 type ctxKeyProxyAddr struct{}
 
 // proxyFromRequest 从请求上下文读取代理地址；未设置时直连。
+//
+// 地址已带 scheme（socks5://host:port）就原样解析；裸 host:port 仍按 http 代理处理
+// —— 池子里绝大多数是 http 代理，保持它们不写前缀，兼容库里的历史数据。
 func proxyFromRequest(r *http.Request) (*url.URL, error) {
 	if addr, ok := r.Context().Value(ctxKeyProxyAddr{}).(string); ok && addr != "" {
+		if strings.Contains(addr, "://") {
+			return url.Parse(addr)
+		}
 		return url.Parse("http://" + addr)
 	}
 	return nil, nil

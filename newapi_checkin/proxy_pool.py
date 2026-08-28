@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import threading
@@ -55,12 +56,74 @@ def _valid_port(port: int) -> bool:
 
 
 def parse_proxy_lines(text: str) -> list[str]:
-    """从纯文本或 HTML 中提取 host:port 列表，过滤非法 IP/端口。"""
+    """从纯文本、HTML 或结构化 JSON 中提取代理地址，过滤非法 IP/端口。
+
+    JSON 源（站大爷 zdaye 等：{data:{proxy_list:[{ip,port,protocol}]}}）里 ip 与 port
+    是分开的字段，正则的 ip:port 连写模式一条都抓不到，所以先按 JSON 试，不是 JSON
+    才回落正则。socks5 输出带 scheme 前缀，http/空输出裸 host:port —— 与服务端
+    parseProxyLines 完全同口径（本地抓源是平台预取失败时的降级路径，两边不能各走各的）。
+    """
+    items = _parse_proxy_json(text)
+    if items is not None:
+        return items
     out: list[str] = []
     for ip, port in _IP_PORT_RE.findall(text or ""):
         if _valid_ip(ip) and _valid_port(int(port)):
             out.append(f"{ip}:{port}")
     return out
+
+
+def _parse_proxy_json(text: str) -> Optional[list[str]]:
+    """结构化代理源解析。
+
+    返回 None 表示「不是可识别的 JSON 代理列表」，交回正则处理；返回列表（可能为空）
+    表示「已按 JSON 处理完」，此时即使过滤后为空也不回落正则，免得在 JSON 文本里
+    乱抓出 IP 片段。
+    """
+    stripped = (text or "").strip()
+    if not stripped or stripped[0] not in "{[":
+        return None
+    try:
+        doc = json.loads(stripped)
+    except (ValueError, TypeError):
+        return None
+    items = None
+    if isinstance(doc, dict):
+        data = doc.get("data")
+        if isinstance(data, dict) and isinstance(data.get("proxy_list"), list):
+            items = data["proxy_list"]
+        elif isinstance(doc.get("proxy_list"), list):
+            items = doc["proxy_list"]
+    elif isinstance(doc, list):
+        items = doc
+    if items is None:
+        return None
+    out: list[str] = []
+    for it in items:
+        addr = _normalize_proxy_item(it)
+        if addr:
+            out.append(addr)
+    return out
+
+
+def _normalize_proxy_item(item) -> str:
+    """一条 JSON 记录 → 代理地址；无法使用返回空串。协议策略与服务端 normalize 一致：
+    socks5 带前缀、http/空裸地址、其余（socks4 等下游用不了）跳过。"""
+    if not isinstance(item, dict):
+        return ""
+    ip = str(item.get("ip") or "").strip()
+    try:
+        port = int(str(item.get("port")).strip())
+    except (TypeError, ValueError):
+        return ""
+    if not _valid_ip(ip) or not _valid_port(port):
+        return ""
+    protocol = str(item.get("protocol") or "").strip().lower()
+    if protocol in ("socks5", "socks5h", "socks"):
+        return f"socks5://{ip}:{port}"
+    if protocol in ("", "http", "https"):
+        return f"{ip}:{port}"
+    return ""
 
 
 @dataclass
