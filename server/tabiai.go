@@ -150,7 +150,20 @@ func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	cookie, err := issueTabiAIRefreshCookie(r.Context(), cfg.HTTP, *target, tabiaiGithubAuthorize)
+	// 签发也走代理，别让服务器真实 IP 直接碰 GitHub OAuth：
+	//   - 账号自带固定代理 → newCookieTestHTTPClient 会优先用它，这里不必再取池
+	//   - 没自带 → 从代理池领一个可用出口；池空则退回直连（不因没代理而阻断签发）
+	proxyAddr := ""
+	if !hasOwnProxy(*target) {
+		if addrs := s.proxies.AvailableAddrs(1); len(addrs) > 0 {
+			proxyAddr = addrs[0]
+			log.Printf("[tabiai] 账号 %q 无自带代理，签发改用代理池出口", name)
+		} else {
+			log.Printf("[tabiai] 账号 %q 无自带代理且代理池为空，签发退回直连", name)
+		}
+	}
+
+	cookie, err := issueTabiAIRefreshCookie(r.Context(), cfg.HTTP, *target, tabiaiGithubAuthorize, proxyAddr)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -172,13 +185,17 @@ func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request)
 // authorizeURL 供测试注入；生产传 GitHub 官方地址。
 //
 // 三步必须在同一个 HTTP session 内完成（state 与站点会话绑定），因此客户端带 cookiejar。
+//
+// proxyAddr 是「账号没有自带固定代理时」从代理池领到的出口（裸 host:port 或 socks5://...）；
+// 账号配了 account.Proxy 时它会被 newCookieTestHTTPClient 优先采用、proxyAddr 忽略，
+// 两处都空则直连。走代理是为了不让服务器真实 IP 直接碰 GitHub OAuth 端点。
 func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account Account,
-	authorizeURL string) (string, error) {
+	authorizeURL string, proxyAddr string) (string, error) {
 	base, err := cookieTestBaseURL(account.URL)
 	if err != nil {
 		return "", fmt.Errorf("站点 URL 无效: %w", err)
 	}
-	client, err := newTabiAIOAuthClient(account, httpCfg)
+	client, err := newTabiAIOAuthClient(account, httpCfg, proxyAddr)
 	if err != nil {
 		return "", err
 	}
@@ -283,8 +300,9 @@ func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account A
 
 // newTabiAIOAuthClient 带 cookiejar 的客户端：三步 OAuth 的 state 与站点会话绑定，必须同一 session。
 // 统一不跟随重定向 —— 第 2 步要读 Location 取 code，第 3 步只关心 Set-Cookie。
-func newTabiAIOAuthClient(account Account, httpCfg HTTPConfig) (*http.Client, error) {
-	client, err := newCookieTestHTTPClient(account, httpCfg, false, "")
+// proxyAddr 透传给 newCookieTestHTTPClient（账号自带 proxy 优先，其次 proxyAddr，都空则直连）。
+func newTabiAIOAuthClient(account Account, httpCfg HTTPConfig, proxyAddr string) (*http.Client, error) {
+	client, err := newCookieTestHTTPClient(account, httpCfg, false, proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP 客户端配置失败: %w", err)
 	}

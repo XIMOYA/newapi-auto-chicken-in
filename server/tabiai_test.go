@@ -251,7 +251,7 @@ func TestIssueTabiAIRefreshCookieThreeSteps(t *testing.T) {
 
 	cookie, err := issueTabiAIRefreshCookie(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
 		Name: "tabi", URL: site.URL, GithubUserSession: "gh-session",
-	}, authorize.URL)
+	}, authorize.URL, "")
 	if err != nil {
 		t.Fatalf("签发失败: %v", err)
 	}
@@ -307,5 +307,77 @@ func TestExtractGithubAuthorizeCodeErrors(t *testing.T) {
 	code, err := extractGithubAuthorizeCode(302, "https://site/oauth/github?code=abc&state=s")
 	if err != nil || code != "abc" {
 		t.Fatalf("正常 302 应取到 code: %q %v", code, err)
+	}
+}
+
+// proxyOf 取出 client 的 Transport 在请求某地址时会用的代理 URL（nil = 直连）。
+func proxyOf(t *testing.T, c *http.Client) *url.URL {
+	t.Helper()
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok || tr.Proxy == nil {
+		return nil
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://github.com/login/oauth/authorize", nil)
+	u, err := tr.Proxy(req)
+	if err != nil {
+		t.Fatalf("解析代理出错: %v", err)
+	}
+	return u
+}
+
+func TestNewTabiAIOAuthClient_ProxyWiring(t *testing.T) {
+	httpCfg := HTTPConfig{Timeout: 5, Verify: true}
+
+	// 1) 账号无自带代理 + 池地址（socks5）：签发经该 socks5 出口
+	c, err := newTabiAIOAuthClient(Account{URL: "https://a.com"}, httpCfg, "socks5://1.2.3.4:1080")
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	if u := proxyOf(t, c); u == nil || u.String() != "socks5://1.2.3.4:1080" {
+		t.Fatalf("池 socks5 代理未生效: %v", u)
+	}
+
+	// 2) 池地址是裸 host:port：按 http 代理用（与 proxyFromRequest 同口径）
+	c, _ = newTabiAIOAuthClient(Account{URL: "https://a.com"}, httpCfg, "1.2.3.4:8080")
+	if u := proxyOf(t, c); u == nil || u.String() != "http://1.2.3.4:8080" {
+		t.Fatalf("池裸地址未套 http: %v", u)
+	}
+
+	// 3) 账号自带代理优先，忽略池地址
+	own := "http://9.9.9.9:8080"
+	c, _ = newTabiAIOAuthClient(Account{URL: "https://a.com", Proxy: &own}, httpCfg, "socks5://1.2.3.4:1080")
+	if u := proxyOf(t, c); u == nil || u.String() != "http://9.9.9.9:8080" {
+		t.Fatalf("账号自带代理应优先于池地址: %v", u)
+	}
+
+	// 4) 都为空：直连（测试环境无 HTTP_PROXY，ProxyFromEnvironment 返回 nil）
+	c, _ = newTabiAIOAuthClient(Account{URL: "https://a.com"}, httpCfg, "")
+	if u := proxyOf(t, c); u != nil {
+		t.Fatalf("无任何代理时应直连，实际走了 %v", u)
+	}
+}
+
+// TestIssueRefreshCookieGoesThroughProxy 端到端确认签发的三步请求真的经过了代理。
+// 用一个记录型 HTTP 代理：三步里打 github.com 的那一步会经它 CONNECT，收到即证明走了代理。
+func TestIssueRefreshCookieGoesThroughProxy(t *testing.T) {
+	var proxied atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 走代理时，绝对 URL 或 CONNECT 会打到这里
+		if r.Method == http.MethodConnect || strings.HasPrefix(r.RequestURI, "http") {
+			proxied.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+
+	// 账号无自带代理，proxyAddr 传代理服务器地址（裸 host:port，会被套成 http://）
+	addr := strings.TrimPrefix(proxy.URL, "http://")
+	_, _ = issueTabiAIRefreshCookie(context.Background(),
+		HTTPConfig{Timeout: 3, Verify: true},
+		Account{Name: "tabi", URL: "https://tabi.example.com", GithubUserSession: "gh"},
+		"https://github.com/login/oauth/authorize", addr)
+	// 不关心签发成没成（假代理不会真回站点响应），只确认请求确实被导向了代理
+	if proxied.Load() == 0 {
+		t.Fatal("签发请求没有经过代理")
 	}
 }
