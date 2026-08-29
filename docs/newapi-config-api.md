@@ -49,7 +49,7 @@ Authorization: Bearer <JWT 或 API Key>
 
 | 范围 | 端点 | 说明 |
 | --- | --- | --- |
-| **双认证**<br>JWT 或 API Key | `GET /api/config`<br>`GET /api/config/revision`<br>`PUT /api/config`<br>`GET /api/export`<br>`GET /api/accounts`<br>`POST /api/accounts/ops`<br>`GET /api/accounts/{name}`<br>`POST /api/cookie-tests/newapi`<br>`POST /api/cookie-tests/tabiai`<br>`GET /api/cookie-tests/status`<br>`POST /api/cookie-tests/stop`<br>`POST /api/tabiai/issue-cookie`<br>`GET /api/run-state`<br>`POST /api/run-state/unlock`<br>`GET /api/proxies`<br>`GET /api/proxies/stats`<br>`POST /api/proxies/refresh`<br>`POST /api/proxies/speedtest` | 日常运维。脚本用一把 API Key 就能干完，不必模拟登录换 JWT |
+| **双认证**<br>JWT 或 API Key | `GET /api/config`<br>`GET /api/config/revision`<br>`PUT /api/config`<br>`GET /api/export`<br>`GET /api/accounts`<br>`POST /api/accounts/ops`<br>`GET /api/accounts/{name}`<br>`POST /api/cookie-tests/newapi`<br>`POST /api/cookie-tests/tabiai`<br>`GET /api/cookie-tests/status`<br>`POST /api/cookie-tests/stop`<br>`POST /api/tabiai/issue-cookie`<br>`GET /api/tabiai/expired`<br>`GET /api/run-state`<br>`POST /api/run-state/unlock`<br>`GET /api/proxies`<br>`GET /api/proxies/stats`<br>`POST /api/proxies/refresh`<br>`POST /api/proxies/speedtest` | 日常运维。脚本用一把 API Key 就能干完，不必模拟登录换 JWT |
 | **仅 API Key** | `GET /api/config/raw`<br>`GET /api/accounts/{name}/raw`<br>`GET /api/proxies/available`<br>`POST /api/proxies/feedback`<br>`POST /api/accounts/{name}/refresh-cookie`<br>`POST /api/run-state/start`<br>`POST /api/run-state/heartbeat`<br>`POST /api/run-state/stop` | 客户端专用通道。JWT 调这些会 401 |
 | **仅 JWT** | `POST /api/config/import`<br>`GET /api/keys`<br>`POST /api/keys`<br>`DELETE /api/keys/{id}`<br>`PUT /api/password`<br>`POST /api/auth/verify-password`<br>`GET /api/tabiai/keepalive`<br>`PUT /api/tabiai/keepalive`<br>`POST /api/tabiai/keepalive/run` | 控制平面 + 网页端专属。一把躺在 CI secrets 里的 Key 若能改密码或造新 Key，泄露就等于永久失守；保活三个接口客户端没有调它的场合 |
 | **无需认证** | `GET /api/health`<br>`POST /api/login` | |
@@ -343,13 +343,15 @@ merge 规则：`accounts` / `sites` 按 `name` 合并（同名整条替换，新
 
 **仅 API Key**。定点更新某个账号的 `new_api_refresh`，供客户端回写。
 
-两种场合都会调它，走的是同一条落盘 + 回写链路（`runner._tabiai_rotate_callback`）：
+只在**代次轮转后**调它：每次 refresh 成功站点都会下发下一代 secret，客户端落盘后
+必须同步过来，否则平台的保活会拿着已作废的旧代次去撞重放检测。
 
-- **代次轮转后** —— 每次 refresh 成功站点都会下发下一代 secret
-- **客户端自行签发后** —— refresh 被拒时客户端用账号的 `github_user_session` 走
-  GitHub OAuth 签发一条新凭据（与平台 `POST /api/tabiai/issue-cookie` 同一套三步协议，
-  但出口是客户端自己的代理），签发结果必须立刻同步过来，否则平台的保活会拿着
-  已作废的旧代次去撞重放检测
+> 凭据**过期后的重新签发**不走这里 —— 客户端改为请平台代签
+> （`POST /api/tabiai/issue-cookie` 带 `for_running_checkin: true`），平台签发时
+> 自己就写库了，客户端拿到新凭据只更新本机，不再回写一遍。
+> 为什么让平台签发：签发要打 GitHub OAuth，而 Actions runner 出口是随机 Azure IP、
+> 代理池里全是机房 IP，带着 `user_session` 从这些地址反复出现最容易触发 GitHub 账号
+> 风控（最坏把 `user_session` 直接作废）。平台在固定 IP 上，GitHub 眼里是常用设备。
 
 ```json
 { "cookie": "new_api_refresh=sid.secret" }
@@ -549,14 +551,27 @@ state 语义：
 为该账号签发一条**全新的** `new_api_refresh`。
 
 ```json
-{ "account_name": "Steven" }
+{ "account_name": "Steven", "for_running_checkin": false }
 ```
 
-**200** `{ "ok": true, "account_name": "Steven" }`
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| account_name | 是 | 目标账号名（精确匹配，大小写敏感） |
+| for_running_checkin | 否 | 置 `true` 时**放行签到锁**。只有签到进程该用它 —— 它自己就是那个「正在跑的签到」，被自己的锁拦住毫无意义。签发按账号生效，只影响请求里这一个，不波及同轮其他账号 |
+
+**200**
+
+```json
+{ "ok": true, "account_name": "Steven", "cookie": "new_api_refresh=sid.secret" }
+```
+
+**`cookie` 字段只对 API Key 调用方下发。** 签到客户端要拿新凭据立刻重试本轮，
+所以必须回给它；网页端走 JWT，签发完刷新页面就够了，不下发就少一个泄漏面。
+明文暴露面没有新增 —— API Key 持有者本来就能 `GET /api/config/raw` 拉走整份明文。
 
 | 状态码 | 文案 |
 | --- | --- |
-| 409 | 签到进行中被锁（响应体带 `run_state`，同上） |
+| 409 | 签到进行中被锁（响应体带 `run_state`，同上）。**带 `for_running_checkin: true` 时不会出现** |
 | 400 | `请求体不是合法的 JSON` / `account_name 不能为空` |
 | 400 | `该账号未填写 GitHub user_session，无法自动签发；请填写后重试，或直接从浏览器复制 new_api_refresh` |
 | 400 | OAuth 三步的具体失败原因（见下） |
@@ -588,6 +603,41 @@ OAuth 失败文案按阶段分布，都是 400：
 刷新代理池换个出口即可。
 
 ⚠ 签发会换出全新 sid，**签到进程手里那条当场作废** —— 这就是它被签到锁拦住的原因。
+
+### GET /api/tabiai/expired
+
+双认证。凭据已失效的 tabiai 账号名单。**只读库里保活写下的判定，不触发任何检测**，
+所以毫秒返回、可随时查 —— 不必为了拿这份名单先跑一遍几十秒的凭据检测。
+
+**200**
+
+```json
+{
+  "accounts": [
+    { "name": "TaBiAI-1", "state": "invalid", "paused": true,
+      "message": "凭据已失效", "last_run_at": "2026-08-28T07:00:00Z",
+      "has_user_session": true }
+  ],
+  "count": 1,
+  "checked_at": "2026-08-28T07:00:00Z"
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| has_user_session | **决定这个账号能不能自动签发**。没填的只能人工粘贴新凭据，一并返回省得调用方挨个查账号详情 |
+| paused | 保活因凭据失效暂停了它。比 `state` 更强的信号 —— 改过凭据才会自动恢复 |
+| checked_at | 名单的判定时间（取最近一次保活刷新时间），让调用方知道这份名单有多新。库里一条记录都没有时是空串 |
+
+**判定口径刻意从严**：只有 `state == "invalid"` 或 `paused == true` 算失效。
+`proxy_issue` / `abnormal` **不算** —— 那是代理不通或网络异常，凭据本身可能是好的，
+把它们也当过期去签发，等于白白作废一条还能用的凭据。
+
+没有保活记录的账号（还没被刷过）不出现在名单里 —— 不能凭空断定它失效。
+非 tabiai 账号一律不列（它们压根没有 `new_api_refresh` 这回事）。
+
+响应**不含任何凭据字段**（连打码占位符都没有），所以走双认证：网页端的「一键签发
+失效账号」要用，脚本/客户端也要用。空名单序列化成 `[]` 而不是 `null`。
 
 ### GET /api/tabiai/keepalive
 

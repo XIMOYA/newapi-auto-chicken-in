@@ -83,6 +83,36 @@ web/src/views/CookieTestsView.vue
             </template>
           </n-space>
         </div>
+
+        <!-- 一键签发：名单来自 GET /api/tabiai/expired（读库里保活的判定，不跑检测），
+             所以刷新页面也在，不依赖本次是否点过「开始检测」 -->
+        <n-card size="small" class="reissue-card">
+          <n-space align="center" :size="10" wrap>
+            <n-button size="small" :loading="loadingExpired" :disabled="reissuing"
+                      @click="loadExpired">
+              查询失效账号
+            </n-button>
+            <n-button size="small" type="warning" :loading="reissuing"
+                      :disabled="!reissuableNames.length || runLock.running"
+                      @click="reissueAllExpired">
+              一键签发失效账号（{{ reissuableNames.length }}）
+            </n-button>
+            <span v-if="expiredLoadedAt" class="checked-at">
+              失效 {{ expired.length }} 个<template v-if="expiredWithoutSession.length">
+                ，其中 {{ expiredWithoutSession.length }} 个未填 user_session 需人工处理</template>
+            </span>
+            <n-tag v-if="runLock.running" size="small" type="error" :bordered="false">
+              签到进行中，人工签发已锁定
+            </n-tag>
+          </n-space>
+          <div v-if="reissueLog.length" class="reissue-log">
+            <div v-for="line in reissueLog" :key="line.name"
+                 :class="['reissue-line', line.ok ? 'is-ok' : 'is-fail']">
+              {{ line.ok ? '✓' : '✕' }} {{ line.name }}<template v-if="line.detail">：{{ line.detail }}</template>
+            </div>
+          </div>
+        </n-card>
+
         <cookie-test-panel
           mode="tabiai"
           :accounts="tabiaiAccounts"
@@ -104,13 +134,16 @@ web/src/views/CookieTestsView.vue
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { NAlert, NButton, NSpace, NTabPane, NTabs, NTag, useDialog, useMessage } from 'naive-ui'
+import { NAlert, NButton, NCard, NSpace, NTabPane, NTabs, NTag, useDialog, useMessage } from 'naive-ui'
 import CookieTestPanel from '@/components/CookieTestPanel.vue'
 import {
   getCookieTestStatus,
+  issueTabiAICookie,
+  listExpiredTabiAI,
   startNewAPICookieTest,
   startTabiAICookieTest,
-  stopCookieTest
+  stopCookieTest,
+  type ExpiredTabiAIAccount
 } from '@/api/cookieTests'
 import { getRunState, unlockRunState } from '@/api/runState'
 import { useConfigStore } from '@/stores/config'
@@ -142,6 +175,21 @@ const message = useMessage()
 const activeMode = ref<CookieTestMode>('newapi_cookie')
 const starting = ref<CookieTestMode | ''>('')
 const stopping = ref(false)
+
+// ---- 一键签发失效凭据 ----
+// 名单来自 GET /api/tabiai/expired（读库里保活写下的判定，不触发检测），
+// 所以刷新页面还在，也不必先跑一遍几十秒的凭据检测。
+const expired = ref<ExpiredTabiAIAccount[]>([])
+const expiredLoadedAt = ref('')
+const loadingExpired = ref(false)
+const reissuing = ref(false)
+const reissueLog = ref<Array<{ name: string; ok: boolean; detail: string }>>([])
+
+// 只有填了 user_session 的才能自动签发；没填的列出来提示人工处理，不混进批量里
+const reissuableNames = computed(() =>
+  expired.value.filter((a) => a.has_user_session).map((a) => a.name)
+)
+const expiredWithoutSession = computed(() => expired.value.filter((a) => !a.has_user_session))
 
 // 后端只有一个任务，这里按模式分别缓存最近一次结果，切 Tab 不会互相覆盖
 const newapiResults = ref<CookieTestResult[]>([])
@@ -276,6 +324,67 @@ function runTabiAITest(accountNames: string[]) {
   void start('tabiai', accountNames)
 }
 
+// ---------------------------------------------------------------------------
+// 一键签发失效凭据
+// ---------------------------------------------------------------------------
+
+async function loadExpired() {
+  loadingExpired.value = true
+  try {
+    const result = await listExpiredTabiAI()
+    expired.value = result.accounts
+    expiredLoadedAt.value = result.checked_at || new Date().toISOString()
+    reissueLog.value = []
+    if (!result.count) {
+      message.success('没有凭据失效的账号')
+    } else if (!reissuableNames.value.length) {
+      message.warning(`${result.count} 个账号失效，但都没填 GitHub user_session，只能人工粘贴新凭据`)
+    } else {
+      message.info(`${result.count} 个账号失效，其中 ${reissuableNames.value.length} 个可自动签发`)
+    }
+  } catch (error) {
+    message.error(extractErrorMessage(error, '查询失效账号失败'))
+  } finally {
+    loadingExpired.value = false
+  }
+}
+
+/**
+ * 串行逐个签发。
+ *
+ * 不并发是刻意的：签发要走 GitHub OAuth 三步，并发打 GitHub 容易触发限流
+ * （403/429），一次失败一批还不如慢点全成。单个失败不中断后面的，
+ * 每条结果都留在页面上，好对照哪个账号还需要人工处理。
+ */
+async function reissueAllExpired() {
+  const names = reissuableNames.value
+  if (!names.length) return
+  reissuing.value = true
+  reissueLog.value = []
+  let okCount = 0
+  try {
+    for (const name of names) {
+      try {
+        await issueTabiAICookie(name)
+        okCount += 1
+        reissueLog.value.push({ name, ok: true, detail: '已签发新凭据' })
+      } catch (error) {
+        reissueLog.value.push({ name, ok: false, detail: extractErrorMessage(error, '签发失败') })
+      }
+    }
+    if (okCount === names.length) {
+      message.success(`${okCount} 个账号已重新签发`)
+    } else {
+      message.warning(`${okCount}/${names.length} 个签发成功，其余原因见下方列表`)
+    }
+    // 签发完重查一次：成功的账号保活状态还没更新，但失败的仍在名单里，
+    // 重查能让「还剩谁要处理」一目了然
+    await loadExpired()
+  } finally {
+    reissuing.value = false
+  }
+}
+
 async function handleStop() {
   stopping.value = true
   try {
@@ -406,5 +515,27 @@ onBeforeUnmount(() => {
 .checked-at {
   color: #8492a6;
   font-size: 12px;
+}
+
+.reissue-card {
+  margin: 0 0 12px;
+  border-radius: 10px;
+}
+
+.reissue-log {
+  margin-top: 10px;
+  max-height: 180px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/* 成败用颜色区分，逐条列出来 —— 批量操作最怕「点完不知道哪个没成」 */
+.reissue-line.is-ok {
+  color: #18a058;
+}
+
+.reissue-line.is-fail {
+  color: #d03050;
 }
 </style>

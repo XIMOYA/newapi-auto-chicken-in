@@ -533,3 +533,101 @@ class TestWritebackReadBack:
         assert ok is False
         assert "未确认收下" in detail
         assert all(item["method"] == "POST" for item in sent)
+
+
+class TestPlatformIssueRefreshCookie:
+    """请平台签发新凭据（客户端不再自己走 GitHub OAuth）。
+
+    动机：签发要打 GitHub OAuth 端点，而 Actions runner 出口是随机 Azure IP、
+    代理池里全是机房 IP —— 带着 user_session 从这些地址反复出现最容易触发 GitHub
+    账号风控，最坏把 user_session 直接作废。平台在固定 IP 上，风险低得多。
+    """
+
+    @staticmethod
+    def _sync(**overrides):
+        from newapi_checkin.config import ConfigSyncConfig
+
+        raw = {
+            "enabled": True,
+            "url": "https://panel.example.com/api/config/raw",
+            "token": "k" * 20,
+        }
+        raw.update(overrides)
+        return ConfigSyncConfig.from_raw(raw)
+
+    def _call(self, monkeypatch, response, name="T"):
+        sent = []
+
+        def fake_request(method, url, **kwargs):
+            sent.append({"method": method, "url": url, **kwargs})
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        monkeypatch.setattr(remote_sync.cffi, "request", fake_request)
+        cookie, error = remote_sync.issue_refresh_cookie_via_platform(self._sync(), name)
+        return cookie, error, sent
+
+    def test_posts_to_issue_endpoint_with_running_checkin_flag(self, monkeypatch):
+        cookie, error, sent = self._call(monkeypatch, FakeResponse(
+            {"ok": True, "account_name": "T", "cookie": "new_api_refresh=sid.new"}))
+        assert (cookie, error) == ("new_api_refresh=sid.new", "")
+        assert sent[0]["method"] == "POST"
+        assert sent[0]["url"] == "https://panel.example.com/api/tabiai/issue-cookie"
+        # for_running_checkin 必须带：签发端点默认被签到锁拦住，而调用方就是那个签到
+        assert sent[0]["json"] == {"account_name": "T", "for_running_checkin": True}
+
+    def test_goes_direct_not_through_proxy(self, monkeypatch):
+        """打的是自己的平台，与回写/读回核实同一套口径：显式直连。"""
+        _, _, sent = self._call(monkeypatch, FakeResponse(
+            {"ok": True, "cookie": "new_api_refresh=sid.new"}))
+        assert sent[0]["proxies"] is None
+
+    def test_account_name_is_sent_as_json_not_path(self, monkeypatch):
+        """名字走请求体，不拼进路径 —— 省掉一层转义，也和平台端点约定一致。"""
+        _, _, sent = self._call(monkeypatch, FakeResponse(
+            {"ok": True, "cookie": "new_api_refresh=sid.new"}), name="组/A 号")
+        assert sent[0]["url"].endswith("/api/tabiai/issue-cookie")
+        assert sent[0]["json"]["account_name"] == "组/A 号"
+
+    def test_platform_error_is_surfaced(self, monkeypatch):
+        cookie, error, _ = self._call(monkeypatch, FakeResponse(
+            {"error": "GitHub 要求重新登录，user_session 已失效"}, status_code=400))
+        assert cookie == ""
+        assert "user_session 已失效" in error
+
+    def test_ok_false_without_error_field(self, monkeypatch):
+        cookie, error, _ = self._call(monkeypatch, FakeResponse({"ok": False}, status_code=200))
+        assert cookie == ""
+        assert "HTTP 200" in error
+
+    def test_success_without_cookie_hints_at_api_key(self, monkeypatch):
+        """平台只对 API Key 下发明文；用 JWT 调会 ok 但没 cookie，要提示配错了 token。"""
+        cookie, error, _ = self._call(monkeypatch, FakeResponse({"ok": True, "account_name": "T"}))
+        assert cookie == ""
+        assert "API Key" in error
+
+    def test_non_json_response(self, monkeypatch):
+        class Raw:
+            status_code = 502
+            text = "<html>bad gateway</html>"
+
+            def json(self):
+                raise ValueError("not json")
+
+        cookie, error, _ = self._call(monkeypatch, Raw())
+        assert cookie == ""
+        assert "不是 JSON" in error
+
+    def test_network_error_is_not_raised(self, monkeypatch):
+        cookie, error, _ = self._call(monkeypatch, RuntimeError("boom"))
+        assert cookie == ""
+        assert "RuntimeError" in error
+
+    def test_missing_url_reports_reason(self, monkeypatch):
+        from newapi_checkin.config import ConfigSyncConfig
+
+        sync = ConfigSyncConfig.from_raw({"enabled": True, "url": "", "token": "k" * 20})
+        cookie, error = remote_sync.issue_refresh_cookie_via_platform(sync, "T")
+        assert cookie == ""
+        assert "签发地址" in error

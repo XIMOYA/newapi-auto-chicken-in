@@ -1,7 +1,8 @@
 /*
 web/src/api/__tests__/cookieTests.test.ts
 cookieTests.ts 接口封装的单元测试（Vitest）
-覆盖：两个启动接口走各自路径、status/stop 的取值、TaBiAI 凭据签发的请求体与错误透传
+覆盖：两个启动接口走各自路径、status/stop 的取值、TaBiAI 凭据签发的请求体与错误透传、
+      凭据失效名单的解析与「不含凭据」约束
 说明：mock 掉 ../http，只验证「调了哪个地址、带了什么 body、怎么解包 data」，不发真实请求
 */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -19,6 +20,7 @@ vi.mock('../http', () => ({
 import {
   getCookieTestStatus,
   issueTabiAICookie,
+  listExpiredTabiAI,
   startNewAPICookieTest,
   startTabiAICookieTest,
   stopCookieTest
@@ -99,5 +101,59 @@ describe('签发 TaBiAI 凭据', () => {
     post.mockResolvedValue({ data: { ok: true, account_name: '我的 站点/A' } })
     await issueTabiAICookie('我的 站点/A')
     expect(post).toHaveBeenCalledWith('/tabiai/issue-cookie', { account_name: '我的 站点/A' })
+  })
+})
+
+describe('凭据失效名单', () => {
+  it('走 GET /tabiai/expired，解出名单与判定时间', async () => {
+    get.mockResolvedValue({
+      data: {
+        accounts: [
+          { name: 'A', state: 'invalid', paused: false, message: '凭据已失效',
+            last_run_at: '2026-08-28T07:00:00Z', has_user_session: true },
+          { name: 'B', state: 'abnormal', paused: true, message: '已暂停',
+            last_run_at: '2026-08-28T06:00:00Z', has_user_session: false }
+        ],
+        count: 2,
+        checked_at: '2026-08-28T07:00:00Z'
+      }
+    })
+    const result = await listExpiredTabiAI()
+    expect(get).toHaveBeenCalledWith('/tabiai/expired')
+    expect(result.count).toBe(2)
+    expect(result.checked_at).toBe('2026-08-28T07:00:00Z')
+    // has_user_session 决定能不能自动签发，是一键签发的筛选依据
+    expect(result.accounts.filter((a) => a.has_user_session).map((a) => a.name)).toEqual(['A'])
+  })
+
+  it('名单里不含任何凭据字段', async () => {
+    get.mockResolvedValue({
+      data: {
+        accounts: [{ name: 'A', state: 'invalid', paused: false, message: '',
+                     last_run_at: '', has_user_session: true }],
+        count: 1,
+        checked_at: ''
+      }
+    })
+    const result = await listExpiredTabiAI()
+    const serialized = JSON.stringify(result)
+    expect(serialized).not.toContain('new_api_refresh')
+    expect(serialized).not.toContain('***')
+    expect(result.accounts[0]).not.toHaveProperty('cookie')
+    expect(result.accounts[0]).not.toHaveProperty('github_user_session')
+  })
+
+  it('没有失效账号时是空数组', async () => {
+    get.mockResolvedValue({ data: { accounts: [], count: 0, checked_at: '' } })
+    const result = await listExpiredTabiAI()
+    expect(result.accounts).toEqual([])
+    expect(result.count).toBe(0)
+  })
+
+  it('服务端错误原样抛出，交页面提示', async () => {
+    get.mockRejectedValue({ response: { status: 500, data: { error: '服务器内部错误' } } })
+    await expect(listExpiredTabiAI()).rejects.toMatchObject({
+      response: { data: { error: '服务器内部错误' } }
+    })
   })
 })

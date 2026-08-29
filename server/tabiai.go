@@ -109,23 +109,36 @@ func (s *Server) handleWriteBackRefreshCookie(w http.ResponseWriter, r *http.Req
 
 // handleIssueTabiAICookie POST /api/tabiai/issue-cookie（JWT 或 API Key）
 // 用账号里保存的 GitHub user_session 走三步 OAuth，为该账号签发一条全新的 new_api_refresh。
+//
+// 两个调用方，行为有别：
+//   - 网页端（JWT）：人工点「签发」。签到进行中会被签到锁拦住 —— 那是防手滑，
+//     人工签发换出的新 sid 会让正在跑的那一轮当场作废。
+//   - 签到客户端（API Key + for_running_checkin）：refresh 过期时自救。必须放行签到锁，
+//     否则自救永远撞 409；而且要把新凭据回给它，它得立刻拿去重试本轮。
+//     签发是按账号的，只影响请求里这一个，不会波及同轮其他账号。
 func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request) {
-	// 签发会换出一条全新的 sid，签到进程手里那条当场作废。跑签到时必须拦住，
-	// 否则正在进行的整轮 TaBiAI 账号都会集体失败。
-	if s.guardRunningCheckin(w) {
-		return
-	}
 	var req struct {
 		AccountName string `json:"account_name"`
+		// ForRunningCheckin 由签到进程置 true：它自己就是那个「正在跑的签到」，
+		// 被自己的锁拦住毫无意义。放行范围仅限本端点、且只作用于请求里那个账号。
+		ForRunningCheckin bool `json:"for_running_checkin"`
 	}
 	if err := readJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "请求体不是合法的 JSON")
+		return
+	}
+	// 签发会换出一条全新的 sid，签到进程手里那条当场作废。人工签发时必须拦住，
+	// 否则正在进行的整轮 TaBiAI 账号都会集体失败。
+	if !req.ForRunningCheckin && s.guardRunningCheckin(w) {
 		return
 	}
 	name := strings.TrimSpace(req.AccountName)
 	if name == "" {
 		writeError(w, http.StatusBadRequest, "account_name 不能为空")
 		return
+	}
+	if req.ForRunningCheckin {
+		log.Printf("[tabiai] 账号 %q 由签到进程请求签发（已放行签到锁）", name)
 	}
 
 	cfg, _, err := LoadConfig(s.db)
@@ -178,7 +191,14 @@ func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	log.Printf("[tabiai] 已为账号 %q 签发新的 refresh cookie", name)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account_name": name})
+	body := map[string]any{"ok": true, "account_name": name}
+	// 明文只回给 API Key 调用方（签到客户端要拿它立刻重试本轮）。
+	// 网页端走 JWT，它签发完刷新页面就行，没有拿明文的必要 —— 不下发就少一个泄漏面。
+	// 暴露面没有新增：API Key 持有者本来就能 GET /api/config/raw 拉走整份明文。
+	if isAPIKeyRequest(r) {
+		body["cookie"] = cookie
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // issueTabiAIRefreshCookie 走 GitHub OAuth 三步为账号签发一条新的 new_api_refresh。

@@ -10,6 +10,7 @@ Cookie 可用性测试接口封装：站点 Cookie 与 TaBiAI 凭据使用独立
 - GET  /api/cookie-tests/status
 - POST /api/cookie-tests/stop
 - POST /api/tabiai/issue-cookie
+- GET  /api/tabiai/expired
 */
 import http from './http'
 import type { CookieTestStatus } from '@/types'
@@ -24,6 +25,28 @@ export interface CookieTestStartResult {
 export interface IssueTabiAICookieResult {
   ok: boolean
   account_name: string
+}
+
+/**
+ * 凭据失效的 tabiai 账号。
+ *
+ * has_user_session 决定能不能自动签发 —— 没填的只能人工粘贴新凭据，
+ * 一键签发要把这类账号跳过并单独提示，别让用户以为点了就都处理了。
+ */
+export interface ExpiredTabiAIAccount {
+  name: string
+  state: string
+  paused: boolean
+  message: string
+  last_run_at: string
+  has_user_session: boolean
+}
+
+export interface ExpiredTabiAIListResult {
+  accounts: ExpiredTabiAIAccount[]
+  count: number
+  /** 名单的判定时间（取最近一次保活刷新时间），空串表示还没有任何记录 */
+  checked_at: string
 }
 
 export function startNewAPICookieTest(accountNames: string[] = []): Promise<CookieTestStartResult> {
@@ -54,4 +77,16 @@ export function issueTabiAICookie(accountName: string): Promise<IssueTabiAICooki
   return http
     .post<IssueTabiAICookieResult>('/tabiai/issue-cookie', { account_name: accountName })
     .then((r) => r.data)
+}
+
+/**
+ * 凭据失效的 tabiai 账号名单。
+ *
+ * 读的是库里保活写下的判定，**不触发检测**，所以毫秒返回、可随时查 —— 不必逼用户
+ * 每次先跑一遍几十秒的凭据检测。判定口径从严：只有 invalid / paused 算失效，
+ * proxy_issue / abnormal 不算（那是代理或网络问题，凭据可能还好，签发它等于白白
+ * 作废一条可用凭据）。
+ */
+export function listExpiredTabiAI(): Promise<ExpiredTabiAIListResult> {
+  return http.get<ExpiredTabiAIListResult>('/tabiai/expired').then((r) => r.data)
 }

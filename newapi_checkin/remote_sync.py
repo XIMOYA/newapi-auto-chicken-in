@@ -334,6 +334,67 @@ def _writeback_once(sync: ConfigSyncConfig, endpoint: str,
     return True, ""
 
 
+def issue_refresh_cookie_via_platform(sync: ConfigSyncConfig,
+                                      account_name: str) -> tuple[str, str]:
+    """请平台为该账号签发一条新的 new_api_refresh，返回 (cookie, error)。
+
+    为什么让平台签发而不是本机自己走 OAuth：签发要打 GitHub 的 OAuth 端点，而
+    Actions runner 的出口是随机的 Azure IP、代理池里又都是机房 IP —— 带着
+    user_session 从这些地址反复出现，最容易触发 GitHub 的账号风控（最坏是把
+    user_session 直接作废，那自救链路就彻底断了）。平台部署在固定 IP 上，
+    GitHub 眼里它是「常用设备」，成功率和安全性都更好。
+
+    带 for_running_checkin=true：签发端点默认被签到锁拦住（防人工手滑打断正在跑的
+    那一轮），而这里的调用方**就是**那个正在跑的签到，必须放行。
+
+    平台签发成功后会自己写库，所以拿到 cookie 只需落本地盘，**不必再回写平台**。
+
+    显式直连（proxies=None）：打的是自己的平台，与回写、读回核实同一套口径。
+    """
+    endpoint = _issue_endpoint(sync)
+    if not endpoint:
+        return "", "无法确定签发地址（config_sync.url 未配置或非法）"
+    try:
+        response = cffi.request(
+            "POST", endpoint,
+            headers={**_headers(sync), "Content-Type": "application/json"},
+            json={"account_name": account_name, "for_running_checkin": True},
+            timeout=sync.timeout,
+            proxies=None,
+        )
+    except Exception as exc:  # noqa: BLE001 - 网络库异常类型不固定
+        return "", f"{type(exc).__name__}: {exc}"[:160]
+    status = int(getattr(response, "status_code", 0) or 0)
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 - 非 JSON 说明没到服务端（网关代答等）
+        text = str(getattr(response, "text", "") or "")[:120]
+        return "", f"平台签发响应不是 JSON（HTTP {status}）：{text!r}"
+    if not isinstance(body, dict):
+        return "", f"平台签发响应不是 JSON 对象（HTTP {status}）"
+    if status >= 400 or not body.get("ok"):
+        # 平台会把 OAuth 三步的具体原因放在 error 里，原样带出去好让人看懂
+        reason = str(body.get("error") or "").strip() or f"HTTP {status}"
+        return "", reason
+    cookie = body.get("cookie")
+    if not isinstance(cookie, str) or not cookie.strip():
+        # 平台说签发成功但没回凭据：多半是用 JWT 而不是 API Key 调的（那种不下发明文）
+        return "", "平台确认已签发但未返回凭据（检查 config_sync.token 是不是 API Key）"
+    return cookie.strip(), ""
+
+
+def _issue_endpoint(sync: ConfigSyncConfig) -> str:
+    """签发端点：按拉取 URL 同源推导 /api/tabiai/issue-cookie。"""
+    from urllib.parse import urlsplit, urlunsplit
+
+    if not sync.url:
+        return ""
+    parts = urlsplit(sync.url)
+    if not parts.scheme or not parts.netloc:
+        return ""
+    return urlunsplit((parts.scheme, parts.netloc, "/api/tabiai/issue-cookie", "", ""))
+
+
 def _verify_endpoint(sync: ConfigSyncConfig, account_name: str) -> str:
     """读回核实端点：按拉取 URL 同源推导 /api/accounts/{name}/raw。
 

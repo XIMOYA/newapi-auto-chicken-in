@@ -1270,36 +1270,46 @@ class Runner:
         return result.kind == api.AUTH_FAILED and result.path == TABIAI_REFRESH_PATH
 
     def _reissue_tabiai_cookie(self, account: Account, record) -> tuple[bool, str]:
-        """凭据过期时用账号的 GitHub user_session 走 OAuth 重新签发一条。
+        """凭据过期时**请平台**用该账号的 GitHub user_session 重新签发一条。
 
         返回 (是否签发成功, 失败原因)。失败原因会进汇总行的 detail，也就是会出现在
         邮件里 —— user_session 自己也过期这种情况必须让人看见，否则每天都白跑一轮。
 
-        全程走该账号的代理（见 github_oauth，代理配错就失败而不是偷偷直连）：签发换
-        出来的会话和后面签到用的必须是同一个出口 IP，站点会把两者关联起来看。
+        为什么交给平台而不是本机自己走 OAuth：签发要打 GitHub 的 OAuth 端点，而
+        Actions runner 的出口是随机 Azure IP、代理池里又都是机房 IP —— 带着
+        user_session 从这些地址反复出现最容易触发 GitHub 账号风控，最坏会把
+        user_session 直接作废，那自救链路就彻底断了。平台在固定 IP 上，GitHub 眼里
+        它是「常用设备」。本机那套 OAuth 实现（github_oauth.py）保留不动，
+        只是主链路不再走它 —— 平台不可达时**不回落**，宁可判负也不拿 user_session
+        去冒风控的险。
 
-        新凭据一到手就走 _tabiai_rotate_callback —— 落本地盘 + 回写平台是同一套流程，
-        少写一处，平台下一次保活就会拿着已作废的旧代次去撞重放检测。
+        平台签发成功后会自己写库，所以这里只需把新凭据落本地盘，**不再回写平台**
+        （省一次往返，也避免把平台刚写的值又覆盖一遍）。
         """
         with self._state_lock:
             if account.name in self._reissued:
                 return False, "凭据已失效，且本轮已尝试过重新签发"
             self._reissued.add(account.name)
 
+        if not self.cfg.config_sync.enabled or not self.cfg.config_sync.url:
+            return False, ("凭据已失效，且未启用 config_sync（签发由管理平台代做，"
+                           "必须能连上它）")
         if not str(getattr(account, "github_user_session", "") or "").strip():
             return False, ("凭据已失效，且账号未填写 GitHub user_session，"
                            "无法自动签发；请在管理端补上 user_session 或手动粘贴新凭据")
 
-        from .github_oauth import issue_refresh_cookie
+        from .remote_sync import issue_refresh_cookie_via_platform
 
-        log.warn("TaBiAI 凭据已失效，尝试用 GitHub user_session 重新签发一条")
-        cookie, error = issue_refresh_cookie(account, self.cfg.http,
-                                             record.cf if record is not None else None)
+        log.warn("TaBiAI 凭据已失效，请平台用 GitHub user_session 重新签发一条")
+        cookie, error = issue_refresh_cookie_via_platform(self.cfg.config_sync, account.name)
         if error or not cookie:
-            return False, f"凭据已失效且自动签发失败：{error or '未取得新凭据'}"
-        # 与轮转共用落盘 + 回写链路，保证本机与平台代次一致
-        self._tabiai_rotate_callback(account)(cookie)
-        log.ok("已重新签发 TaBiAI 凭据并同步到平台，重试本轮签到")
+            return False, f"凭据已失效且平台签发失败：{error or '未取得新凭据'}"
+        # 平台已落库，这里只更新本机（store + account.cookie），不再回写
+        from .tabiai import normalize_refresh_cookie
+
+        self.store.remember_refresh_cookie(account.slug, cookie)
+        account.cookie = normalize_refresh_cookie(cookie)
+        log.ok("平台已重新签发 TaBiAI 凭据（已落库），重试本轮签到")
         return True, ""
 
     def _writeback_refresh_cookie(self, account: Account, cookie: str) -> None:

@@ -105,6 +105,9 @@ func (s *Server) routes() http.Handler {
 
 	// TaBiAI 凭据维护：签发（GitHub OAuth 三步换 new_api_refresh）与回写（Python 侧轮转后同步）
 	mux.HandleFunc("POST /api/tabiai/issue-cookie", s.requireJWTOrAPIKey(s.handleIssueTabiAICookie))
+	// 凭据失效名单（读库里保活写下的判定，不触发检测）：网页端一键签发与脚本都要用，
+	// 响应不含任何凭据字段，所以走双认证
+	mux.HandleFunc("GET /api/tabiai/expired", s.requireJWTOrAPIKey(s.handleListExpiredTabiAI))
 	mux.HandleFunc("POST /api/accounts/{name}/refresh-cookie", s.requireAPIKey(s.handleWriteBackRefreshCookie))
 
 	// 签到运行状态：客户端用 API Key 上报开跑/心跳/收尾，网页端据此锁住高危凭据操作。

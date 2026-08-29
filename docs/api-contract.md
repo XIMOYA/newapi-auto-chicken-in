@@ -635,7 +635,8 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
 
 - 锁定期间 `POST /api/cookie-tests/tabiai` 与 `POST /api/tabiai/issue-cookie` 返回
   **409**，响应体为 `{ "error": "...可读说明...", "run_state": { ...同上... } }`，
-  前端可直接用回传状态刷新视图
+  前端可直接用回传状态刷新视图。**例外**：`issue-cookie` 带 `for_running_checkin: true`
+  时放行——那是签到进程在给自己的账号自救，被自己的锁拦住毫无意义
 - `POST /api/cookie-tests/newapi` **不锁**：站点 Cookie 是静态凭据，不轮转也没有重放检测
 - 判活看心跳而非布尔开关：Actions 有 6 小时硬上限，超时是被平台强杀，客户端没有机会
   发 `stop`。超过 `stale_after_seconds` 没心跳就自动视为已结束，否则一把只能显式关闭的
@@ -653,13 +654,41 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
 
 `POST /api/tabiai/issue-cookie`（JWT 或 API Key）
 
-请求体：`{ "account_name": "TaBiAI" }`
+请求体：`{ "account_name": "TaBiAI", "for_running_checkin": false }`
 
 用账号里保存的 `github_user_session` 走三步 OAuth，为该账号签发一条全新的 `new_api_refresh` 并写入 `accounts[].cookie`。
 
-响应（200）：`{ "ok": true, "account_name": "TaBiAI" }`
+`for_running_checkin: true` 时**放行签到锁**——只有签到进程该用它，它自己就是那个「正在跑的签到」，被自己的锁拦住毫无意义。签发按账号生效，只影响请求里这一个，不波及同轮其他账号。
+
+响应（200）：`{ "ok": true, "account_name": "TaBiAI", "cookie": "new_api_refresh=..." }`
+
+`cookie` 字段**只对 API Key 调用方下发**：签到客户端要拿新凭据立刻重试本轮；网页端走 JWT，签发完刷新页面就够，不下发就少一个泄漏面。明文暴露面没有新增——API Key 持有者本来就能拉 `/api/config/raw`。
+
 错误（400）：`{ "error": "该账号未填写 GitHub user_session，无法自动签发；请填写后重试，或直接从浏览器复制 new_api_refresh" }` 或 OAuth 过程中的具体错误
 错误（404）：`{ "error": "账号不存在: <名字>" }`
+
+### 凭据失效名单
+
+`GET /api/tabiai/expired`（JWT 或 API Key）
+
+响应（200）：
+```json
+{
+  "accounts": [
+    { "name": "TaBiAI-1", "state": "invalid", "paused": true, "message": "凭据已失效",
+      "last_run_at": "2026-08-28T07:00:00Z", "has_user_session": true }
+  ],
+  "count": 1,
+  "checked_at": "2026-08-28T07:00:00Z"
+}
+```
+
+只读 `tabiai_keepalive_state` 表里保活写下的判定，**不触发任何检测**，毫秒返回。网页端的「一键签发失效账号」和脚本都用它。
+
+- **判定从严**：只有 `state == "invalid"` 或 `paused` 算失效。`proxy_issue` / `abnormal` 不算——那是代理或网络问题，凭据可能还好，签发它等于白白作废一条可用凭据
+- `has_user_session` 决定能不能自动签发；没填的只能人工粘贴新凭据
+- 没有保活记录的账号（还没被刷过）不出现在名单里；非 tabiai 账号一律不列
+- 响应不含任何凭据字段，空名单是 `[]` 而不是 `null`
 
 ## Turnstile 与 tabiai 配置段（仅 Python 客户端）
 

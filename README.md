@@ -111,10 +111,22 @@ python desktop.py --daemon        # 后台常驻
 `401 AUTH_UNAUTHORIZED`，一旦被判定为旧代重放，**整条会话被撤销**
 （`401 AUTH_SESSION_REVOKED`），只能重新签发。
 
-两种失效都能自救：账号填了 `github_user_session` 时，签到发现 refresh 被拒会当场走
-GitHub OAuth 三步**重新签发一条**（走该账号同一个代理出口），落盘并回写平台后重试本
-轮。每个账号一轮只签发一次 —— 签发换出全新 sid、把上一条当场作废，失败了再签只是继
-续耗 GitHub 那把会话的信誉。没填 `user_session`、或连它也失效时判负，原因写进汇总邮件。
+两种失效都能自救：账号填了 `github_user_session` 时，签到发现 refresh 被拒会**请管理平台
+代为签发**一条新凭据（`POST /api/tabiai/issue-cookie`，带 `for_running_checkin` 放行签到
+锁），拿回来落盘后重试本轮。每个账号一轮只签发一次 —— 签发换出全新 sid、把上一条当场
+作废，失败了再签只是继续耗 GitHub 那把会话的信誉。没填 `user_session`、或连它也失效时
+判负，原因写进汇总邮件。
+
+**为什么交给平台而不是本机自己签发**：签发要打 GitHub 的 OAuth 端点，而 Actions runner
+的出口是随机 Azure IP、代理池里又全是机房 IP —— 带着 `user_session` 从这些地址反复出现
+最容易触发 GitHub 的账号风控，最坏会把 `user_session` 直接作废，那自救链路就彻底断了。
+平台部署在固定 IP 上，GitHub 眼里它是「常用设备」。平台不可达时**不回落**本机签发，
+宁可判负也不拿 `user_session` 去冒风控的险（本机那套 OAuth 实现仍保留在
+`newapi_checkin/github_oauth.py`，只是主链路不再走它）。
+
+网页端也能批量处理：「Cookie 检测 → TaBiAI 凭据」页签里有「查询失效账号」和
+「一键签发失效账号」——名单来自 `GET /api/tabiai/expired`（读库里保活写下的判定，
+不触发检测，毫秒返回），只对填了 `user_session` 的账号签发，串行逐个进行并列出每条结果。
 
 签到一天只跑一次，中间十几个小时那一代一直躺着不动。这段时间里任何一个"第三方"
 ——本机 daemon、网页端的凭据检测、另一台机器——碰一下，平台手里这代就作废了，

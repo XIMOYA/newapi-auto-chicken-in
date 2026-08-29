@@ -381,3 +381,58 @@ func TestIssueRefreshCookieGoesThroughProxy(t *testing.T) {
 		t.Fatal("签发请求没有经过代理")
 	}
 }
+
+// TestIssueCookieForRunningCheckinBypassesLock 签到进程自救时必须放行签到锁。
+// 人工签发（网页端 JWT，不带标记）仍要被拦 —— 那是防手滑打断正在跑的那一轮。
+func TestIssueCookieForRunningCheckinBypassesLock(t *testing.T) {
+	srv := newTestServer(t)
+	seedConfig(t, srv, []Account{
+		{Name: "tabi", URL: "https://tabi.example.com", LoginMethod: LoginMethodTabiAI,
+			Cookie: "new_api_refresh=sid.old", GithubUserSession: "gh-session", Enabled: true},
+	}, nil)
+	jwt := loginToken(t, srv)
+	key := apiKeyToken(t, srv, jwt)
+
+	// 占上签到锁
+	if rr := doReq(t, srv, http.MethodPost, "/api/run-state/start", key,
+		map[string]any{"source": "test"}); rr.Code != http.StatusOK {
+		t.Fatalf("占锁失败 = %d, %s", rr.Code, rr.Body.String())
+	}
+
+	// 不带标记（网页端人工点）→ 409 被锁拦住
+	locked := doReq(t, srv, http.MethodPost, "/api/tabiai/issue-cookie", jwt,
+		map[string]any{"account_name": "tabi"})
+	if locked.Code != http.StatusConflict {
+		t.Fatalf("人工签发应被签到锁拦住，实际 %d: %s", locked.Code, locked.Body.String())
+	}
+
+	// 带标记（签到进程自救）→ 放行，走到 OAuth 阶段才因为站点不可达而 400，
+	// 关键是**不再是 409**：说明锁已放行
+	bypass := doReq(t, srv, http.MethodPost, "/api/tabiai/issue-cookie", key,
+		map[string]any{"account_name": "tabi", "for_running_checkin": true})
+	if bypass.Code == http.StatusConflict {
+		t.Fatalf("带 for_running_checkin 不该被锁拦住：%s", bypass.Body.String())
+	}
+}
+
+// TestIssueCookieDoesNotLeakCookieToJWT 明文只回给 API Key 调用方。
+//
+// 签到客户端（API Key）要拿新凭据立刻重试本轮；网页端走 JWT，签发完刷新页面就行，
+// 不下发就少一个泄漏面。这里断言的是那条硬约束：**JWT 响应里不出现 cookie 字段**，
+// 它与 OAuth 是否成功无关，所以不必搭假 GitHub。API Key 能拿到明文那一半由客户端侧
+// 的 test_success_without_cookie_hints_at_api_key 反向守住（拿不到就报错提示配 Key）。
+func TestIssueCookieDoesNotLeakCookieToJWT(t *testing.T) {
+	srv := newTestServer(t)
+	seedConfig(t, srv, []Account{
+		{Name: "tabi", URL: "https://tabi.invalid", LoginMethod: LoginMethodTabiAI,
+			Cookie: "new_api_refresh=sid.old", GithubUserSession: "gh-session",
+			GithubClientID: "cid", Enabled: true},
+	}, nil)
+	jwt := loginToken(t, srv)
+
+	withJWT := doReq(t, srv, http.MethodPost, "/api/tabiai/issue-cookie", jwt,
+		map[string]any{"account_name": "tabi"})
+	if contains(withJWT.Body.String(), `"cookie"`) {
+		t.Fatalf("JWT 调用不该拿到明文 cookie：%s", withJWT.Body.String())
+	}
+}
