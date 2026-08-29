@@ -34,16 +34,18 @@ const currentConfigVersion = 3
 
 // Config 完整配置对象 = 契约文档中的顶层结构。
 type Config struct {
-	ConfigVersion int           `json:"config_version"`
-	Accounts      []Account     `json:"accounts"`
-	Sites         []Site        `json:"sites"`
-	AI            AIConfig      `json:"ai"`
-	Browser       BrowserConfig `json:"browser"`
-	HTTP          HTTPConfig    `json:"http"`
-	ProxyPool     ProxyPool     `json:"proxy_pool"`
-	Notify        Notify        `json:"notify"`
-	ConfigSync    ConfigSync    `json:"config_sync"`
-	Security      Security      `json:"security"`
+	ConfigVersion int       `json:"config_version"`
+	Accounts      []Account `json:"accounts"`
+	// GitHubAccounts 统一的 GitHub 凭据池，供多个站点账号按名字引用（见 github_accounts.go）
+	GitHubAccounts []GitHubAccount `json:"github_accounts"`
+	Sites          []Site          `json:"sites"`
+	AI             AIConfig        `json:"ai"`
+	Browser        BrowserConfig   `json:"browser"`
+	HTTP           HTTPConfig      `json:"http"`
+	ProxyPool      ProxyPool       `json:"proxy_pool"`
+	Notify         Notify          `json:"notify"`
+	ConfigSync     ConfigSync      `json:"config_sync"`
+	Security       Security        `json:"security"`
 }
 
 // Site 站点预设：供新增账号时快速选择，自动带出 URL 与接口路径。
@@ -64,13 +66,17 @@ type Account struct {
 	Cookie string `json:"cookie"`
 	// GithubUserSession / GithubClientID 不再是登录凭据，
 	// 仅供「签发 TaBiAI cookie」小工具走 GitHub OAuth 三步时使用
-	GithubUserSession string  `json:"github_user_session"`
-	GithubClientID    string  `json:"github_client_id"`
-	UserID            *int64  `json:"user_id"`
-	Proxy             *string `json:"proxy"`
-	CheckinPath       *string `json:"checkin_path"`
-	BrowserPath       *string `json:"browser_path"`
-	Enabled           bool    `json:"enabled"`
+	GithubUserSession string `json:"github_user_session"`
+	GithubClientID    string `json:"github_client_id"`
+	// GitHubAccount 引用 github_accounts[].name。非空时凭据从那里取，
+	// 账号名也由「该 GitHub 名（本站域名）」自动生成，不再手填。
+	// 上面两个旧字段保留：老配置迁移期间仍作兜底，见 resolveAccountSession
+	GitHubAccount string  `json:"github_account"`
+	UserID        *int64  `json:"user_id"`
+	Proxy         *string `json:"proxy"`
+	CheckinPath   *string `json:"checkin_path"`
+	BrowserPath   *string `json:"browser_path"`
+	Enabled       bool    `json:"enabled"`
 }
 
 // AIConfig AI 辅助配置。
