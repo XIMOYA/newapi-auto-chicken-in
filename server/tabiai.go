@@ -163,20 +163,7 @@ func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 签发也走代理，别让服务器真实 IP 直接碰 GitHub OAuth：
-	//   - 账号自带固定代理 → newCookieTestHTTPClient 会优先用它，这里不必再取池
-	//   - 没自带 → 从代理池领一个可用出口；池空则退回直连（不因没代理而阻断签发）
-	proxyAddr := ""
-	if !hasOwnProxy(*target) {
-		if addrs := s.proxies.AvailableAddrs(1); len(addrs) > 0 {
-			proxyAddr = addrs[0]
-			log.Printf("[tabiai] 账号 %q 无自带代理，签发改用代理池出口", name)
-		} else {
-			log.Printf("[tabiai] 账号 %q 无自带代理且代理池为空，签发退回直连", name)
-		}
-	}
-
-	cookie, err := issueTabiAIRefreshCookie(r.Context(), cfg.HTTP, *target, tabiaiGithubAuthorize, proxyAddr)
+	cookie, err := issueTabiAIRefreshCookie(r.Context(), cfg.HTTP, *target, tabiaiGithubAuthorize)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -206,16 +193,20 @@ func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request)
 //
 // 三步必须在同一个 HTTP session 内完成（state 与站点会话绑定），因此客户端带 cookiejar。
 //
-// proxyAddr 是「账号没有自带固定代理时」从代理池领到的出口（裸 host:port 或 socks5://...）；
-// 账号配了 account.Proxy 时它会被 newCookieTestHTTPClient 优先采用、proxyAddr 忽略，
-// 两处都空则直连。走代理是为了不让服务器真实 IP 直接碰 GitHub OAuth 端点。
+// **全程用平台自己的出口直连，不走任何代理**（既不用代理池，也忽略账号自带的
+// account.Proxy）。这是刻意的：GitHub 的 OAuth 端点对机房 IP 有明显限流（403/429），
+// 而带着 user_session 从不断变化的地址出现，正是触发 GitHub 账号风控最快的方式 ——
+// 最坏会把 user_session 直接作废，自救链路彻底断掉。平台部署在固定 IP 上，
+// 在 GitHub 眼里是「常用设备」，成功率和安全性都比套代理好。
+//
+// 客户端（Actions）签到时的凭据轮转与签到本身照旧走代理，那与这里无关。
 func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account Account,
-	authorizeURL string, proxyAddr string) (string, error) {
+	authorizeURL string) (string, error) {
 	base, err := cookieTestBaseURL(account.URL)
 	if err != nil {
 		return "", fmt.Errorf("站点 URL 无效: %w", err)
 	}
-	client, err := newTabiAIOAuthClient(account, httpCfg, proxyAddr)
+	client, err := newTabiAIOAuthClient(account, httpCfg)
 	if err != nil {
 		return "", err
 	}
@@ -320,9 +311,14 @@ func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account A
 
 // newTabiAIOAuthClient 带 cookiejar 的客户端：三步 OAuth 的 state 与站点会话绑定，必须同一 session。
 // 统一不跟随重定向 —— 第 2 步要读 Location 取 code，第 3 步只关心 Set-Cookie。
-// proxyAddr 透传给 newCookieTestHTTPClient（账号自带 proxy 优先，其次 proxyAddr，都空则直连）。
-func newTabiAIOAuthClient(account Account, httpCfg HTTPConfig, proxyAddr string) (*http.Client, error) {
-	client, err := newCookieTestHTTPClient(account, httpCfg, false, proxyAddr)
+//
+// **强制直连**：把 account.Proxy 清空后再交给 newCookieTestHTTPClient，所以即使账号配了
+// 固定代理，签发也走平台自己的出口（理由见 issueTabiAIRefreshCookie）。Cookie 检测那边
+// 仍照旧用账号代理 —— 那是在验「凭据在这个出口下能不能用」，和签发的诉求正好相反。
+func newTabiAIOAuthClient(account Account, httpCfg HTTPConfig) (*http.Client, error) {
+	direct := account
+	direct.Proxy = nil
+	client, err := newCookieTestHTTPClient(direct, httpCfg, false, "")
 	if err != nil {
 		return nil, fmt.Errorf("HTTP 客户端配置失败: %w", err)
 	}

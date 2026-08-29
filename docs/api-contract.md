@@ -658,6 +658,8 @@ Python 侧默认按 `config_sync.url` 同源推导该地址；也可用 `config_
 
 用账号里保存的 `github_user_session` 走三步 OAuth，为该账号签发一条全新的 `new_api_refresh` 并写入 `accounts[].cookie`。
 
+**全程用平台自己的出口直连**：既不用代理池，也忽略账号自带的 `proxy`。GitHub 的 OAuth 端点对机房 IP 有明显限流（403/429），而带着 `user_session` 从不断变化的地址出现正是触发账号风控最快的方式（最坏把 `user_session` 直接作废）。平台在固定 IP 上，GitHub 眼里是「常用设备」。凭据检测那边仍走账号代理 —— 那是在验「凭据在这个出口下能不能用」，诉求正好相反。
+
 `for_running_checkin: true` 时**放行签到锁**——只有签到进程该用它，它自己就是那个「正在跑的签到」，被自己的锁拦住毫无意义。签发按账号生效，只影响请求里这一个，不波及同轮其他账号。
 
 响应（200）：`{ "ok": true, "account_name": "TaBiAI", "cookie": "new_api_refresh=..." }`
