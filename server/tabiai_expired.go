@@ -69,13 +69,16 @@ func (s *Server) handleListExpiredTabiAI(w http.ResponseWriter, r *http.Request)
 		if !isExpiredKeepaliveState(row) {
 			continue
 		}
+		// 能不能自救看的是「实际生效的凭据」：账号自己没填、但引用的池子里有，
+		// 界面上那个「一键签发」按钮就该是可点的
+		session, _ := resolveAccountSession(&cfg, account)
 		items = append(items, expiredTabiAIAccount{
 			Name:           account.Name,
 			State:          row.State,
 			Paused:         row.Paused,
 			Message:        row.Message,
 			LastRunAt:      row.LastRunAt,
-			HasUserSession: strings.TrimSpace(account.GithubUserSession) != "",
+			HasUserSession: session != "",
 		})
 		// 取最近的一次刷新时间当整体的「判定时间」，让调用方知道这份名单有多新
 		if row.LastRunAt > checkedAt {

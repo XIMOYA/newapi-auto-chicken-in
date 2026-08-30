@@ -157,13 +157,17 @@ func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "账号不存在: "+name)
 		return
 	}
-	if strings.TrimSpace(target.GithubUserSession) == "" {
+	// 凭据取「实际生效值」：引用的 GitHub 账号池优先，账号自带的旧字段兜底。
+	// 副本只用于这一次签发，不落库（见 effectiveGitHubCredentials）
+	effective := effectiveGitHubCredentials(&cfg, *target)
+	if strings.TrimSpace(effective.GithubUserSession) == "" {
 		writeError(w, http.StatusBadRequest,
-			"该账号未填写 GitHub user_session，无法自动签发；请填写后重试，或直接从浏览器复制 new_api_refresh")
+			"该账号拿不到 GitHub user_session（自身没填，引用的 GitHub 账号池里也没有），"+
+				"无法自动签发；请补上后重试，或直接从浏览器复制 new_api_refresh")
 		return
 	}
 
-	cookie, err := issueTabiAIRefreshCookie(r.Context(), cfg.HTTP, *target, tabiaiGithubAuthorize)
+	cookie, err := issueTabiAIRefreshCookie(r.Context(), cfg.HTTP, effective, tabiaiGithubAuthorize)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

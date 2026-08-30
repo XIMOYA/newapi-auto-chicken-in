@@ -107,6 +107,23 @@ func resolveAccountSession(cfg *Config, account Account) (session, clientID stri
 	return session, clientID
 }
 
+// effectiveGitHubCredentials 返回一份把 GitHub 凭据填成「实际生效值」的账号副本。
+//
+// 为什么是填副本，而不是给下游多传两个参数：签发链路里
+// issueTabiAIRefreshCookie / resolveGithubClientID / newTabiAIOAuthClient
+// 有好几处各自读这两个字段，改签名要动整条链路连带它的测试；而「凭据是从池子来
+// 还是从账号旧字段来」属于配置层的事，签发链路不需要知道。
+//
+// 副本只用于本次签发，绝不落库 —— 真把解析结果写回配置就等于悄悄迁移了数据，
+// 用户下次打开界面会发现账号里凭空多出一份凭据，池子也就白建了。
+func effectiveGitHubCredentials(cfg *Config, account Account) Account {
+	session, clientID := resolveAccountSession(cfg, account)
+	effective := account
+	effective.GithubUserSession = session
+	effective.GithubClientID = clientID
+	return effective
+}
+
 // planAccountRenames 算出「旧名 -> 新名」映射，只包含真正需要改的。
 //
 // 跳过三种情况：没引用 GitHub 账号的、拼不出规范名的、已经是规范名的。
