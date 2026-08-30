@@ -79,6 +79,38 @@ func TestPlanAccountRenames(t *testing.T) {
 	}
 }
 
+func TestValidateConfigChecksPoolNames(t *testing.T) {
+	// 名字是引用键：重名时 UnmaskConfig 建的 map 留最后一条、findGitHubAccount
+	// 返回第一条，用户会看到「改了 session 但签发还用旧的」，且全程没有报错。
+	// ops 端点自己挡住了这两种输入，但整份 PUT /api/config 绕过它，只能在这里兜住。
+	cases := []struct {
+		name string
+		pool []GitHubAccount
+		bad  bool
+	}{
+		{"正常", []GitHubAccount{{Name: "A", UserSession: "sa"}, {Name: "B"}}, false},
+		{"空池子", nil, false},
+		{"空名字", []GitHubAccount{{Name: "", UserSession: "sa"}}, true},
+		{"名字只有空格", []GitHubAccount{{Name: "   "}}, true},
+		{"重名", []GitHubAccount{{Name: "A", UserSession: "s1"}, {Name: "A", UserSession: "s2"}}, true},
+		// 名字两侧空白在比对时剔掉，否则 "A" 和 "A " 会被当成两条而实际引用同一个键
+		{"空白差异也算重名", []GitHubAccount{{Name: "A"}, {Name: "A "}}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.GitHubAccounts = c.pool
+			err := ValidateConfig(&cfg)
+			if c.bad && err == nil {
+				t.Fatal("应报错")
+			}
+			if !c.bad && err != nil {
+				t.Fatalf("不该报错: %v", err)
+			}
+		})
+	}
+}
+
 func TestPlanAccountRenamesRejectsCollision(t *testing.T) {
 	// 同一个 GitHub 账号 + 同一域名 = 重名。报错而不是加序号：
 	// 用户确认过这种情况不该存在，静默加序号只会把配置问题藏起来

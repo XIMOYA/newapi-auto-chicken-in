@@ -279,9 +279,10 @@ func DefaultConfig() Config {
 }
 
 // MaskConfig 返回敏感字段被替换为 "***" 的深拷贝配置（仅用于 GET /api/config）。
-// 打码字段：accounts[].cookie、accounts[].github_user_session、ai.api_key、
-// notify.email.password、config_sync.token、proxy_pool.remote_token、
-// security.config_key；非空才打码，空值原样保留。
+// 打码字段：accounts[].cookie、accounts[].github_user_session、
+// github_accounts[].user_session、ai.api_key、notify.email.password、
+// config_sync.token、proxy_pool.remote_token、security.config_key；
+// 非空才打码，空值原样保留。
 //
 // accounts[].proxy 有意不打码：地址是运维辨识出口的必要信息，而该字段在前端是普通
 // 输入框（不是 MaskedInput）。若打成 http://***@host，用户想「只改 host、保留认证」
@@ -296,6 +297,14 @@ func MaskConfig(cfg *Config) *Config {
 		}
 		if m.Accounts[i].GithubUserSession != "" {
 			m.Accounts[i].GithubUserSession = MaskPlaceholder
+		}
+	}
+	// 共享凭据池的 session 与账号自带的那份等价，同样不能明文下发浏览器。
+	// client_id 是站点 OAuth 应用的公开标识，不打码 —— 打了前端就没法判断
+	// 用户是「想改」还是「原样回传」，反而容易把占位符当真值存回去。
+	for i := range m.GitHubAccounts {
+		if m.GitHubAccounts[i].UserSession != "" {
+			m.GitHubAccounts[i].UserSession = MaskPlaceholder
 		}
 	}
 	if m.AI.APIKey != "" {
@@ -358,6 +367,29 @@ func UnmaskConfig(in, old *Config) (*Config, error) {
 		}
 	}
 
+	// 池子也按名字还原，与 accounts 同一套口径。
+	// 走 ops 端点改名时，调用方会先把旧配置副本里的名字改好再进来（见
+	// unmaskWithPoolRenames），所以能匹配上；整份 PUT 里直接改名会落到这里报错，
+	// 让用户重填 —— 比静默存下 "***" 好，那样界面显示「已填写」而签发必然失败。
+	oldPoolSessionByName := make(map[string]string, len(old.GitHubAccounts))
+	for _, g := range old.GitHubAccounts {
+		if g.Name != "" {
+			oldPoolSessionByName[g.Name] = g.UserSession
+		}
+	}
+	for i := range out.GitHubAccounts {
+		if out.GitHubAccounts[i].UserSession != MaskPlaceholder {
+			continue
+		}
+		name := out.GitHubAccounts[i].Name
+		s, ok := oldPoolSessionByName[name]
+		if !ok {
+			return nil, fmt.Errorf(
+				"github_accounts[%d].user_session 无法还原：旧配置中没有名为 %q 的 GitHub 账号（改名后需要重新填写 user_session）", i, name)
+		}
+		out.GitHubAccounts[i].UserSession = s
+	}
+
 	if out.AI.APIKey == MaskPlaceholder {
 		out.AI.APIKey = old.AI.APIKey
 	}
@@ -392,6 +424,12 @@ func SanitizeMaskLeftovers(cfg *Config) []string {
 		if cfg.Accounts[i].GithubUserSession == MaskPlaceholder {
 			cfg.Accounts[i].GithubUserSession = ""
 			cleaned = append(cleaned, fmt.Sprintf("accounts[%d].github_user_session", i))
+		}
+	}
+	for i := range cfg.GitHubAccounts {
+		if cfg.GitHubAccounts[i].UserSession == MaskPlaceholder {
+			cfg.GitHubAccounts[i].UserSession = ""
+			cleaned = append(cleaned, fmt.Sprintf("github_accounts[%d].user_session", i))
 		}
 	}
 	if cfg.AI.APIKey == MaskPlaceholder {
@@ -446,6 +484,11 @@ func cloneConfig(c *Config) *Config {
 		}
 	}
 
+	// 全是值类型字段，copy 就够；关键是必须重建切片 —— 共享底层数组的话，
+	// MaskConfig 会把调用方内存里的真实 session 改成 "***"，之后任何保存都会落库
+	cp.GitHubAccounts = make([]GitHubAccount, len(c.GitHubAccounts))
+	copy(cp.GitHubAccounts, c.GitHubAccounts)
+
 	cp.Sites = make([]Site, len(c.Sites))
 	for i, s := range c.Sites {
 		cp.Sites[i] = s
@@ -489,6 +532,7 @@ func cloneConfig(c *Config) *Config {
 // - url 必须以 http:// 或 https:// 开头
 // - sites 每个站点必须提供 name / url
 // - accounts / sites 的 name 不可重复（name 是敏感字段还原与合并的匹配键）
+// - github_accounts 每条必须提供 name，且 name 不可重复（它是引用键）
 // 返回第一个错误信息（供 400 响应使用）。
 func ValidateConfig(cfg *Config) error {
 	if cfg == nil {
@@ -521,6 +565,24 @@ func ValidateConfig(cfg *Config) error {
 		}
 		accountNames[a.Name] = i
 	}
+	// 池子的名字是引用键：accounts[].github_account 按它找凭据，UnmaskConfig 按它
+	// 还原打码值。重名的后果是静默的 —— UnmaskConfig 建 map 时后一条覆盖前一条，
+	// 而 findGitHubAccount 返回的是第一条，用户会看到「改了 session 但签发还用旧的」。
+	// 这里只管名字，不校验引用是否存在：迁移期账号可能引用还没建的记录，
+	// 那种情况 resolveAccountSession 会回落账号自带的旧字段，不该拦住保存。
+	poolNames := make(map[string]int, len(cfg.GitHubAccounts))
+	for i, g := range cfg.GitHubAccounts {
+		name := strings.TrimSpace(g.Name)
+		if name == "" {
+			return fmt.Errorf("github_accounts[%d].name 不能为空（它是站点账号引用凭据的键）", i)
+		}
+		if prev, dup := poolNames[name]; dup {
+			return fmt.Errorf("github_accounts[%d].name 与 github_accounts[%d] 重复：%q（引用键必须唯一）",
+				i, prev, name)
+		}
+		poolNames[name] = i
+	}
+
 	siteNames := make(map[string]int, len(cfg.Sites))
 	for i, s := range cfg.Sites {
 		if strings.TrimSpace(s.Name) == "" {
