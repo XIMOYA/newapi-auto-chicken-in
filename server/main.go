@@ -124,6 +124,11 @@ func main() {
 	if err := SanitizeConfigSecrets(db); err != nil {
 		log.Fatalf("清理占位符凭据失败: %v", err)
 	}
+	// 账号名统一成「GitHub 名（域名）」，顺带把保活状态迁到新名下（幂等，每次启动都跑）。
+	// 不 Fatal：改名失败也该让平台起来，否则用户连改配置的界面都打不开
+	if err := MigrateAccountNames(db); err != nil {
+		log.Printf("[rename] 账号名迁移失败（不影响启动，下次启动会重试）: %v", err)
+	}
 
 	srv := NewServer(db, jwtSecret)
 	log.Printf("NewAPI 签到配置管理平台已启动，监听 %s（数据库: %s）", addr, dbPath)
