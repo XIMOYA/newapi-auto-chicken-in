@@ -98,12 +98,18 @@ func createProxiesTable(db *sql.DB) error {
 	return nil
 }
 
-// parseProxyLines 从文本/HTML 提取 host:port 列表（兼容纯文本行与 89ip HTML）。
+// parseProxyLines 从文本/HTML 提取代理列表。
 //
-// 先尝试按 JSON 结构化源解析（站大爷 zdaye 等：{data:{proxy_list:[{ip,port,protocol}]}}）——
-// 那种响应里 ip 与 port 是分开的字段，正则的 ip:port 连写模式一条都抓不到。不是 JSON
-// 或没有 proxy_list 字段时才回落到正则，纯文本/HTML 源行为完全不变。
+// 三种形态按「不会互相误判」的顺序试：
+//  1. 机场订阅（整块 base64 或明文 vless:// 行，见 proxy_subscription.go）——
+//     base64 字符集里没有 '.' 和 ':'，而下面两种恰恰靠这两个字符识别，不会撞
+//  2. JSON 结构化源（站大爷 zdaye 等：{data:{proxy_list:[{ip,port,protocol}]}}）——
+//     那种响应里 ip 与 port 是分开的字段，正则的 ip:port 连写模式一条都抓不到
+//  3. 正则兜底：纯文本行与 89ip 那种 HTML
 func parseProxyLines(text string) []string {
+	if nodes := parseSubscription(text); nodes != nil {
+		return nodes
+	}
 	if items := parseProxyJSON(text); items != nil {
 		// 是可识别的 JSON 代理列表（哪怕过滤后为空）就以它为准，不再回落正则乱抓
 		return items
