@@ -86,6 +86,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/github-accounts/ops", s.requireJWTOrAPIKey(s.handleGitHubAccountOps))
 	// 池子账号可用性探测：同样双认证。它在后台实际请求 GitHub OAuth，串行执行
 	mux.HandleFunc("POST /api/github-accounts/check", s.requireJWTOrAPIKey(s.handleCheckGitHubAccount))
+	// 按站点 URL 批量建签到账号：会为每个 GitHub 账号签发一条站点凭据，
+	// 与签到抢代次，所以内部先过签到锁
+	mux.HandleFunc("POST /api/sites/provision", s.requireJWTOrAPIKey(s.handleProvisionSite))
 
 	// 单账号查询（凭据回写的读回核实，见 account_query.go）：
 	// 脱敏摘要跟 GET /api/config 同级（双认证，cookie 只给指纹不给明文），
