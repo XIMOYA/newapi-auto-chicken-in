@@ -19,6 +19,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -56,6 +57,14 @@ const maxFeedbackItems = 2000
 // feedbackRetentionDays 反馈保留天数：超过这么久没再更新的行会被清理。
 const feedbackRetentionDays = 14
 
+// maxFeedbackAddrLen 上报地址的长度上限。
+//
+// 原本是 255，那是按「host:port」估的。VLESS 节点的地址是一整条 URI：uuid + 传输
+// 参数（reality 的 pbk/sid、ws 的 path）+ 机场给的中文备注，真实节点轻松过 300。
+// addr 是 proxy_feedback 的主键，所以也不能真放开 —— 1024 能装下现实里的节点，
+// 又足以挡住客户端拼串出 bug 时的异常长串。
+const maxFeedbackAddrLen = 1024
+
 // createProxyFeedbackTable 建 proxy_feedback 表（幂等）。
 func createProxyFeedbackTable(db *sql.DB) error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS proxy_feedback (
@@ -79,16 +88,35 @@ func createProxyFeedbackTable(db *sql.DB) error {
 /*
 validFeedbackAddr 判断上报来的地址能不能收。
 
-只做形状检查：非空、无空白、含且仅含一个冒号、两段都不空。不校验是不是合法 IP ——
-上游源里出现过域名形式的代理，客户端能用就该能记。真正的过滤在于这个 addr 是否
-出现在 proxies 表里，排序时对不上号的行自然不会影响任何结果。
+只做形状检查，不校验是不是合法 IP —— 上游源里出现过域名形式的代理，客户端能用
+就该能记。真正的过滤在于这个 addr 是否出现在 proxies 表里，排序时对不上号的行
+自然不会影响任何结果。
+
+分两条路判：
+  - 带 scheme（socks5:// http:// vless://）交给 url.Parse，要求有主机且有端口。
+    原先只有一条「含且仅含一个冒号」的规则，把带 scheme 的地址全判死了 ——
+    而 parseProxyLines 本来就会产出 socks5://host:port，等于所有 socks5 代理的
+    反馈一直在被静默丢弃，它们在优选里永远停在 rankUnknown。反过来 "http://"
+    这种没主机的垃圾当年却能过（Cut 出来的 port 是 "//"），会白占一行主键。
+  - 裸 host:port 沿用旧规则，行为一字不变。
 */
 func validFeedbackAddr(addr string) bool {
-	if addr == "" || len(addr) > 255 {
+	if addr == "" || len(addr) > maxFeedbackAddrLen {
 		return false
 	}
 	if strings.ContainsAny(addr, " \t\r\n") {
 		return false
+	}
+	if i := strings.Index(addr, "://"); i >= 0 {
+		if i == 0 {
+			return false // scheme 为空，如 "://1.2.3.4:8080"
+		}
+		u, err := url.Parse(addr)
+		if err != nil {
+			return false
+		}
+		// 端口也必须有：没端口的代理地址下游连不上，收下只会污染主键
+		return u.Hostname() != "" && u.Port() != ""
 	}
 	host, port, found := strings.Cut(addr, ":")
 	if !found || host == "" || port == "" {
