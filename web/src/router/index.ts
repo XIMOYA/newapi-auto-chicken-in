@@ -34,6 +34,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: 'Cookie 测试' }
       },
       {
+        path: 'github-accounts',
+        name: 'github-accounts',
+        component: () => import('@/views/GitHubAccountsView.vue'),
+        meta: { title: 'GitHub 账号池' }
+      },
+      {
         path: 'tabiai-keepalive',
         name: 'tabiai-keepalive',
         component: () => import('@/views/TabiAIKeepaliveView.vue'),

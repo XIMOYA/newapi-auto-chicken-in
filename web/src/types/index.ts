@@ -29,6 +29,12 @@ export interface Account {
   /** 不再是登录凭据，仅作 POST /api/tabiai/issue-cookie 签发 new_api_refresh 的原料 */
   github_user_session: string
   github_client_id: string
+  /**
+   * 引用 github_accounts[].name。非空时签发链路的凭据从池子里取，
+   * 上面两个旧字段退为迁移期兜底（服务端 resolveAccountSession 的优先级）。
+   * 空串表示没引用池子。
+   */
+  github_account: string
   user_id: number | null
   /** 手动代理。有意不打码，会以明文回传给已登录管理员（详见 api-contract 打码规则） */
   proxy: string | null
@@ -42,6 +48,21 @@ export interface Site {
   url: string
   checkin_path: string | null
   browser_path: string | null
+}
+
+/**
+ * GitHub 凭据池里的一条：一份 user_session 供多个站点账号共用。
+ *
+ * name 同时是引用键（accounts[].github_account 按它找凭据），改名必须走
+ * ops 端点的 previous_name，否则服务端还原打码值时找不到旧记录。
+ */
+export interface GitHubAccount {
+  /** GitHub 用户名，同时是引用键 */
+  name: string
+  /** GitHub 网页会话 cookie。凭据字段：GET /api/config 返回时已被打成 "***" */
+  user_session: string
+  /** 站点 OAuth 应用 ID，不是凭据，留空时由站点 /api/status 探测 */
+  client_id: string
 }
 
 export interface AIConfig {
@@ -147,6 +168,8 @@ export interface SecurityConfig {
 
 export interface AppConfig {
   accounts: Account[]
+  /** GitHub 凭据池：accounts[].github_account 按 name 引用它 */
+  github_accounts: GitHubAccount[]
   sites: Site[]
   ai: AIConfig
   browser: BrowserConfig
@@ -275,8 +298,58 @@ export interface AccountOpsResult {
   skipped: string[] | null
 }
 
-// ===== 单账号查询（凭据回写的读回核实）=====
+// ===== GitHub 凭据池的增量操作 =====
 
+/**
+ * 一条池子操作。走 POST /api/github-accounts/ops，语义与 AccountOp 对齐：
+ * 提交「意图」而不是整份快照 —— 整份 PUT /api/config 会把后台刚轮转的凭据覆盖掉。
+ */
+export type GitHubAccountOp =
+  | {
+      type: 'upsert'
+      account: GitHubAccount
+      /**
+       * 改名时填原名：服务端据此找回打码的 user_session（提交 "***" 即可），
+       * 并把引用它的账号的 github_account 一起改过去
+       */
+      previous_name?: string
+    }
+  | { type: 'delete'; name: string }
+
+export interface GitHubAccountOpsResult {
+  ok: boolean
+  /** 服务端重放后的最新打码配置，前端直接换上即可 */
+  config: AppConfig
+  updated_at: string
+  revision: number
+  /** 被跳过的操作说明（如目标已被他人删除），非错误 */
+  skipped: string[] | null
+}
+
+/**
+ * user_session 的探测结论三态：
+ * - ok      GitHub 返回了授权 code，session 有效
+ * - expired GitHub 要求重新登录，session 已失效，得重新填
+ * - unknown 出口被限流 / 站点出错 / 网络失败，无法下结论（不等于失效）
+ */
+export type GitHubCheckStatus = 'ok' | 'expired' | 'unknown'
+
+export interface GitHubCheckDetail {
+  status: GitHubCheckStatus
+  message: string
+  /** 实际探测用的站点 OAuth 应用 ID，服务端回显供核对 */
+  authorized_client_id?: string
+}
+
+/** POST /api/github-accounts/check 的响应。site 是实际被探测的那个站点 URL */
+export interface GitHubAccountCheckResult {
+  ok: boolean
+  name: string
+  site: string
+  result: GitHubCheckDetail
+}
+
+// ===== 单账号查询（凭据回写的读回核实）=====
 /**
  * 账号清单里的一条：够筛选和展示，**不含任何凭据字段**（连打码占位符也没有）。
  *
@@ -381,7 +454,16 @@ export interface CreateKeyResult {
 export interface ProxyEntry {
   id: number
   source: string
+  /**
+   * 展示用地址：带凭据的形态已被服务端脱敏（VLESS 的 uuid、http 代理的 user:pass
+   * 会变成 ***@host）。裸 host:port 与 socks5://host:port 原样返回。
+   * 因为它可能不是真值，指定操作目标（如测速）一律用 fingerprint。
+   */
   addr: string
+  /** 协议名："http" / "socks5" / "vless"…，裸 host:port 归为 http */
+  protocol: string
+  /** 完整地址的 12 位十六进制短指纹，脱敏后指定操作目标就靠它 */
+  fingerprint: string
   latency_ms: number
   alive: boolean
   last_checked_at: string

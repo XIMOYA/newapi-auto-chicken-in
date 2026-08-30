@@ -5,7 +5,8 @@ web/src/views/OverviewView.vue
 - 顶部统计卡：账号总数 / 启用数 / 代理池开关 / 邮件通知开关
 - 账号管理表格：搜索、多选、启停开关、打码凭据、手动隧道、编辑/删除
 - 凭据列按登录方式展示：站点 Cookie 只有一项，TaBiAI 另附 user_session（签发原料）
-- 新增/编辑账号弹窗；批量启用/停用/删除（带确认）
+  与引用的 GitHub 池条目（引用了池子时签发用的是池子里那份）
+- 新增/编辑账号弹窗（可选择引用 GitHub 账号池里的哪一份凭据）；批量启用/停用/删除（带确认）
 数据来源：
 - GET /api/config（经 config store）
 - POST /api/accounts/ops（账号增删改：提交操作而非整份快照，多人同时编辑互不覆盖）
@@ -135,6 +136,7 @@ web/src/views/OverviewView.vue
       :account="editingAccount"
       :submitting="submitting"
       :sites="sites"
+      :github-accounts="githubAccounts"
       @submit="handleAccountSubmit"
       @credential-issued="handleCredentialIssued"
     />
@@ -169,7 +171,7 @@ import { verifyPassword } from '@/api/auth'
 import { exportConfig } from '@/api/export'
 import { deepClone } from '@/utils/clone'
 import { extractErrorMessage } from '@/utils/error'
-import type { Account, AccountOp, LoginMethod, Site } from '@/types'
+import type { Account, AccountOp, GitHubAccount, LoginMethod, Site } from '@/types'
 
 interface AccountRow extends Account {
   _index: number
@@ -185,6 +187,8 @@ const message = useMessage()
 
 const accounts = computed<Account[]>(() => configStore.config?.accounts ?? [])
 const sites = computed<Site[]>(() => configStore.config?.sites ?? [])
+// 供编辑弹窗选择引用哪份 GitHub 凭据；池子本身在「GitHub 账号池」页维护
+const githubAccounts = computed<GitHubAccount[]>(() => configStore.config?.github_accounts ?? [])
 const accountCount = computed(() => accounts.value.length)
 const enabledCount = computed(() => accounts.value.filter((a) => a.enabled).length)
 const proxyPoolEnabled = computed(() => !!configStore.config?.proxy_pool?.enabled)
@@ -490,7 +494,7 @@ const columns: DataTableColumns<AccountRow> = [
       // user_session 已退化为签发原料，但仍要留一个查看入口，所以 TaBiAI 多列一行
       const fields: Array<'cookie' | 'github_user_session'> =
         row.login_method === 'tabiai' ? ['cookie', 'github_user_session'] : ['cookie']
-      return h('div', { class: 'credential-cell' }, fields.map((field) => {
+      const lines = fields.map((field) => {
         const value = row[field]
         const label = credentialFieldLabel(row.login_method, field)
         const text = value === '***' ? `${label}（已设置）` : value ? `${label}已设置` : `${label}未设置`
@@ -502,7 +506,15 @@ const columns: DataTableColumns<AccountRow> = [
             { icon: () => h(NIcon, null, { default: () => h(EyeOutline) }) }
           )
         ])
-      }))
+      })
+      // 引用了池子时，签发实际用的是池子里那份 —— 不标出来，用户会盯着上面那行
+      // 「user_session 未设置」以为漏填了
+      if (row.github_account) {
+        lines.push(
+          h('div', { class: 'pool-ref' }, `GitHub 池：${row.github_account}`)
+        )
+      }
+      return h('div', { class: 'credential-cell' }, lines)
     }
   },
   {
@@ -766,6 +778,12 @@ async function persistAccounts(successTip?: string) {
 .cookie-masked {
   font-family: 'JetBrains Mono', Consolas, monospace;
   color: #48566a;
+}
+
+/* 引用的 GitHub 池条目：附属信息，不抢凭据状态那两行的注意力 */
+.pool-ref {
+  font-size: 12px;
+  color: #7c5cf0;
 }
 
 .muted {

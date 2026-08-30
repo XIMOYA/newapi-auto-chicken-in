@@ -34,6 +34,7 @@ const account = (name: string): Account => ({
   cookie: '***',
   github_user_session: '',
   github_client_id: '',
+  github_account: '',
   user_id: null,
   proxy: null,
   checkin_path: null,

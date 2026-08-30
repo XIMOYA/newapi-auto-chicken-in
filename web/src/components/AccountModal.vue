@@ -2,9 +2,11 @@
 web/src/components/AccountModal.vue
 组件：签到账号 新增/编辑 弹窗
 职责：
-- 字段：name/url/login_method/cookie/github_user_session/user_id/proxy/checkin_path/browser_path/enabled
+- 字段：name/url/login_method/cookie/github_account/github_user_session/user_id/proxy/checkin_path/browser_path/enabled
 - 凭据按登录方式取不同含义：newapi_cookie 存站点 Cookie 头，tabiai 存 new_api_refresh 的值
-- github_user_session 不再是登录凭据，只作签发 new_api_refresh 的原料，因此仅在 tabiai 下出现
+- github_account 引用 GitHub 账号池（github_accounts[].name）：选了就从池子取 user_session / Client ID
+- github_user_session 不再是登录凭据，只作签发 new_api_refresh 的原料，因此仅在 tabiai 下出现；
+  引用池子时它退为兜底（服务端 resolveAccountSession 是池子优先）
 - tabiai 可直接在弹窗里一键签发凭据（服务端走 GitHub OAuth 换新 new_api_refresh 并落库）
 - cookie 打码处理：服务端返回 "***" 时显示「已设置」，留空则提交原值
 - 表单校验：名称必填、URL 必须 http(s) 开头、用户 ID 为可选安全整数
@@ -82,6 +84,21 @@ web/src/components/AccountModal.vue
           </div>
         </div>
       </n-form-item>
+      <n-form-item v-if="isTabiAI" label="GitHub 账号" path="github_account">
+        <div class="field-col">
+          <n-select
+            v-model:value="githubAccountRef"
+            :options="githubAccountOptions"
+            placeholder="从 GitHub 账号池选择（留空则用下面账号自带的 user_session）"
+            clearable
+            filterable
+          />
+          <div class="field-note">
+            选了就从池子里取 user_session / Client ID，换 session 只改池子一处。
+            池子在「GitHub 账号池」页维护；服务端重启时会把账号名规范化成「GitHub 名（站点域名）」。
+          </div>
+        </div>
+      </n-form-item>
       <n-form-item v-if="isTabiAI" label="GitHub user_session" path="github_user_session">
         <div class="cookie-field">
           <masked-input
@@ -153,7 +170,7 @@ import { verifyPassword } from '@/api/auth'
 import { issueTabiAICookie } from '@/api/cookieTests'
 import { exportConfig } from '@/api/export'
 import { extractErrorMessage } from '@/utils/error'
-import type { Account, LoginMethod, Site } from '@/types'
+import type { Account, GitHubAccount, LoginMethod, Site } from '@/types'
 
 const props = defineProps<{
   show: boolean
@@ -161,6 +178,8 @@ const props = defineProps<{
   account: Account | null
   /** 站点预设列表（供新增时选择自动带出路径） */
   sites?: Site[]
+  /** GitHub 凭据池（供选择要引用哪一份 user_session） */
+  githubAccounts?: GitHubAccount[]
   submitting?: boolean
 }>()
 
@@ -237,6 +256,8 @@ interface AccountForm {
   cookie: string
   github_user_session: string
   github_client_id: string
+  /** 引用的 GitHub 账号池条目名，空串=不引用 */
+  github_account: string
   user_id: string
   proxy: string
   checkin_path: string
@@ -252,6 +273,7 @@ const form = reactive<AccountForm>({
   cookie: '',
   github_user_session: '',
   github_client_id: '',
+  github_account: '',
   user_id: '',
   proxy: '',
   checkin_path: '',
@@ -260,6 +282,31 @@ const form = reactive<AccountForm>({
 })
 
 const isTabiAI = computed(() => form.login_method === 'tabiai')
+
+/**
+ * 池子下拉选项。已经填了引用但池子里查不到那条时（别人刚删掉、或配置手改过）
+ * 补一个「(已失效)」选项，否则 NSelect 显示空白，用户会以为本来就没引用。
+ */
+const githubAccountOptions = computed<SelectOption[]>(() => {
+  const list = props.githubAccounts ?? []
+  const options: SelectOption[] = list.map((g) => ({
+    label: g.client_id ? `${g.name}（Client ID: ${g.client_id}）` : g.name,
+    value: g.name
+  }))
+  const current = form.github_account
+  if (current && !list.some((g) => g.name === current)) {
+    options.unshift({ label: `${current}（池子里已不存在）`, value: current })
+  }
+  return options
+})
+
+// NSelect 清空时给的是 null，而配置里这个字段是空串
+const githubAccountRef = computed<string | null>({
+  get: () => (form.github_account === '' ? null : form.github_account),
+  set: (v) => {
+    form.github_account = v ?? ''
+  }
+})
 
 // cookie 字段一份表单两种含义：newapi_cookie 存整条 Cookie 头，tabiai 存 new_api_refresh 的值
 const cookieFieldLabel = computed(() => (isTabiAI.value ? 'TaBiAI 凭据' : '站点 Cookie'))
@@ -278,12 +325,16 @@ const cookieTip = computed(() => {
     ? '站点 Cookie 已设置（接口不回传明文），留空保持不变，输入新值可修改'
     : '可稍后补充；该登录方式运行时需要有效 Cookie'
 })
-// user_session 已经不是登录凭据了，文案必须讲清它现在的唯一用途，否则用户会以为它还能登录
-const githubSessionTip = computed(() =>
-  isEdit.value
+// user_session 已经不是登录凭据了，文案必须讲清它现在的唯一用途，否则用户会以为它还能登录。
+// 引用了池子时它就退成兜底（服务端 resolveAccountSession 池子优先），也要说明白
+const githubSessionTip = computed(() => {
+  if (form.github_account) {
+    return '已引用 GitHub 账号池，签发会用池子里的 user_session；这里填的只在池子那条为空时兜底，可以不管'
+  }
+  return isEdit.value
     ? 'GitHub user_session 已设置（接口不回传明文），留空保持不变。它不是登录凭据，只在「一键签发凭据」时用来走一次 OAuth 换 new_api_refresh'
     : '可选，只填 user_session 值（Client ID 留空则用内置默认值）。它不是登录凭据，只用于帮你签发 new_api_refresh'
-)
+})
 
 watch(
   () => props.show,
@@ -298,6 +349,7 @@ watch(
       form.cookie = props.account.cookie // 可能是 "***"
       form.github_user_session = props.account.github_user_session || ''
       form.github_client_id = props.account.github_client_id || ''
+      form.github_account = props.account.github_account || ''
       form.user_id = props.account.user_id == null ? '' : String(props.account.user_id)
       form.proxy = props.account.proxy ?? ''
       form.checkin_path = props.account.checkin_path ?? ''
@@ -311,6 +363,7 @@ watch(
       form.cookie = ''
       form.github_user_session = ''
       form.github_client_id = ''
+      form.github_account = ''
       form.user_id = ''
       form.proxy = ''
       form.checkin_path = ''
@@ -473,6 +526,7 @@ function handleSubmit() {
       cookie: finalCookie,
       github_user_session: finalGithubUserSession,
       github_client_id: form.github_client_id.trim(),
+      github_account: form.github_account.trim(),
       user_id: normalizeUserID(form.user_id),
       proxy: form.proxy.trim() === '' ? null : form.proxy.trim(),
       checkin_path: normalizePath(form.checkin_path),

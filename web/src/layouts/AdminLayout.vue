@@ -2,7 +2,7 @@
 web/src/layouts/AdminLayout.vue
 布局：管理后台主框架
 职责：
-- 深蓝色侧边栏导航（配置总览/AI/浏览器/HTTP/全局默认/代理池/邮件通知/API Key/导出/API 文档）
+- 深蓝色侧边栏导航（配置总览/Cookie 测试/GitHub 账号池/凭据保活/AI/浏览器/HTTP/代理池/代理管理/邮件通知/API Key/导出/API 文档）
 - 顶部栏：当前页面标题 + 用户名下拉（修改密码/退出登录）
 - 首次进入时拉取 GET /api/config 初始化 config store
 - 常驻轮询 GET /api/config/revision：版本号变了就静默换上最新配置，让别人的改动
@@ -94,6 +94,7 @@ import {
   DocumentTextOutline,
   CheckmarkCircleOutline,
   RefreshCircleOutline,
+  LogoGithub,
   RocketOutline,
   CubeOutline,
   PersonCircleOutline,
@@ -122,6 +123,7 @@ const renderIcon = (icon: unknown) => () => h(NIcon, null, { default: () => h(ic
 const menuOptions: MenuOption[] = [
   { label: '配置总览', key: '/', icon: renderIcon(HomeOutline) },
   { label: 'Cookie 测试', key: '/cookie-tests', icon: renderIcon(CheckmarkCircleOutline) },
+  { label: 'GitHub 账号池', key: '/github-accounts', icon: renderIcon(LogoGithub) },
   { label: '凭据保活', key: '/tabiai-keepalive', icon: renderIcon(RefreshCircleOutline) },
   { label: 'AI 配置', key: '/settings/ai', icon: renderIcon(SparklesOutline) },
   { label: '浏览器配置', key: '/settings/browser', icon: renderIcon(PlanetOutline) },

@@ -3,9 +3,11 @@ web/src/views/ProxiesView.vue
 页面：代理管理（独立页）
 职责：
 - 统计卡：可用 / 总数 / 平均延迟 / 上次刷新
-- 代理列表表格：地址 / 来源 / 延迟(ms) / 测速(KB/s·MB/s) / 状态 / 最后存活
-- 筛选（全部/可用 + 按来源）+ 排序（延迟/速度）
+- 代理列表表格：地址 / 协议 / 来源 / 延迟(ms) / 测速(KB/s·MB/s) / 状态 / 最后存活
+- 筛选（全部/可用 + 按协议 + 按来源）+ 排序（延迟/速度）
 - 测速：手动对全部可用或勾选代理跑 Cloudflare 下载测速，结果写库
+- 测速目标一律传 fingerprint：带凭据的地址（VLESS 的 uuid、http 代理的 user:pass）
+  在列表里已被服务端脱敏，把脱敏后的 addr 传回去匹配不上任何一条
 - Actions 预取：列表按质量排序（speed_bps 优先），实现优选
 数据来源：GET /api/proxies、GET /api/proxies/stats、POST /api/proxies/speedtest
 -->
@@ -96,6 +98,14 @@ web/src/views/ProxiesView.vue
           <n-radio-button value="alive">仅可用</n-radio-button>
         </n-radio-group>
         <n-select
+          v-model:value="protocolFilter"
+          :options="protocolOptions"
+          placeholder="按协议筛选"
+          clearable
+          size="small"
+          class="protocol-select"
+        />
+        <n-select
           v-model:value="sourceFilter"
           :options="sourceOptions"
           placeholder="按来源筛选"
@@ -138,7 +148,7 @@ web/src/views/ProxiesView.vue
         striped
         :bordered="false"
         size="small"
-        :scroll-x="900"
+        :scroll-x="1080"
       >
         <template #empty>
           <n-empty v-if="!listLoading" description="暂无代理数据，点击「立即刷新」抓取" />
@@ -200,6 +210,7 @@ const refreshing = ref(false)
 const speedTesting = ref(false)
 const aliveFilter = ref<'all' | 'alive'>('all')
 const sourceFilter = ref<string | null>(null)
+const protocolFilter = ref<string | null>(null)
 const sortBy = ref<'latency' | 'speed'>('latency')
 const selectedKeys = ref<number[]>([])
 const speedModalVisible = ref(false)
@@ -263,10 +274,33 @@ const sortOptions: SelectOption[] = [
   { label: '按速度排序', value: 'speed' }
 ]
 
+// 协议筛选项只列库里实际出现的，避免摆一堆永远筛不出东西的选项
+const protocolOptions = computed<SelectOption[]>(() => {
+  const set = new Set<string>()
+  proxies.value.forEach((p) => {
+    if (p.protocol) set.add(p.protocol)
+  })
+  return [...set].sort().map((p) => ({ label: protocolLabel(p), value: p }))
+})
+
+/** 协议徽章配色：vless 是自建/机场节点，跟公共 http/socks5 分开看 */
+const PROTOCOL_TAG_TYPE: Record<string, 'default' | 'info' | 'success' | 'warning'> = {
+  http: 'info',
+  https: 'info',
+  socks5: 'success',
+  socks4: 'success',
+  vless: 'warning'
+}
+
+function protocolLabel(protocol: string) {
+  return protocol ? protocol.toUpperCase() : '未知'
+}
+
 const filteredProxies = computed(() => {
   let out = proxies.value
   if (aliveFilter.value === 'alive') out = out.filter((p) => p.alive)
   if (sourceFilter.value) out = out.filter((p) => p.source === sourceFilter.value)
+  if (protocolFilter.value) out = out.filter((p) => p.protocol === protocolFilter.value)
   const arr = [...out]
   if (sortBy.value === 'speed') {
     arr.sort((a, b) => (b.speed_bps || 0) - (a.speed_bps || 0) || (a.latency_ms || 0) - (b.latency_ms || 0))
@@ -298,8 +332,27 @@ const proxyColumns: DataTableColumns<ProxyEntry> = [
   {
     title: '代理地址',
     key: 'addr',
-    width: 170,
-    render: (row) => h('span', { class: 'mono-inline' }, row.addr)
+    width: 240,
+    // 不用 Naive 的 ellipsis：单元格里是两行（地址 + 指纹），
+    // NEllipsis 按单行文本处理会把版式压坏，改成 CSS 截断 + 原生 title 提示
+    // 脱敏后的两个 VLESS 节点可能长得一模一样（uuid 不同、host 相同），
+    // 底下补一行指纹，用户才有办法区分自己在对哪一条操作
+    render: (row) =>
+      h('div', { class: 'addr-cell' }, [
+        h('span', { class: 'mono-inline addr-text', title: row.addr }, row.addr),
+        row.fingerprint ? h('span', { class: 'addr-fingerprint' }, row.fingerprint) : null
+      ])
+  },
+  {
+    title: '协议',
+    key: 'protocol',
+    width: 90,
+    render: (row) =>
+      h(
+        NTag,
+        { size: 'small', bordered: false, type: PROTOCOL_TAG_TYPE[row.protocol] ?? 'default' },
+        { default: () => protocolLabel(row.protocol) }
+      )
   },
   {
     title: '来源',
@@ -410,7 +463,10 @@ function openSpeedTestModal() {
 async function handleSpeedTest(targets: ProxyEntry[]) {
   speedTesting.value = true
   try {
-    await speedTestProxies({ proxies: targets.map((p) => p.addr) })
+    // 一律传 fingerprint：带凭据的 addr 在列表里是脱敏形态，传回去服务端匹配不上，
+    // 会出现「点了测速但一条没测」。服务端先按 addr 精确匹配、再按指纹反查，
+    // 所以指纹对未脱敏的条目同样有效。指纹缺失（老服务端）时才退回 addr
+    await speedTestProxies({ proxies: targets.map((p) => p.fingerprint || p.addr) })
     message.success(`已对 ${targets.length} 个代理发起测速，弹窗实时显示进度`)
     startPolling()
     setTimeout(() => loadProxyData(), 2000)
@@ -545,6 +601,29 @@ onBeforeUnmount(stopPolling)
 
 .source-select {
   width: 220px;
+}
+
+.protocol-select {
+  width: 140px;
+}
+
+/* 地址单元格：第一行地址（超长截断）、第二行指纹 */
+.addr-cell {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.addr-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.addr-fingerprint {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 11px;
+  color: #a3aec0;
 }
 
 .sort-select {
