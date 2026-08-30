@@ -28,6 +28,22 @@ type GitHubAccount struct {
 	UserSession string `json:"user_session"`
 	// ClientID 站点 OAuth 应用 ID。留空时由站点 /api/status 探测
 	ClientID string `json:"client_id"`
+
+	// Fingerprint 客户端指纹的 seed。一个账号一份、永不漂移 ——
+	// GitHub 的 session 绑设备特征，UA 忽然变了会被判成异常会话。
+	// 空值时签发链路回落全局默认 UA（老配置的迁移期）。见 github_fingerprint.go
+	Fingerprint string `json:"fingerprint"`
+
+	// ProxyAddr 绑定的固定出口（代理池里的一条 addr，可能是 vless:// URI）。
+	//
+	// 为什么要固定：同一条 user_session 从不断变化的 IP 出现，是触发 GitHub 风控
+	// 最快的方式，最坏直接作废 session。所以一个账号粘住一个出口，只有这个出口
+	// 真的不可用了才换。
+	//
+	// 它是**服务端运行状态而不是用户配置**：由服务端分配与换绑，整份配置提交时
+	// 一律忽略客户端提交的值、保留库里的（见 saveConfigKeepingCookiesLocked）。
+	// 值里可能带节点 uuid（凭据），出站前必须过 proxyDisplay。
+	ProxyAddr string `json:"proxy_addr"`
 }
 
 // accountNameOpen / accountNameClose 名字里包住域名的括号。
@@ -122,6 +138,82 @@ func effectiveGitHubCredentials(cfg *Config, account Account) Account {
 	effective.GithubUserSession = session
 	effective.GithubClientID = clientID
 	return effective
+}
+
+// effectiveGitHubFingerprint 取该站点账号该用的客户端指纹。
+//
+// 只有引用了池子的账号才有指纹：老配置里凭据还在账号自己身上，那些账号继续用
+// 全局默认 UA（零值指纹会让 applyGitHubFingerprint 什么都不做）。宁可保持旧行为，
+// 也不要在迁移期给某个账号换一套特征 —— 换特征本身就是异常信号。
+func effectiveGitHubFingerprint(cfg *Config, account Account) githubFingerprint {
+	if ref := findGitHubAccount(cfg, account.GitHubAccount); ref != nil {
+		return deriveGitHubFingerprint(ref.Fingerprint)
+	}
+	return githubFingerprint{}
+}
+
+// ensureGitHubFingerprints 给还没有指纹 seed 的池子账号补上，返回补过的账号名。
+//
+// 幂等：已有 seed 的一律不动 —— 重算会换掉这个账号在 GitHub 眼里的设备特征，
+// 那正是我们要避免的事。
+//
+// 启动时和每次池子提交后都调一次：启动那次管老配置的迁移，提交那次管新加的账号。
+// 只靠启动会漏掉「加完账号还没重启就开始签发」的窗口。
+func ensureGitHubFingerprints(cfg *Config) []string {
+	var filled []string
+	for i := range cfg.GitHubAccounts {
+		if strings.TrimSpace(cfg.GitHubAccounts[i].Fingerprint) != "" {
+			continue
+		}
+		name := strings.TrimSpace(cfg.GitHubAccounts[i].Name)
+		if name == "" {
+			continue // 名字都没有的条目由 ValidateConfig 拦，这里不越权
+		}
+		cfg.GitHubAccounts[i].Fingerprint = newFingerprintSeed(name)
+		filled = append(filled, name)
+	}
+	return filled
+}
+
+// keepGitHubRuntimeFields 处理提交上来的出口绑定字段。
+//
+// 出口绑定由服务端分配与换绑，不是用户配置。但两条写入路径的形态不同，不能一律
+// 用库里的值盖掉：
+//   - 整份 PUT /api/config：客户端回传的是它读到的**脱敏**形态
+//     （vless 的 uuid 不能明文回浏览器），原样存回去会把绑定写成一条不可用的假地址。
+//     这种一律换成库里的真值。
+//   - POST /api/github-accounts/ops：incoming 里的值是服务端自己刚从旧记录搬过来的
+//     真值（见 inheritGitHubRuntimeFields）。这种必须保留 —— 无条件覆盖会在改名时
+//     把刚搬好的绑定又抹掉，因为库里还没有新名字这条记录。
+//
+// 按 name 匹配而不是下标：前端调整顺序时下标会错位。
+// 注意整份 PUT 里改名会丢绑定 —— 那条路径不带 previous_name，服务端无从得知
+// 新旧名的对应关系。改名请走 ops 端点。
+func keepGitHubRuntimeFields(incoming *Config, stored Config) {
+	if incoming == nil {
+		return
+	}
+	boundByName := make(map[string]string, len(stored.GitHubAccounts))
+	for _, g := range stored.GitHubAccounts {
+		if name := strings.TrimSpace(g.Name); name != "" {
+			boundByName[name] = g.ProxyAddr
+		}
+	}
+	for i := range incoming.GitHubAccounts {
+		name := strings.TrimSpace(incoming.GitHubAccounts[i].Name)
+		bound, known := boundByName[name]
+		submitted := incoming.GitHubAccounts[i].ProxyAddr
+
+		if strings.Contains(submitted, MaskPlaceholder) {
+			// 界面原样回传的脱敏值：换成库里的真值（库里没有就归零）
+			incoming.GitHubAccounts[i].ProxyAddr = bound
+			continue
+		}
+		if submitted == "" && known {
+			// 没带绑定但库里有：补回去，免得一次普通保存就把绑定清了
+			incoming.GitHubAccounts[i].ProxyAddr = bound
+		}
+	}
 }
 
 // planAccountRenames 算出「旧名 -> 新名」映射，只包含真正需要改的。

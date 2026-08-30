@@ -52,7 +52,7 @@ func poolReferencingAccount(cfg *Config, poolName string) (*Account, bool) {
 // 消耗站点侧的授权码配额，更不该无意中把一条新的 new_api_refresh 落到库里。
 // authorizeURL 供测试注入；生产传 GitHub 官方地址。
 func checkTabiAIGithubSession(ctx context.Context, httpCfg HTTPConfig, account Account,
-	authorizeURL string) githubCheckResult {
+	authorizeURL string, fp githubFingerprint) githubCheckResult {
 	base, err := cookieTestBaseURL(account.URL)
 	if err != nil {
 		return githubCheckResult{Status: "unknown", Message: "站点 URL 无效: " + err.Error()}
@@ -64,14 +64,14 @@ func checkTabiAIGithubSession(ctx context.Context, httpCfg HTTPConfig, account A
 
 	// 第 1 步：取 flow_token。这一步挂在站点上 —— 站点都连不上时，session 本身
 	// 是否有效无从判断，归 unknown
-	state, err := fetchTabiAIOAuthState(ctx, client, base)
+	state, err := fetchTabiAIOAuthState(ctx, client, base, fp)
 	if err != nil {
 		return githubCheckResult{Status: "unknown", Message: err.Error()}
 	}
 
 	// 第 2 步：带 session 换授权 code。这里才真正判定 session 的状态。
 	// code 拿到即止：检测不兑换，不该消耗站点侧的授权码配额
-	if _, err := fetchGithubAuthorizeCode(ctx, client, base, account, state, authorizeURL); err != nil {
+	if _, err := fetchGithubAuthorizeCode(ctx, client, base, account, state, authorizeURL, fp); err != nil {
 		status := "unknown"
 		if strings.Contains(err.Error(), "已失效") {
 			status = "expired"
@@ -125,7 +125,8 @@ func (s *Server) handleCheckGitHubAccount(w http.ResponseWriter, r *http.Request
 	githubCheckMu.Lock()
 	defer githubCheckMu.Unlock()
 
-	result := checkTabiAIGithubSession(r.Context(), cfg.HTTP, effective, s.githubAuthorizeURLOrDefault())
+	result := checkTabiAIGithubSession(r.Context(), cfg.HTTP, effective,
+		s.githubAuthorizeURLOrDefault(), effectiveGitHubFingerprint(&cfg, *ref))
 	log.Printf("[github-accounts] 探测 %q（站点 %s）: %s",
 		pool.Name, ref.URL, result.Status)
 	writeJSON(w, http.StatusOK, map[string]any{

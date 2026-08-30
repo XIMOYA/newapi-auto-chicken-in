@@ -167,7 +167,8 @@ func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	cookie, err := issueTabiAIRefreshCookie(r.Context(), cfg.HTTP, effective, tabiaiGithubAuthorize)
+	cookie, err := issueTabiAIRefreshCookie(r.Context(), cfg.HTTP, effective,
+		s.githubAuthorizeURLOrDefault(), effectiveGitHubFingerprint(&cfg, *target))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -194,7 +195,8 @@ func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request)
 
 // fetchTabiAIOAuthState 第 1 步：取 flow_token（与本次 HTTP session 绑定）。
 // 后面第 3 步回调必须用同一个客户端带着这份 state 回去。
-func fetchTabiAIOAuthState(ctx context.Context, client *http.Client, base string) (string, error) {
+func fetchTabiAIOAuthState(ctx context.Context, client *http.Client, base string,
+	fp githubFingerprint) (string, error) {
 	statePayload, _ := json.Marshal(map[string]string{"provider": "github", "intent": "login"})
 	stateReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		base+tabiaiOAuthStatePath, bytes.NewReader(statePayload))
@@ -202,6 +204,8 @@ func fetchTabiAIOAuthState(ctx context.Context, client *http.Client, base string
 		return "", fmt.Errorf("构造 OAuth state 请求失败: %w", err)
 	}
 	setCookieTestCommonHeaders(stateReq, base, "")
+	// 站点这一跳也用同一份指纹：一个「设备」访问站点和 GitHub 时特征应当一致
+	applyGitHubFingerprint(stateReq.Header, fp)
 	stateReq.Header.Set("Content-Type", "application/json")
 	stateReq.Header.Set("Cache-Control", "no-store")
 	stateResp, err := client.Do(stateReq)
@@ -231,7 +235,7 @@ func fetchTabiAIOAuthState(ctx context.Context, client *http.Client, base string
 // 与第 1 步共用同一个 client，保证 state 与站点会话绑定。
 // authorizeURL 供测试注入；生产传 GitHub 官方地址。
 func fetchGithubAuthorizeCode(ctx context.Context, client *http.Client, base string,
-	account Account, state, authorizeURL string) (string, error) {
+	account Account, state, authorizeURL string, fp githubFingerprint) (string, error) {
 	clientID, err := resolveGithubClientID(ctx, client, base, account)
 	if err != nil {
 		return "", err
@@ -252,6 +256,9 @@ func fetchGithubAuthorizeCode(ctx context.Context, client *http.Client, base str
 	}
 	authorizeReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	authorizeReq.Header.Set("User-Agent", cookieTestDefaultUA)
+	// 账号自己的固定指纹覆盖全局默认 UA。GitHub 的 session 绑设备特征，
+	// 几个账号共用一个 UA 时其中一个被盯上，其余的特征完全一致
+	applyGitHubFingerprint(authorizeReq.Header, fp)
 	session := sanitizeCookieTestHeader(account.GithubUserSession)
 	authorizeReq.Header.Set("Cookie", "user_session="+session+
 		"; __Host-user_session_same_site="+session+"; logged_in=yes")
@@ -276,7 +283,7 @@ func fetchGithubAuthorizeCode(ctx context.Context, client *http.Client, base str
 //
 // 客户端（Actions）签到时的凭据轮转与签到本身照旧走代理，那与这里无关。
 func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account Account,
-	authorizeURL string) (string, error) {
+	authorizeURL string, fp githubFingerprint) (string, error) {
 	base, err := cookieTestBaseURL(account.URL)
 	if err != nil {
 		return "", fmt.Errorf("站点 URL 无效: %w", err)
@@ -287,13 +294,13 @@ func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account A
 	}
 
 	// 第 1 步：取 flow_token（与本 session 绑定）
-	state, err := fetchTabiAIOAuthState(ctx, client, base)
+	state, err := fetchTabiAIOAuthState(ctx, client, base, fp)
 	if err != nil {
 		return "", err
 	}
 
 	// 第 2 步：带 GitHub user_session 换授权 code
-	code, err := fetchGithubAuthorizeCode(ctx, client, base, account, state, authorizeURL)
+	code, err := fetchGithubAuthorizeCode(ctx, client, base, account, state, authorizeURL, fp)
 	if err != nil {
 		return "", err
 	}
@@ -308,6 +315,7 @@ func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account A
 		return "", fmt.Errorf("构造 OAuth 回调请求失败: %w", err)
 	}
 	setCookieTestCommonHeaders(callbackReq, base, "")
+	applyGitHubFingerprint(callbackReq.Header, fp)
 	callbackReq.Header.Set("Referer", sanitizeCookieTestHeader(base+"/oauth/github"))
 	callbackResp, err := client.Do(callbackReq)
 	if err != nil {

@@ -302,10 +302,15 @@ func MaskConfig(cfg *Config) *Config {
 	// 共享凭据池的 session 与账号自带的那份等价，同样不能明文下发浏览器。
 	// client_id 是站点 OAuth 应用的公开标识，不打码 —— 打了前端就没法判断
 	// 用户是「想改」还是「原样回传」，反而容易把占位符当真值存回去。
+	// fingerprint 只是指纹 seed（决定 UA），不是凭据，照常下发让界面能显示派生结果。
 	for i := range m.GitHubAccounts {
 		if m.GitHubAccounts[i].UserSession != "" {
 			m.GitHubAccounts[i].UserSession = MaskPlaceholder
 		}
+		// 绑定的出口可能是 vless:// URI，里面的 uuid 是接入凭据。
+		// 这里用展示脱敏而不是打成 "***"：运维要能看出绑的是哪个节点。
+		// 它是服务端状态、入站一律被忽略，所以不需要能还原
+		m.GitHubAccounts[i].ProxyAddr = proxyDisplay(m.GitHubAccounts[i].ProxyAddr)
 	}
 	if m.AI.APIKey != "" {
 		m.AI.APIKey = MaskPlaceholder

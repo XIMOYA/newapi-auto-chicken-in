@@ -251,7 +251,7 @@ func TestIssueTabiAIRefreshCookieThreeSteps(t *testing.T) {
 
 	cookie, err := issueTabiAIRefreshCookie(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
 		Name: "tabi", URL: site.URL, GithubUserSession: "gh-session",
-	}, authorize.URL)
+	}, authorize.URL, githubFingerprint{})
 	if err != nil {
 		t.Fatalf("签发失败: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestIssueRefreshCookieIgnoresAccountProxy(t *testing.T) {
 	_, _ = issueTabiAIRefreshCookie(context.Background(),
 		HTTPConfig{Timeout: 3, Verify: true},
 		Account{Name: "tabi", URL: "https://tabi.invalid", GithubUserSession: "gh", Proxy: &own},
-		"https://github.com/login/oauth/authorize")
+		"https://github.com/login/oauth/authorize", githubFingerprint{})
 	// 不关心签发成没成（站点是不可达的假域名），只确认那个代理压根没被用到
 	if proxied.Load() != 0 {
 		t.Fatalf("签发不该经过账号自带代理，实际经过了 %d 次", proxied.Load())

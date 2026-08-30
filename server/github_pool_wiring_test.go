@@ -90,10 +90,11 @@ func TestIssueUsesPoolSessionAndClientID(t *testing.T) {
 	// 它带的 Cookie 就是签发实际使用的 session，骗不了人。
 	site := poolOAuthSite(t)
 
-	var sawSession, sawClientID string
+	var sawSession, sawClientID, sawUA string
 	authorize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sawSession = r.Header.Get("Cookie")
 		sawClientID = r.URL.Query().Get("client_id")
+		sawUA = r.Header.Get("User-Agent")
 		w.Header().Set("Location", site.URL+"/oauth/github?code=code-pool&state=flow-pool")
 		w.WriteHeader(http.StatusFound)
 	}))
@@ -101,7 +102,8 @@ func TestIssueUsesPoolSessionAndClientID(t *testing.T) {
 
 	cfg := &Config{
 		GitHubAccounts: []GitHubAccount{
-			{Name: "Steven", UserSession: "pool-sess", ClientID: "pool-cid"},
+			{Name: "Steven", UserSession: "pool-sess", ClientID: "pool-cid",
+				Fingerprint: newFingerprintSeed("Steven")},
 		},
 	}
 	account := Account{
@@ -109,9 +111,12 @@ func TestIssueUsesPoolSessionAndClientID(t *testing.T) {
 		GitHubAccount: "Steven", Enabled: true,
 	}
 
+	// 指纹从池子那条记录的 seed 派生。这里顺带守住一件事：
+	// 派生结果非零时，发给 GitHub 的 UA 必须是它而不是全局默认值
+	fp := effectiveGitHubFingerprint(cfg, account)
 	cookie, err := issueTabiAIRefreshCookie(context.Background(),
 		HTTPConfig{Timeout: 5, Verify: true},
-		effectiveGitHubCredentials(cfg, account), authorize.URL)
+		effectiveGitHubCredentials(cfg, account), authorize.URL, fp)
 	if err != nil {
 		t.Fatalf("用池子凭据签发失败: %v", err)
 	}
@@ -124,6 +129,17 @@ func TestIssueUsesPoolSessionAndClientID(t *testing.T) {
 	// 池子填了 client_id 就该直接用，不再去站点 /api/status 探测
 	if sawClientID != "pool-cid" {
 		t.Errorf("client_id 应用池子的 pool-cid，实际 %q", sawClientID)
+	}
+	// 指纹必须真的替换掉全局默认 UA：GitHub 的 session 绑设备特征，
+	// 几个账号共用一个 UA 时其中一个被盯上，其余的特征完全一致
+	if fp.UserAgent == "" {
+		t.Fatal("这条记录有 seed，应派生出 UA")
+	}
+	if sawUA != fp.UserAgent {
+		t.Errorf("发给 GitHub 的 UA = %q, want 账号自己的 %q", sawUA, fp.UserAgent)
+	}
+	if sawUA == cookieTestDefaultUA {
+		t.Error("UA 还是全局默认值，指纹没生效")
 	}
 }
 
@@ -261,7 +277,7 @@ func TestCheckTabiAIGithubSessionThreeStates(t *testing.T) {
 		})
 		account := baseAccount
 		account.URL = site
-		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth)
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{})
 		if res.Status != "ok" {
 			t.Fatalf("状态 = %s, want ok（message: %s）", res.Status, res.Message)
 		}
@@ -274,7 +290,7 @@ func TestCheckTabiAIGithubSessionThreeStates(t *testing.T) {
 		})
 		account := baseAccount
 		account.URL = site
-		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth)
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{})
 		if res.Status != "expired" {
 			t.Fatalf("状态 = %s, want expired（message: %s）", res.Status, res.Message)
 		}
@@ -289,7 +305,7 @@ func TestCheckTabiAIGithubSessionThreeStates(t *testing.T) {
 		})
 		account := baseAccount
 		account.URL = site
-		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth)
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{})
 		if res.Status != "unknown" {
 			t.Fatalf("状态 = %s, want unknown（message: %s）", res.Status, res.Message)
 		}
@@ -305,7 +321,7 @@ func TestCheckTabiAIGithubSessionThreeStates(t *testing.T) {
 		defer broken.Close()
 		account := baseAccount
 		account.URL = broken.URL
-		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth)
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{})
 		if res.Status != "unknown" {
 			t.Fatalf("状态 = %s, want unknown（message: %s）", res.Status, res.Message)
 		}

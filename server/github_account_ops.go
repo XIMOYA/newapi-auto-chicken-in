@@ -87,6 +87,23 @@ func applyGitHubAccountOps(cfg *Config, ops []GitHubAccountOp) ([]string, error)
 	return skipped, nil
 }
 
+// inheritGitHubRuntimeFields 把旧记录的服务端运行状态搬到新记录上。
+//
+// Fingerprint 与 ProxyAddr 都不是用户提交的字段（前端压根不发），所以每次 upsert
+// 重建记录时必须显式搬过来。漏掉的后果正好打破这两件事的立意：
+//   - 不搬 Fingerprint：ensureGitHubFingerprints 会按新名字重新派生 seed，
+//     改个名就等于给这个账号换了台设备，而 GitHub 的 session 绑设备特征
+//   - 不搬 ProxyAddr：keepGitHubRuntimeFields 按名字匹配，改名后对不上就丢绑定，
+//     账号会被重新分配出口 —— 而固定出口本来就是为了不让 session 换 IP
+func inheritGitHubRuntimeFields(incoming *GitHubAccount, old GitHubAccount) {
+	if strings.TrimSpace(incoming.Fingerprint) == "" {
+		incoming.Fingerprint = old.Fingerprint
+	}
+	if strings.TrimSpace(incoming.ProxyAddr) == "" {
+		incoming.ProxyAddr = old.ProxyAddr
+	}
+}
+
 // applyGitHubUpsert 新增或更新一条池子记录。
 //
 // user_session 允许提交打码占位符：还原交给 UnmaskConfig 统一处理，
@@ -119,6 +136,8 @@ func applyGitHubUpsert(cfg *Config, op GitHubAccountOp) error {
 		if findGitHubAccountIndexByName(cfg.GitHubAccounts, name) >= 0 {
 			return fmt.Errorf("GitHub 账号 %q 已存在", name)
 		}
+		// 指纹与出口绑定跟着这条记录走，不因为改名而重置
+		inheritGitHubRuntimeFields(&incoming, cfg.GitHubAccounts[idx])
 		cfg.GitHubAccounts[idx] = incoming
 		for i := range cfg.Accounts {
 			if strings.TrimSpace(cfg.Accounts[i].GitHubAccount) == prev {
@@ -129,6 +148,8 @@ func applyGitHubUpsert(cfg *Config, op GitHubAccountOp) error {
 	}
 
 	if idx := findGitHubAccountIndexByName(cfg.GitHubAccounts, name); idx >= 0 {
+		// 同名更新同理：前端只回传三个字段，运行状态得自己保住
+		inheritGitHubRuntimeFields(&incoming, cfg.GitHubAccounts[idx])
 		cfg.GitHubAccounts[idx] = incoming
 		return nil
 	}

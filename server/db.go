@@ -388,13 +388,21 @@ func SanitizeConfigSecrets(db *sql.DB) error {
 		return err
 	}
 	cleaned := SanitizeMaskLeftovers(&cfg)
-	if len(cleaned) == 0 {
+	filled := ensureGitHubFingerprints(&cfg)
+	if len(cleaned) == 0 && len(filled) == 0 {
 		return nil
 	}
 	if _, err := SaveConfig(db, cfg); err != nil {
 		return err
 	}
-	log.Printf("[config] 已清理遗留的占位符敏感字段（需要重新填写）: %s", strings.Join(cleaned, "、"))
+	if len(cleaned) > 0 {
+		log.Printf("[config] 已清理遗留的占位符敏感字段（需要重新填写）: %s", strings.Join(cleaned, "、"))
+	}
+	if len(filled) > 0 {
+		// 老配置里的池子账号没有指纹 seed，补上之后它们在 GitHub 眼里就各是一台设备。
+		// seed 由账号名派生，所以这次补齐算出来的值与将来任何一次重算都一致
+		log.Printf("[config] 已为 GitHub 账号分配固定客户端指纹: %s", strings.Join(filled, "、"))
+	}
 	return nil
 }
 
@@ -480,6 +488,13 @@ func saveConfigKeepingCookiesLocked(db *sql.DB, cfg Config) (string, error) {
 	// 兜底：任何路径漏掉 UnmaskConfig 时，"***" 也不该落库
 	if cleaned := SanitizeMaskLeftovers(&cfg); len(cleaned) > 0 {
 		log.Printf("[config] 拦截到未还原的占位符并清空: %s", strings.Join(cleaned, ", "))
+	}
+	// 出口绑定是服务端运行状态：提交上来的值一律丢掉，用库里的。
+	// 出站时它被 proxyDisplay 脱敏过，原样存回去会把绑定写成一条假地址
+	keepGitHubRuntimeFields(&cfg, stored)
+	// 新加的池子账号在这里就把指纹 seed 补上，不必等下次重启
+	if filled := ensureGitHubFingerprints(&cfg); len(filled) > 0 {
+		log.Printf("[config] 已为 GitHub 账号分配固定客户端指纹: %s", strings.Join(filled, ", "))
 	}
 	return saveConfigLocked(db, cfg)
 }
