@@ -42,6 +42,8 @@ type Server struct {
 	// githubAuthorizeURL 测试钩子：留空时探测/签发走 GitHub 官方地址。
 	// 端点测试注入假地址后全程离线，不依赖外网；生产路径不受影响
 	githubAuthorizeURL string
+	// githubProfileURL 同上，用于账号状态探测（可登录/停用/封禁）
+	githubProfileURL string
 }
 
 // NewServer 构造服务实例；jwtSecret 为 JWT 签名密钥（main 已校验长度）。
@@ -86,6 +88,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/github-accounts/ops", s.requireJWTOrAPIKey(s.handleGitHubAccountOps))
 	// 池子账号可用性探测：同样双认证。它在后台实际请求 GitHub OAuth，串行执行
 	mux.HandleFunc("POST /api/github-accounts/check", s.requireJWTOrAPIKey(s.handleCheckGitHubAccount))
+	// 账号自身状态（可登录/已停用/已封禁）：与站点无关，入池前也能先判一次
+	mux.HandleFunc("POST /api/github-accounts/status", s.requireJWTOrAPIKey(s.handleCheckGitHubStatus))
 	// 按站点 URL 批量建签到账号：会为每个 GitHub 账号签发一条站点凭据，
 	// 与签到抢代次，所以内部先过签到锁
 	mux.HandleFunc("POST /api/sites/provision", s.requireJWTOrAPIKey(s.handleProvisionSite))
