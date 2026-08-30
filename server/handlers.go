@@ -39,6 +39,9 @@ type Server struct {
 	keepalive     *TabiAIKeepalive
 	loginLim      *loginLimiter
 	exportTickets *exportTicketStore
+	// githubAuthorizeURL 测试钩子：留空时探测/签发走 GitHub 官方地址。
+	// 端点测试注入假地址后全程离线，不依赖外网；生产路径不受影响
+	githubAuthorizeURL string
 }
 
 // NewServer 构造服务实例；jwtSecret 为 JWT 签名密钥（main 已校验长度）。
@@ -81,6 +84,8 @@ func (s *Server) routes() http.Handler {
 	// 属于日常运维（换了 session 要能立刻补上），不是控制平面。
 	// 注意它不像 /api/keys 那样能自我提权：池子里的 session 只能用来签发站点凭据。
 	mux.HandleFunc("POST /api/github-accounts/ops", s.requireJWTOrAPIKey(s.handleGitHubAccountOps))
+	// 池子账号可用性探测：同样双认证。它在后台实际请求 GitHub OAuth，串行执行
+	mux.HandleFunc("POST /api/github-accounts/check", s.requireJWTOrAPIKey(s.handleCheckGitHubAccount))
 
 	// 单账号查询（凭据回写的读回核实，见 account_query.go）：
 	// 脱敏摘要跟 GET /api/config 同级（双认证，cookie 只给指纹不给明文），

@@ -222,3 +222,174 @@ func TestExpiredListHasUserSessionFromPool(t *testing.T) {
 		t.Error("失效名单里出现了明文 session")
 	}
 }
+
+// checkFixture 造一对假站点 + 假 authorize，让探测不碰任何真实网络。
+// authorize 的响应由 handler 决定，返回值用于驱动三态判定。
+func checkFixture(t *testing.T, authorizeHandler func(w http.ResponseWriter, r *http.Request)) (siteURL, authorizeURL string) {
+	t.Helper()
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case tabiaiOAuthStatePath:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data":    map[string]any{"flow_token": "flow-check"},
+			})
+		case tabiaiStatusPath:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data":    map[string]any{"github_client_id": "site-cid"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(site.Close)
+
+	auth := httptest.NewServer(http.HandlerFunc(authorizeHandler))
+	t.Cleanup(auth.Close)
+	return site.URL, auth.URL
+}
+
+func TestCheckTabiAIGithubSessionThreeStates(t *testing.T) {
+	httpCfg := HTTPConfig{Timeout: 5, Verify: true}
+	baseAccount := Account{Name: "Steven（site）", URL: "http://placeholder", GithubUserSession: "gh-sess"}
+
+	t.Run("拿到 code 判 ok", func(t *testing.T) {
+		site, auth := checkFixture(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Location", "https://site/oauth/github?code=code-ok&state=flow-check")
+			w.WriteHeader(http.StatusFound)
+		})
+		account := baseAccount
+		account.URL = site
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth)
+		if res.Status != "ok" {
+			t.Fatalf("状态 = %s, want ok（message: %s）", res.Status, res.Message)
+		}
+	})
+
+	t.Run("跳登录页判 expired", func(t *testing.T) {
+		site, auth := checkFixture(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Location", "https://github.com/login?return_to=x")
+			w.WriteHeader(http.StatusFound)
+		})
+		account := baseAccount
+		account.URL = site
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth)
+		if res.Status != "expired" {
+			t.Fatalf("状态 = %s, want expired（message: %s）", res.Status, res.Message)
+		}
+		if !strings.Contains(res.Message, "已失效") {
+			t.Errorf("message 应点明失效: %s", res.Message)
+		}
+	})
+
+	t.Run("被限流判 unknown", func(t *testing.T) {
+		site, auth := checkFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		})
+		account := baseAccount
+		account.URL = site
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth)
+		if res.Status != "unknown" {
+			t.Fatalf("状态 = %s, want unknown（message: %s）", res.Status, res.Message)
+		}
+	})
+
+	t.Run("站点 state 失败判 unknown", func(t *testing.T) {
+		_, auth := checkFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		})
+		broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "站点拒绝"})
+		}))
+		defer broken.Close()
+		account := baseAccount
+		account.URL = broken.URL
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth)
+		if res.Status != "unknown" {
+			t.Fatalf("状态 = %s, want unknown（message: %s）", res.Status, res.Message)
+		}
+	})
+}
+
+func TestCheckGitHubAccountEndpointUsesPoolCredentials(t *testing.T) {
+	// 端点按池子账号名探测它引用的站点。验证两点：探测真的打到了那个站点、
+	// 打的还是池子里那份凭据（反向验证过接线，这里只守端点契约）
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case tabiaiOAuthStatePath:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data":    map[string]any{"flow_token": "flow-ep"},
+			})
+		case tabiaiStatusPath:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data":    map[string]any{"github_client_id": "ep-cid"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer site.Close()
+
+	srv := newTestServer(t)
+	// 注入假 authorize：探测全程离线，不依赖外网，CI 里结果才稳定。
+	// 在它上面抓真实发出的 Cookie 头，用来断言「走的是池子凭据」
+	var sawGithubCookie string
+	fakeAuth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawGithubCookie = r.Header.Get("Cookie")
+		w.Header().Set("Location", site.URL+"/oauth/github?code=code-ep&state=flow-ep")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer fakeAuth.Close()
+	srv.githubAuthorizeURL = fakeAuth.URL
+
+	seedPool(t, srv,
+		[]GitHubAccount{{Name: "Steven", UserSession: "pool-sess", ClientID: "pool-cid"}},
+		[]Account{{Name: "Steven（site）", URL: site.URL, LoginMethod: LoginMethodTabiAI,
+			GitHubAccount: "Steven", Enabled: true}})
+
+	rr := doReq(t, srv, http.MethodPost, "/api/github-accounts/check", loginToken(t, srv),
+		map[string]any{"name": "Steven"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("探测应成功 = %d, %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Site   string `json:"site"`
+		Result struct {
+			Status string `json:"status"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Site != site.URL {
+		t.Errorf("探测的站点 = %q, want %q", resp.Site, site.URL)
+	}
+	// 注入假 authorize 后探测结果确定是 ok，可以放心断言
+	if resp.Result.Status != "ok" {
+		t.Errorf("状态 = %q, want ok（响应: %s）", resp.Result.Status, rr.Body.String())
+	}
+	// 正向断言：发给 GitHub 的 Cookie 必须是池子里的 session。
+	// 这个账号自身没有任何凭据字段，只靠池子 —— 这条断言才是「池子接线生效」的证据
+	if !strings.Contains(sawGithubCookie, "user_session=pool-sess") {
+		t.Errorf("发给 GitHub 的不是池子凭据: %q", sawGithubCookie)
+	}
+	// 响应不该把池子凭据带回给界面
+	if strings.Contains(rr.Body.String(), "pool-sess") {
+		t.Error("探测响应里出现了明文 session")
+	}
+
+	// 未引用任何站点的池子账号：无法确定探测目标，应 400
+	if rr := doReq(t, srv, http.MethodPost, "/api/github-accounts/check", loginToken(t, srv),
+		map[string]any{"name": "孤儿账号"}); rr.Code != http.StatusNotFound {
+		t.Fatalf("不存在的账号应 404，实际 %d", rr.Code)
+	}
+	seedPool(t, srv, append(poolFromDB(t, srv), GitHubAccount{Name: "孤本", UserSession: "s"}),
+		nil)
+	if rr := doReq(t, srv, http.MethodPost, "/api/github-accounts/check", loginToken(t, srv),
+		map[string]any{"name": "孤本"}); rr.Code != http.StatusBadRequest {
+		t.Fatalf("没被引用应 400，实际 %d: %s", rr.Code, rr.Body.String())
+	}
+}

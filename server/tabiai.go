@@ -192,30 +192,9 @@ func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, body)
 }
 
-// issueTabiAIRefreshCookie 走 GitHub OAuth 三步为账号签发一条新的 new_api_refresh。
-// authorizeURL 供测试注入；生产传 GitHub 官方地址。
-//
-// 三步必须在同一个 HTTP session 内完成（state 与站点会话绑定），因此客户端带 cookiejar。
-//
-// **全程用平台自己的出口直连，不走任何代理**（既不用代理池，也忽略账号自带的
-// account.Proxy）。这是刻意的：GitHub 的 OAuth 端点对机房 IP 有明显限流（403/429），
-// 而带着 user_session 从不断变化的地址出现，正是触发 GitHub 账号风控最快的方式 ——
-// 最坏会把 user_session 直接作废，自救链路彻底断掉。平台部署在固定 IP 上，
-// 在 GitHub 眼里是「常用设备」，成功率和安全性都比套代理好。
-//
-// 客户端（Actions）签到时的凭据轮转与签到本身照旧走代理，那与这里无关。
-func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account Account,
-	authorizeURL string) (string, error) {
-	base, err := cookieTestBaseURL(account.URL)
-	if err != nil {
-		return "", fmt.Errorf("站点 URL 无效: %w", err)
-	}
-	client, err := newTabiAIOAuthClient(account, httpCfg)
-	if err != nil {
-		return "", err
-	}
-
-	// 第 1 步：取 flow_token（与本 session 绑定）
+// fetchTabiAIOAuthState 第 1 步：取 flow_token（与本次 HTTP session 绑定）。
+// 后面第 3 步回调必须用同一个客户端带着这份 state 回去。
+func fetchTabiAIOAuthState(ctx context.Context, client *http.Client, base string) (string, error) {
 	statePayload, _ := json.Marshal(map[string]string{"provider": "github", "intent": "login"})
 	stateReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		base+tabiaiOAuthStatePath, bytes.NewReader(statePayload))
@@ -245,8 +224,14 @@ func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account A
 	if state == "" {
 		return "", fmt.Errorf("OAuth state 成功但未返回 flow_token")
 	}
+	return state, nil
+}
 
-	// 第 2 步：带 GitHub user_session 换授权 code
+// fetchGithubAuthorizeCode 第 2 步：带 GitHub user_session 换授权 code。
+// 与第 1 步共用同一个 client，保证 state 与站点会话绑定。
+// authorizeURL 供测试注入；生产传 GitHub 官方地址。
+func fetchGithubAuthorizeCode(ctx context.Context, client *http.Client, base string,
+	account Account, state, authorizeURL string) (string, error) {
 	clientID, err := resolveGithubClientID(ctx, client, base, account)
 	if err != nil {
 		return "", err
@@ -275,7 +260,40 @@ func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account A
 		return "", fmt.Errorf("GitHub authorize 网络错误: %s", shortCookieTestError(err))
 	}
 	defer authorizeResp.Body.Close()
-	code, err := extractGithubAuthorizeCode(authorizeResp.StatusCode, authorizeResp.Header.Get("Location"))
+	return extractGithubAuthorizeCode(authorizeResp.StatusCode, authorizeResp.Header.Get("Location"))
+}
+
+// issueTabiAIRefreshCookie 走 GitHub OAuth 三步为账号签发一条新的 new_api_refresh。
+// authorizeURL 供测试注入；生产传 GitHub 官方地址。
+//
+// 三步必须在同一个 HTTP session 内完成（state 与站点会话绑定），因此客户端带 cookiejar。
+//
+// **全程用平台自己的出口直连，不走任何代理**（既不用代理池，也忽略账号自带的
+// account.Proxy）。这是刻意的：GitHub 的 OAuth 端点对机房 IP 有明显限流（403/429），
+// 而带着 user_session 从不断变化的地址出现，正是触发 GitHub 账号风控最快的方式 ——
+// 最坏会把 user_session 直接作废，自救链路彻底断掉。平台部署在固定 IP 上，
+// 在 GitHub 眼里是「常用设备」，成功率和安全性都比套代理好。
+//
+// 客户端（Actions）签到时的凭据轮转与签到本身照旧走代理，那与这里无关。
+func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account Account,
+	authorizeURL string) (string, error) {
+	base, err := cookieTestBaseURL(account.URL)
+	if err != nil {
+		return "", fmt.Errorf("站点 URL 无效: %w", err)
+	}
+	client, err := newTabiAIOAuthClient(account, httpCfg)
+	if err != nil {
+		return "", err
+	}
+
+	// 第 1 步：取 flow_token（与本 session 绑定）
+	state, err := fetchTabiAIOAuthState(ctx, client, base)
+	if err != nil {
+		return "", err
+	}
+
+	// 第 2 步：带 GitHub user_session 换授权 code
+	code, err := fetchGithubAuthorizeCode(ctx, client, base, account, state, authorizeURL)
 	if err != nil {
 		return "", err
 	}
