@@ -799,8 +799,10 @@ func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
 		}
 		entries = filtered
 	}
+	// 出站脱敏：VLESS 节点的 addr 里带着 uuid（接入凭据），不能明文回给界面。
+	// 存量的 http/socks5 代理没有 userinfo，addr 原样输出，行为不变
 	writeJSON(w, http.StatusOK, map[string]any{
-		"proxies": entries,
+		"proxies": proxyViewsOf(entries),
 		"total":   len(entries),
 	})
 }
@@ -903,12 +905,14 @@ func (s *Server) handleSpeedTestProxies(w http.ResponseWriter, r *http.Request) 
 	timeout := cfg.ProxyPool.Timeout
 	// 测速地址取配置，空值回落到默认端点。响应里回显它，前端不必自己拼一份
 	speedURL := speedTestURLOf(cfg.ProxyPool)
+	// 界面手里可能只有指纹（带凭据的地址出站时被脱敏了），先还原成真实地址
+	targets := s.proxies.resolveProxyRefs(req.Proxies)
 	go func() {
 		defer recoverPanic("代理测速任务")
 		// 测速后台使用独立 120 秒 context：不随 HTTP 请求结束/取消而中断
 		ctx, cancel := context.WithTimeout(context.Background(), speedTestBackgroundTimeout)
 		defer cancel()
-		updated, terr := s.proxies.SpeedTest(ctx, req.Proxies, timeout, speedURL)
+		updated, terr := s.proxies.SpeedTest(ctx, targets, timeout, speedURL)
 		if terr != nil {
 			log.Printf("[proxy] 测速失败: %v", terr)
 		} else {
@@ -916,7 +920,7 @@ func (s *Server) handleSpeedTestProxies(w http.ResponseWriter, r *http.Request) 
 		}
 	}()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "tested": len(req.Proxies), "url": speedURL,
+		"ok": true, "tested": len(targets), "url": speedURL,
 	})
 }
 
