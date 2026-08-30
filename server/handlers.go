@@ -77,6 +77,11 @@ func (s *Server) routes() http.Handler {
 	// 账号级增量操作：多人同时编辑账号列表走这里，不走整份覆盖
 	mux.HandleFunc("POST /api/accounts/ops", s.requireJWTOrAPIKey(s.handleAccountOps))
 
+	// GitHub 凭据池的增删改：和账号 ops 同级双认证 —— 它改的是签发用的原料，
+	// 属于日常运维（换了 session 要能立刻补上），不是控制平面。
+	// 注意它不像 /api/keys 那样能自我提权：池子里的 session 只能用来签发站点凭据。
+	mux.HandleFunc("POST /api/github-accounts/ops", s.requireJWTOrAPIKey(s.handleGitHubAccountOps))
+
 	// 单账号查询（凭据回写的读回核实，见 account_query.go）：
 	// 脱敏摘要跟 GET /api/config 同级（双认证，cookie 只给指纹不给明文），
 	// 明文切片跟 GET /api/config/raw 同级（只认 API Key，暴露面不新增）
