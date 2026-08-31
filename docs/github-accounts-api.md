@@ -288,13 +288,71 @@ vless://***@node.example.com:443#香港01
 
 1. `POST /api/login` 拿 JWT，或用现成 API Key
 2. `GET /api/config` 读 `config.github_accounts` 与 `config.accounts`，注意凭据字段是 `"***"`
-3. 改池子走 `POST /api/github-accounts/ops`，响应里的 `config` 直接替换本地副本
-4. 查会话是否还活着走 `POST /api/github-accounts/check`，按三态分开处置
-5. 需要新的站点凭据走 `POST /api/tabiai/issue-cookie`
+3. 新账号入池前先 `POST /api/github-accounts/status` 判一次（停用/封禁的不入池）
+4. 改池子走 `POST /api/github-accounts/ops`，响应里的 `config` 直接替换本地副本
+5. 查会话是否还活着走 `POST /api/github-accounts/check`，按三态分开处置
+6. 需要新的站点凭据走 `POST /api/tabiai/issue-cookie`
+7. 新接一个站点时走 `POST /api/sites/provision` 批量建号
 
-## 9. 已知边界
+## 9. 新增端点（补记）
+
+### 9.1 `POST /api/github-accounts/status`
+
+双认证。判定**账号自身**状态，与站点无关。body 二选一：
+
+```json
+{"name": "Steven"}                 // 按池子账号名（凭据从池子取）
+{"user_session": "尚未入池的凭据"}   // 入池之前先判一次
+```
+
+```json
+{"ok": true, "name": "Steven",
+ "result": {"status": "active", "message": "已登录，账号可用", "usable": true}}
+```
+
+`status` 五态：`active` / `suspended` / `banned` / `expired` / `unknown`。
+`usable` 只在 `active` 为真，是「值得留在池子里」的唯一依据 ——
+`suspended` 有申诉恢复的可能、`banned` 基本没有，两者都别加进池子。
+`expired` 是 session 失效（账号本身未知），`unknown` 是出口被限流/页面变化判不了。
+该请求会实际访问 GitHub，可能数十秒，客户端超时放宽到 180s 以上。
+
+### 9.2 `POST /api/sites/provision`
+
+双认证。按站点 URL 为池子里的 GitHub 账号批量建签到账号（站点在 OAuth 首次登录时
+自动注册用户，所以注册和登录是同一趟流程，不需要浏览器）。
+
+```json
+{"url": "https://a.example.com", "only": ["Steven"]}
+```
+
+`only` 可选，只处理这几个账号；留空处理池子全部。**会真的为每个账号签发一条站点
+凭据**，请先确认该站点是新接入的，避免覆盖已有账号。已存在的账号会被跳过，不会
+重新签发。整批串行执行且过签到锁，可能耗时几分钟，客户端超时放宽。
+
+```json
+{"ok": true, "url": "...", "created": 2, "total": 3,
+ "results": [
+   {"github_account": "Steven", "account_name": "Steven（a.example.com）",
+    "status": "created", "attempts": 1},
+   {"github_account": "NoCred", "status": "skipped_no_credentials", "attempts": 0}
+ ]}
+```
+
+`status` 取值与处置：
+- `created`：建号成功，`account_name` 是规范名「GitHub名（域名）」，已落库
+- `exists`：站点账号已存在，跳过
+- `skipped_registration_closed`：站点关闭注册，**只尝试一次不重试**
+- `skipped_no_credentials`：该 GitHub 账号没有 user_session
+- `failed`：其他失败（网络/限流/站点 5xx），已重试到 `provisionMaxAttempts`（3）次
+
+## 10. 已知边界
 
 - 池子账号名（引用键）必须非空且唯一，服务端在保存时校验，重名返回 `400`
 - 单次 ops 最多 500 条
 - 探测串行执行，多个账号排队；单次可能几十秒
-- 出口绑定的**分配与换绑逻辑仍在实现中**：`proxy_addr` 字段与它的持久化、改名继承、脱敏都已就绪并有测试，但「首次分配」和「失效换绑」还没接进签发链路。当前该字段可能为空，客户端不应依赖它非空
+- `proxy_addr`（出口绑定）现在是**真实生效**的：签发/探测/批量建号都走账号绑定的
+  固定出口，只在原出口不可用或链路失败时才换。仍有两个限制：
+  - 当前池子里的 http/socks5 节点可直接用；VLESS 节点需先在本地起 xray 转 socks5，
+    那层还没接，绑到 VLESS 时本次走直连并记日志
+  - 绑定出口在每次代理刷新时被并入候选复测，所以判死但网络抖了一下的绑定
+    不会因为一次刷新就被换掉
