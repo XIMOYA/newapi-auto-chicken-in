@@ -4,15 +4,25 @@ GitHub 凭据池接口封装
 职责：
 - 池子增删改：POST /api/github-accounts/ops（提交操作而非整份快照）
 - 单条 user_session 可用性探测：POST /api/github-accounts/check
+- 账号自身状态探测：POST /api/github-accounts/status（可登录/停用/封禁）
+- 按站点 URL 批量建签到账号：POST /api/sites/provision
 说明：
 - 增删改刻意不走 PUT /api/config —— 整份提交会把后台签到刚轮转的凭据覆盖掉
-- 探测会实际请求 GitHub OAuth，单次要几十秒，必须单独放大超时（默认 30s 不够）
+- 两个探测都会实际请求 GitHub，单次要几十秒，必须单独放大超时（默认 30s 不够）
 数据来源：
 - POST /api/github-accounts/ops
 - POST /api/github-accounts/check
+- POST /api/github-accounts/status
+- POST /api/sites/provision
 */
 import http from './http'
-import type { GitHubAccountCheckResult, GitHubAccountOp, GitHubAccountOpsResult } from '@/types'
+import type {
+  GitHubAccountCheckResult,
+  GitHubAccountOp,
+  GitHubAccountOpsResult,
+  GitHubStatusResult,
+  ProvisionOutcome,
+} from '@/types'
 
 /**
  * 探测的超时。服务端串行执行且要走完「取 flow_token → 换授权 code」两步，
@@ -43,5 +53,34 @@ export function applyGitHubAccountOps(ops: GitHubAccountOp[]): Promise<GitHubAcc
 export function checkGitHubAccount(name: string): Promise<GitHubAccountCheckResult> {
   return http
     .post<GitHubAccountCheckResult>('/github-accounts/check', { name }, { timeout: GITHUB_CHECK_TIMEOUT_MS })
+    .then((r) => r.data)
+}
+
+/**
+ * 探测账号自身状态（与站点无关）：active / suspended / banned / expired / unknown。
+ * 停用/封禁的账号不该留在池子里（每轮签发都会失败）。
+ */
+export function checkGitHubAccountStatus(name: string): Promise<{ result: GitHubStatusResult }> {
+  return http
+    .post<{ result: GitHubStatusResult }>('/github-accounts/status', { name }, { timeout: GITHUB_CHECK_TIMEOUT_MS })
+    .then((r) => r.data)
+}
+
+/**
+ * 按站点 URL 为池子里的 GitHub 账号批量建签到账号。
+ *
+ * 会为每个账号签发一条站点凭据，整批可能几分钟 —— 超时放宽到 10 分钟。
+ * 已存在的账号服务端会跳过，不会重签。
+ */
+export function provisionSite(
+  url: string,
+  only?: string[],
+): Promise<{ created: number; total: number; results: ProvisionOutcome[] }> {
+  return http
+    .post<{ created: number; total: number; results: ProvisionOutcome[] }>(
+      '/sites/provision',
+      { url, only },
+      { timeout: 600_000 },
+    )
     .then((r) => r.data)
 }

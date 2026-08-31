@@ -55,6 +55,43 @@ web/src/views/GitHubAccountsView.vue
       </n-data-table>
     </n-card>
 
+    <n-card :bordered="false" class="pool-card">
+      <template #header>
+        <div class="card-header">
+          <span class="card-title">按站点批量建签到账号</span>
+          <n-tag v-if="provisionResults" size="small" type="info" :bordered="false">
+            {{ provisionResults.filter((r) => r.status === 'created').length }} / {{ provisionResults.length }} 建成
+          </n-tag>
+        </div>
+      </template>
+      <n-space vertical :size="10">
+        <n-input
+          v-model:value="provisionUrl"
+          placeholder="站点 URL，例如 https://a.example.com"
+          clearable
+          :disabled="provisioning"
+        />
+        <n-space :size="10" align="center">
+          <n-button type="primary" :loading="provisioning" :disabled="!provisionUrl.trim()" @click="handleProvision">
+            为全部 GitHub 账号建号
+          </n-button>
+          <span class="muted">会为每个账号签发一条站点凭据，整批可能几分钟。已存在的账号自动跳过，不重签。</span>
+        </n-space>
+        <div v-if="provisionResults" class="provision-list">
+          <div v-for="item in provisionResults" :key="item.github_account" class="provision-item">
+            <n-tag size="small" :bordered="false"
+              :type="item.status === 'created' ? 'success' : item.status === 'exists' ? 'info' : 'warning'">
+              {{ provisionLabel(item.status) }}
+            </n-tag>
+            <span class="provision-account">{{ item.github_account }}</span>
+            <span v-if="item.account_name" class="provision-name">{{ item.account_name }}</span>
+            <span v-if="item.message" class="muted">{{ item.message }}</span>
+            <span v-if="item.attempts > 1" class="check-time">尝试 {{ item.attempts }} 次</span>
+          </div>
+        </div>
+      </n-space>
+    </n-card>
+
     <github-account-modal
       v-model:show="modalVisible"
       :account="editingAccount"
@@ -68,6 +105,7 @@ web/src/views/GitHubAccountsView.vue
 import { computed, h, reactive, ref } from 'vue'
 import {
   NCard, NButton, NIcon, NDataTable, NAlert, NEmpty, NTag, NTooltip, NSpace,
+  NInput,
   useDialog, useMessage, type DataTableColumns, type PaginationProps
 } from 'naive-ui'
 import {
@@ -75,10 +113,10 @@ import {
 } from '@vicons/ionicons5'
 import GithubAccountModal from '@/components/GitHubAccountModal.vue'
 import { useConfigStore } from '@/stores/config'
-import { checkGitHubAccount } from '@/api/githubAccounts'
+import { checkGitHubAccount, checkGitHubAccountStatus, provisionSite } from '@/api/githubAccounts'
 import { deepClone } from '@/utils/clone'
 import { extractErrorMessage } from '@/utils/error'
-import type { Account, GitHubAccount, GitHubAccountOp, GitHubCheckStatus } from '@/types'
+import type { Account, GitHubAccount, GitHubAccountOp, GitHubCheckStatus, ProvisionOutcome } from '@/types'
 
 /** 表格行：池子记录 + 引用它的站点账号名（引用关系只在这一页展示，不进类型定义） */
 interface PoolRow extends GitHubAccount {
@@ -109,12 +147,15 @@ const editingAccount = ref<GitHubAccount | null>(null)
 const checkingName = ref('')
 const checkResults = reactive<Record<string, CheckRecord>>({})
 
-const tableData = computed<PoolRow[]>(() =>
-  pool.value.map((g) => ({
-    ...g,
-    referencedBy: accounts.value.filter((a) => a.github_account === g.name).map((a) => a.name)
-  }))
-)
+/** 账号状态（active/suspended/banned/expired/unknown）的检测结果，按账号名存 */
+interface StatusRecord {
+  status: string
+  usable: boolean
+  message: string
+  checkedAt: number
+}
+const statusCheckingName = ref('')
+const statusResults = reactive<Record<string, StatusRecord>>({})
 
 const pagination = reactive<PaginationProps>({
   pageSize: 10,
@@ -124,6 +165,119 @@ const pagination = reactive<PaginationProps>({
     pagination.pageSize = size
   }
 })
+
+/** 批量建号的状态 */
+const provisionUrl = ref('')
+const provisioning = ref(false)
+const provisionResults = ref<ProvisionOutcome[] | null>(null)
+
+const tableData = computed<PoolRow[]>(() =>
+  pool.value.map((g) => ({
+    ...g,
+    referencedBy: accounts.value.filter((a) => a.github_account === g.name).map((a) => a.name)
+  }))
+)
+
+/** 账号状态呈现：suspended/banned 是「不该留在池子里」，expired 是「session 没了」，
+ * unknown 是「测不出来」。五态分开给色，混色会让停用账号和好账号一个样 */
+const STATUS_PRESENTATION: Record<string, { label: string; type: 'success' | 'error' | 'warning' | 'info' }> = {
+  active: { label: '可登录', type: 'success' },
+  suspended: { label: '已停用', type: 'error' },
+  banned: { label: '已封禁', type: 'error' },
+  expired: { label: '会话失效', type: 'warning' },
+  unknown: { label: '无法判断', type: 'info' }
+}
+
+/** 状态结果单元格：徽章 + 悬浮看服务端原话与 usable */
+function renderStatusCell(row: PoolRow) {
+  if (statusCheckingName.value === row.name) {
+    return h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '状态检测中…' })
+  }
+  const record = statusResults[row.name]
+  if (!record) return h('span', { class: 'muted' }, '未检测')
+  const view = STATUS_PRESENTATION[record.status] ?? { label: record.status, type: 'info' as const }
+  return h(NTooltip, { trigger: 'hover', style: 'max-width: 360px' }, {
+    trigger: () =>
+      h('div', { class: 'check-cell' }, [
+        h(NTag, { size: 'small', type: view.type, bordered: false }, { default: () => view.label }),
+        h('span', { class: 'check-time' }, formatTime(record.checkedAt))
+      ]),
+    default: () =>
+      h('div', { class: 'check-detail' }, [
+        h('div', {}, record.message || '（服务端没有给出说明）'),
+        record.usable
+          ? h('div', { class: 'check-detail-sub' }, '可留在池子里')
+          : h('div', { class: 'check-detail-sub' }, '不建议留在池子里（每轮签发都会失败）')
+      ])
+  })
+}
+
+/**
+ * 检测账号自身状态（与站点无关）。停用/封禁的账号即便登录成功也不该入池，
+ * 这类账号每轮签发都会失败，留着只是白占名额。
+ */
+async function handleStatusCheck(row: PoolRow) {
+  if (statusCheckingName.value) return
+  statusCheckingName.value = row.name
+  try {
+    const res = await checkGitHubAccountStatus(row.name)
+    statusResults[row.name] = {
+      status: res.result.status,
+      usable: res.result.usable,
+      message: res.result.message,
+      checkedAt: Date.now()
+    }
+    const view = STATUS_PRESENTATION[res.result.status]
+    const tip = `「${row.name}」状态：${view?.label ?? res.result.status}`
+    if (res.result.status === 'active') message.success(tip)
+    else if (res.result.status === 'suspended' || res.result.status === 'banned') {
+      message.error(`${tip} —— 不应留在池子里，考虑删除`)
+    } else message.warning(tip)
+  } catch (e) {
+    message.error(extractErrorMessage(e, `状态检测「${row.name}」失败`))
+  } finally {
+    statusCheckingName.value = ''
+  }
+}
+
+/** 批量建号：为池子里所有 GitHub 账号在目标站点建签到账号 */
+async function handleProvision() {
+  const url = provisionUrl.value.trim()
+  if (!url) {
+    message.warning('先填站点 URL，例如 https://a.example.com')
+    return
+  }
+  provisioning.value = true
+  provisionResults.value = null
+  try {
+    const res = await provisionSite(url)
+    provisionResults.value = res.results
+    if (res.created > 0) {
+      message.success(`成功建号 ${res.created} 个，其余 ${res.total - res.created} 个跳过/失败`)
+      await configStore.fetchConfig()
+    } else {
+      message.warning('没有建成新的账号（详见下方结果）')
+    }
+  } catch (e) {
+    message.error(extractErrorMessage(e, '批量建号失败'))
+  } finally {
+    provisioning.value = false
+  }
+}
+
+/** 批量建号结果的状态中文 */
+function provisionLabel(status: string) {
+  return (
+    {
+      created: '建成',
+      exists: '已存在（跳过）',
+      skipped_registration_closed: '站点关闭注册（跳过）',
+      skipped_no_credentials: '无 user_session（跳过）',
+      failed: '失败'
+    } as Record<string, string>
+  )[status] ?? status
+}
+
 
 /**
  * 三态的界面呈现。刻意给三种不同颜色 —— unknown 是「测不出来」而不是「失效」，
@@ -185,7 +339,7 @@ const columns: DataTableColumns<PoolRow> = [
   {
     title: 'OAuth Client ID',
     key: 'client_id',
-    width: 220,
+    width: 200,
     ellipsis: { tooltip: true },
     render: (row) =>
       row.client_id
@@ -193,9 +347,19 @@ const columns: DataTableColumns<PoolRow> = [
         : h('span', { class: 'muted' }, '自动探测')
   },
   {
+    title: '绑定出口',
+    key: 'proxy_addr',
+    width: 210,
+    ellipsis: { tooltip: true },
+    render: (row) =>
+      row.proxy_addr
+        ? h('span', { class: 'mono-inline', title: '服务端分配的固定出口，出站已脱敏' }, row.proxy_addr)
+        : h('span', { class: 'muted' }, '未绑定（走直连）')
+  },
+  {
     title: '被引用',
     key: 'referencedBy',
-    width: 190,
+    width: 170,
     render: (row) => {
       if (!row.referencedBy.length) {
         // 没被引用不只是「闲置」：检测拿不到站点上下文，服务端会直接 400
@@ -210,11 +374,12 @@ const columns: DataTableColumns<PoolRow> = [
       })
     }
   },
-  { title: '检测结果', key: 'check', width: 170, render: renderCheckCell },
+  { title: '账号状态', key: 'status', width: 150, render: renderStatusCell },
+  { title: '检测结果', key: 'check', width: 160, render: renderCheckCell },
   {
     title: '操作',
     key: 'actions',
-    width: 210,
+    width: 270,
     fixed: 'right',
     render: (row) =>
       h(NSpace, { size: 6, wrap: false }, {
@@ -225,12 +390,23 @@ const columns: DataTableColumns<PoolRow> = [
               size: 'tiny',
               secondary: true,
               type: 'info',
-              // 探测在服务端串行，多点几次只是排队等几十秒，直接按住不放行
               loading: checkingName.value === row.name,
               disabled: checkingName.value !== '' || !row.referencedBy.length,
               onClick: () => handleCheck(row)
             },
             { icon: () => h(NIcon, null, { default: () => h(PulseOutline) }), default: () => '检测' }
+          ),
+          h(
+            NButton,
+            {
+              size: 'tiny',
+              secondary: true,
+              type: 'warning',
+              loading: statusCheckingName.value === row.name,
+              disabled: statusCheckingName.value !== '',
+              onClick: () => handleStatusCheck(row)
+            },
+            { default: () => '状态' }
           ),
           h(
             NButton,
@@ -423,5 +599,34 @@ async function handleCheck(row: PoolRow) {
 
 .table-empty {
   padding: 40px 0;
+}
+
+.provision-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow: auto;
+  background: #fafbfc;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.provision-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.8;
+}
+
+.provision-account {
+  font-weight: 600;
+  color: #1f2d3d;
+}
+
+.provision-name {
+  color: #48566a;
 }
 </style>

@@ -63,6 +63,29 @@ export interface GitHubAccount {
   user_session: string
   /** 站点 OAuth 应用 ID，不是凭据，留空时由站点 /api/status 探测 */
   client_id: string
+  /** 客户端指纹 seed（决定 UA 等特征）。服务端状态：提交会被忽略，只读展示 */
+  fingerprint?: string
+  /** 绑定的固定出口。服务端状态：出站已脱敏（VLESS 的 uuid 打码），提交会被忽略 */
+  proxy_addr?: string
+}
+
+/** GitHub 账号自身状态探测的结果（POST /api/github-accounts/status）。 */
+export interface GitHubStatusResult {
+  /** active / suspended / banned / expired / unknown */
+  status: string
+  message: string
+  /** 是否值得留在池子里：只有 active 为 true */
+  usable: boolean
+}
+
+/** 批量建号的单账号结果（POST /api/sites/provision）。 */
+export interface ProvisionOutcome {
+  github_account: string
+  account_name?: string
+  /** created / exists / skipped_registration_closed / skipped_no_credentials / failed */
+  status: string
+  attempts: number
+  message?: string
 }
 
 export interface AIConfig {
