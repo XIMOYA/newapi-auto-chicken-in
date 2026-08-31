@@ -251,7 +251,7 @@ func TestIssueTabiAIRefreshCookieThreeSteps(t *testing.T) {
 
 	cookie, err := issueTabiAIRefreshCookie(context.Background(), HTTPConfig{Timeout: 5, Verify: true}, Account{
 		Name: "tabi", URL: site.URL, GithubUserSession: "gh-session",
-	}, authorize.URL, githubFingerprint{})
+	}, authorize.URL, githubFingerprint{}, "")
 	if err != nil {
 		t.Fatalf("签发失败: %v", err)
 	}
@@ -325,16 +325,18 @@ func proxyOf(t *testing.T, c *http.Client) *url.URL {
 	return u
 }
 
-// TestNewTabiAIOAuthClient_AlwaysDirect 签发客户端**永远直连**，不吃任何代理配置。
+// TestNewTabiAIOAuthClient_IgnoresAccountProxy 签发客户端只认显式传入的出口，
+// 一律忽略 account.Proxy。
 //
-// GitHub 的 OAuth 端点对机房 IP 有明显限流（403/429），而带着 user_session 从不断变化
-// 的地址出现是触发账号风控最快的方式 —— 最坏把 user_session 直接作废。平台在固定 IP
-// 上，在 GitHub 眼里是「常用设备」。所以这里连账号自带的固定代理也要绕开。
-func TestNewTabiAIOAuthClient_AlwaysDirect(t *testing.T) {
+// 为什么忽略：出口由 GitHub 账号的固定绑定决定，不是由站点账号决定 —— 同一条
+// user_session 必须始终从同一个 IP 出现，而 account.Proxy 表达的是「这个站点账号
+// 签到时走哪个出口」，两者诉求不同。带着 session 从不断变化的地址出现是触发
+// GitHub 账号风控最快的方式，最坏直接作废 session。
+func TestNewTabiAIOAuthClient_IgnoresAccountProxy(t *testing.T) {
 	httpCfg := HTTPConfig{Timeout: 5, Verify: true}
 
-	// 没配代理：直连（测试环境无 HTTP_PROXY，ProxyFromEnvironment 返回 nil）
-	c, err := newTabiAIOAuthClient(Account{URL: "https://a.com"}, httpCfg)
+	// 不传出口：直连（测试环境无 HTTP_PROXY，ProxyFromEnvironment 返回 nil）
+	c, err := newTabiAIOAuthClient(Account{URL: "https://a.com"}, httpCfg, "")
 	if err != nil {
 		t.Fatalf("构造失败: %v", err)
 	}
@@ -342,9 +344,9 @@ func TestNewTabiAIOAuthClient_AlwaysDirect(t *testing.T) {
 		t.Fatalf("应直连，实际走了 %v", u)
 	}
 
-	// 账号配了固定代理：签发仍然直连，account.Proxy 被刻意忽略
+	// 账号配了固定代理但没传出口：仍然直连，account.Proxy 被刻意忽略
 	own := "http://9.9.9.9:8080"
-	c, err = newTabiAIOAuthClient(Account{URL: "https://a.com", Proxy: &own}, httpCfg)
+	c, err = newTabiAIOAuthClient(Account{URL: "https://a.com", Proxy: &own}, httpCfg, "")
 	if err != nil {
 		t.Fatalf("构造失败: %v", err)
 	}
@@ -354,12 +356,23 @@ func TestNewTabiAIOAuthClient_AlwaysDirect(t *testing.T) {
 
 	// socks5 自带代理同样忽略（免得以为只挡 http 那种）
 	socks := "socks5://1.2.3.4:1080"
-	c, err = newTabiAIOAuthClient(Account{URL: "https://a.com", Proxy: &socks}, httpCfg)
+	c, err = newTabiAIOAuthClient(Account{URL: "https://a.com", Proxy: &socks}, httpCfg, "")
 	if err != nil {
 		t.Fatalf("构造失败: %v", err)
 	}
 	if u := proxyOf(t, c); u != nil {
 		t.Fatalf("socks5 自带代理也该被忽略，实际走了 %v", u)
+	}
+
+	// 显式传入的出口要真的生效，且盖过 account.Proxy
+	c, err = newTabiAIOAuthClient(Account{URL: "https://a.com", Proxy: &own}, httpCfg,
+		"http://7.7.7.7:3128")
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	u := proxyOf(t, c)
+	if u == nil || u.Host != "7.7.7.7:3128" {
+		t.Fatalf("应走显式传入的出口，实际 %v", u)
 	}
 }
 
@@ -380,7 +393,7 @@ func TestIssueRefreshCookieIgnoresAccountProxy(t *testing.T) {
 	_, _ = issueTabiAIRefreshCookie(context.Background(),
 		HTTPConfig{Timeout: 3, Verify: true},
 		Account{Name: "tabi", URL: "https://tabi.invalid", GithubUserSession: "gh", Proxy: &own},
-		"https://github.com/login/oauth/authorize", githubFingerprint{})
+		"https://github.com/login/oauth/authorize", githubFingerprint{}, "")
 	// 不关心签发成没成（站点是不可达的假域名），只确认那个代理压根没被用到
 	if proxied.Load() != 0 {
 		t.Fatalf("签发不该经过账号自带代理，实际经过了 %d 次", proxied.Load())

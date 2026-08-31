@@ -52,12 +52,12 @@ func poolReferencingAccount(cfg *Config, poolName string) (*Account, bool) {
 // 消耗站点侧的授权码配额，更不该无意中把一条新的 new_api_refresh 落到库里。
 // authorizeURL 供测试注入；生产传 GitHub 官方地址。
 func checkTabiAIGithubSession(ctx context.Context, httpCfg HTTPConfig, account Account,
-	authorizeURL string, fp githubFingerprint) githubCheckResult {
+	authorizeURL string, fp githubFingerprint, outbound string) githubCheckResult {
 	base, err := cookieTestBaseURL(account.URL)
 	if err != nil {
 		return githubCheckResult{Status: "unknown", Message: "站点 URL 无效: " + err.Error()}
 	}
-	client, err := newTabiAIOAuthClient(account, httpCfg)
+	client, err := newTabiAIOAuthClient(account, httpCfg, outbound)
 	if err != nil {
 		return githubCheckResult{Status: "unknown", Message: err.Error()}
 	}
@@ -125,8 +125,17 @@ func (s *Server) handleCheckGitHubAccount(w http.ResponseWriter, r *http.Request
 	githubCheckMu.Lock()
 	defer githubCheckMu.Unlock()
 
+	// 探测走这个账号绑定的固定出口：探测和签发必须从同一个 IP 出现，
+	// 否则探测「通了」不代表签发也能通
+	_, outbound := s.prepareGitHubOutbound(&cfg, pool.Name)
+
 	result := checkTabiAIGithubSession(r.Context(), cfg.HTTP, effective,
-		s.githubAuthorizeURLOrDefault(), effectiveGitHubFingerprint(&cfg, *ref))
+		s.githubAuthorizeURLOrDefault(), effectiveGitHubFingerprint(&cfg, *ref), outbound)
+	// 探测因链路问题失败时解绑：这个出口连不上 GitHub，留着下次还是失败。
+	// session 失效（expired）不解绑 —— 那是凭据的问题，换出口没用
+	if result.Status == githubStatusUnknown && outbound != "" {
+		s.releaseAndPersistGitHubOutbound(&cfg, pool.Name, "探测时链路不通: "+result.Message)
+	}
 	log.Printf("[github-accounts] 探测 %q（站点 %s）: %s",
 		pool.Name, ref.URL, result.Status)
 	writeJSON(w, http.StatusOK, map[string]any{

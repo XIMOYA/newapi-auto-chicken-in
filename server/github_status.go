@@ -144,12 +144,12 @@ probeGitHubAccountStatus 带 user_session 请求 GitHub 判定账号状态。
 profileURL 供测试注入；生产传 githubProfileURL。
 */
 func probeGitHubAccountStatus(ctx context.Context, httpCfg HTTPConfig, session string,
-	fp githubFingerprint, profileURL string) githubStatusResult {
+	fp githubFingerprint, profileURL, outbound string) githubStatusResult {
 	if strings.TrimSpace(session) == "" {
 		return githubStatusResult{Status: githubStatusUnknown, Message: "没有 user_session，无法探测"}
 	}
-	// 与签发链路同一套客户端构造：强制直连、不跟随重定向
-	client, err := newTabiAIOAuthClient(Account{URL: profileURL}, httpCfg)
+	// 与签发链路同一套客户端构造：不跟随重定向，出口用账号绑定的那个
+	client, err := newTabiAIOAuthClient(Account{URL: profileURL}, httpCfg, outbound)
 	if err != nil {
 		return githubStatusResult{Status: githubStatusUnknown, Message: err.Error()}
 	}
@@ -219,12 +219,19 @@ func (s *Server) handleCheckGitHubStatus(w http.ResponseWriter, r *http.Request)
 		fp = deriveGitHubFingerprint(pool.Fingerprint)
 	}
 
+	// 状态探测也走账号绑定的固定出口：GitHub 会话必须始终从同一个 IP 出现，
+	// 换个出口去问「这账号还好吗」本身就可能触发风控
+	outbound := ""
+	if name != "" {
+		_, outbound = s.prepareGitHubOutbound(&cfg, name)
+	}
+
 	// 与站点探测共用同一把锁：两者都在打 GitHub，并发只会更快撞限流
 	githubCheckMu.Lock()
 	defer githubCheckMu.Unlock()
 
 	result := probeGitHubAccountStatus(r.Context(), cfg.HTTP, session, fp,
-		s.githubProfileURLOrDefault())
+		s.githubProfileURLOrDefault(), outbound)
 	log.Printf("[github-accounts] 状态探测 %q → %s", name, result.Status)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "name": name, "result": result,

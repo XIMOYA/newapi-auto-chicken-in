@@ -167,9 +167,18 @@ func (s *Server) handleIssueTabiAICookie(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// 出口取这个 GitHub 账号绑定的那个：同一条 session 必须始终从同一个 IP 出现
+	_, outbound := s.prepareGitHubOutbound(&cfg, target.GitHubAccount)
+
 	cookie, err := issueTabiAIRefreshCookie(r.Context(), cfg.HTTP, effective,
-		s.githubAuthorizeURLOrDefault(), effectiveGitHubFingerprint(&cfg, *target))
+		s.githubAuthorizeURLOrDefault(), effectiveGitHubFingerprint(&cfg, *target), outbound)
 	if err != nil {
+		// 链路类失败才解绑：凭据失效换出口没用，而这个出口连不上 GitHub 的话
+		// 留着下次还是失败。判据是错误信息里的网络/限流特征
+		if outbound != "" && isOutboundFailure(err.Error()) {
+			s.releaseAndPersistGitHubOutbound(&cfg, target.GitHubAccount,
+				"签发时链路不通: "+err.Error())
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -283,12 +292,12 @@ func fetchGithubAuthorizeCode(ctx context.Context, client *http.Client, base str
 //
 // 客户端（Actions）签到时的凭据轮转与签到本身照旧走代理，那与这里无关。
 func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account Account,
-	authorizeURL string, fp githubFingerprint) (string, error) {
+	authorizeURL string, fp githubFingerprint, outbound string) (string, error) {
 	base, err := cookieTestBaseURL(account.URL)
 	if err != nil {
 		return "", fmt.Errorf("站点 URL 无效: %w", err)
 	}
-	client, err := newTabiAIOAuthClient(account, httpCfg)
+	client, err := newTabiAIOAuthClient(account, httpCfg, outbound)
 	if err != nil {
 		return "", err
 	}
@@ -342,13 +351,19 @@ func issueTabiAIRefreshCookie(ctx context.Context, httpCfg HTTPConfig, account A
 // newTabiAIOAuthClient 带 cookiejar 的客户端：三步 OAuth 的 state 与站点会话绑定，必须同一 session。
 // 统一不跟随重定向 —— 第 2 步要读 Location 取 code，第 3 步只关心 Set-Cookie。
 //
-// **强制直连**：把 account.Proxy 清空后再交给 newCookieTestHTTPClient，所以即使账号配了
-// 固定代理，签发也走平台自己的出口（理由见 issueTabiAIRefreshCookie）。Cookie 检测那边
-// 仍照旧用账号代理 —— 那是在验「凭据在这个出口下能不能用」，和签发的诉求正好相反。
-func newTabiAIOAuthClient(account Account, httpCfg HTTPConfig) (*http.Client, error) {
-	direct := account
-	direct.Proxy = nil
-	client, err := newCookieTestHTTPClient(direct, httpCfg, false, "")
+// outbound 是这次要走的出口（空串=直连）。**账号自带的 account.Proxy 一律忽略**：
+// 出口由 GitHub 账号的固定绑定决定，不是由站点账号决定 —— 同一个 GitHub 会话必须
+// 始终从同一个 IP 出现，而 account.Proxy 是「这个站点账号签到时用哪个出口」，
+// 两者诉求不同。Cookie 检测那边仍照旧用账号代理，那是在验「凭据在这个出口下能不能用」。
+func newTabiAIOAuthClient(account Account, httpCfg HTTPConfig,
+	outbound string) (*http.Client, error) {
+	bound := account
+	if trimmed := strings.TrimSpace(outbound); trimmed != "" {
+		bound.Proxy = &trimmed
+	} else {
+		bound.Proxy = nil
+	}
+	client, err := newCookieTestHTTPClient(bound, httpCfg, false, "")
 	if err != nil {
 		return nil, fmt.Errorf("HTTP 客户端配置失败: %w", err)
 	}

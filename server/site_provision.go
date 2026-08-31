@@ -213,8 +213,11 @@ func (s *Server) handleProvisionSite(w http.ResponseWriter, r *http.Request) {
 		existing[a.Name] = true
 	}
 	issue := func(ctx context.Context, account Account, fp githubFingerprint) (string, error) {
+		// 每个账号走它自己绑定的固定出口。批量建号是「一个 GitHub 会话连续对多个
+		// 站点授权」，出口必须始终一致，否则等于告诉 GitHub 这个会话在到处跑
+		_, outbound := s.prepareGitHubOutbound(&cfg, account.GitHubAccount)
 		return issueTabiAIRefreshCookie(ctx, cfg.HTTP, account,
-			s.githubAuthorizeURLOrDefault(), fp)
+			s.githubAuthorizeURLOrDefault(), fp, outbound)
 	}
 
 	results := make([]provisionOutcome, 0, len(targets))

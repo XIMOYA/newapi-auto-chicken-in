@@ -116,7 +116,7 @@ func TestIssueUsesPoolSessionAndClientID(t *testing.T) {
 	fp := effectiveGitHubFingerprint(cfg, account)
 	cookie, err := issueTabiAIRefreshCookie(context.Background(),
 		HTTPConfig{Timeout: 5, Verify: true},
-		effectiveGitHubCredentials(cfg, account), authorize.URL, fp)
+		effectiveGitHubCredentials(cfg, account), authorize.URL, fp, "")
 	if err != nil {
 		t.Fatalf("用池子凭据签发失败: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestCheckTabiAIGithubSessionThreeStates(t *testing.T) {
 		})
 		account := baseAccount
 		account.URL = site
-		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{})
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{}, "")
 		if res.Status != "ok" {
 			t.Fatalf("状态 = %s, want ok（message: %s）", res.Status, res.Message)
 		}
@@ -290,7 +290,7 @@ func TestCheckTabiAIGithubSessionThreeStates(t *testing.T) {
 		})
 		account := baseAccount
 		account.URL = site
-		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{})
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{}, "")
 		if res.Status != "expired" {
 			t.Fatalf("状态 = %s, want expired（message: %s）", res.Status, res.Message)
 		}
@@ -305,7 +305,7 @@ func TestCheckTabiAIGithubSessionThreeStates(t *testing.T) {
 		})
 		account := baseAccount
 		account.URL = site
-		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{})
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{}, "")
 		if res.Status != "unknown" {
 			t.Fatalf("状态 = %s, want unknown（message: %s）", res.Status, res.Message)
 		}
@@ -321,7 +321,7 @@ func TestCheckTabiAIGithubSessionThreeStates(t *testing.T) {
 		defer broken.Close()
 		account := baseAccount
 		account.URL = broken.URL
-		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{})
+		res := checkTabiAIGithubSession(context.Background(), httpCfg, account, auth, githubFingerprint{}, "")
 		if res.Status != "unknown" {
 			t.Fatalf("状态 = %s, want unknown（message: %s）", res.Status, res.Message)
 		}
