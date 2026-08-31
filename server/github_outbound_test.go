@@ -175,3 +175,41 @@ func TestReleaseGitHubOutboundClearsBinding(t *testing.T) {
 		t.Error("未知账号应返回 false")
 	}
 }
+
+func TestMergeBoundOutboundsPutsBoundFirst(t *testing.T) {
+	fresh := []proxyCandidate{{addr: "1.1.1.1:80", source: "s1"}, {addr: nodeB, source: "s2"}}
+	merged := mergeBoundOutbounds(fresh, []string{nodeA, nodeC, nodeB})
+	if len(merged) != 4 {
+		t.Fatalf("应合并出 4 条（nodeB 已在 fresh 里去重），实际 %d: %+v", len(merged), merged)
+	}
+	if merged[0].addr != nodeA || merged[1].addr != nodeC {
+		t.Fatalf("绑定的出口应排最前，实际 %+v", merged)
+	}
+	if merged[0].source != "github-binding" {
+		t.Errorf("绑定的出口应标记来源 github-binding，实际 %q", merged[0].source)
+	}
+	if merged[2].addr != "1.1.1.1:80" {
+		t.Errorf("fresh 顺序应保持，实际 %+v", merged)
+	}
+	// 空绑定原样返回
+	if out := mergeBoundOutbounds(fresh, nil); len(out) != len(fresh) {
+		t.Errorf("空绑定不该改动候选")
+	}
+}
+
+func TestBoundOutboundsDedupAndReadsConfig(t *testing.T) {
+	srv := newTestServer(t)
+	seedPool(t, srv, []GitHubAccount{
+		{Name: "A", ProxyAddr: nodeA},
+		{Name: "B", ProxyAddr: nodeA}, // 两个账号绑同一出口：去重
+		{Name: "C", ProxyAddr: nodeC},
+		{Name: "D"}, // 没绑
+	}, nil)
+	got, err := srv.proxies.boundOutbounds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != nodeA || got[1] != nodeC {
+		t.Fatalf("boundOutbounds = %v", got)
+	}
+}

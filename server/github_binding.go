@@ -20,6 +20,62 @@ import (
 )
 
 /*
+boundOutbounds 读出当前被 GitHub 账号绑定的全部出口地址（去重、保序）。
+
+刷新代理池时要拿它把绑定的出口并进候选，否则「粘住一个出口」根本立不住：
+判定出口可用的依据是它在不在可用清单里，而清单来自每轮刷新的测通结果 ——
+不复测就永远回不了清单，绑定于是只能活一轮。
+*/
+func (m *ProxyManager) boundOutbounds() ([]string, error) {
+	cfg, _, err := LoadConfig(m.db)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(cfg.GitHubAccounts))
+	out := make([]string, 0, len(cfg.GitHubAccounts))
+	for _, g := range cfg.GitHubAccounts {
+		addr := strings.TrimSpace(g.ProxyAddr)
+		if addr == "" || seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		out = append(out, addr)
+	}
+	return out, nil
+}
+
+/*
+mergeBoundOutbounds 把绑定的出口并进候选清单，排在最前面。
+
+与 mergeExistingCandidates 的区别：那个只捞**存活**的老代理，这个连上一轮判死的
+也要捞回来 —— 判死可能只是那一轮网络抖了一下，而代价不对称：漏捞会让一个
+GitHub 账号无谓地换出口（换 IP 是风控信号），多测一条只是多花一次测活配额。
+
+排在最前面是因为测通可能「达标提前停」，绑定的出口必须优先拿到测活机会。
+*/
+func mergeBoundOutbounds(fresh []proxyCandidate, bound []string) []proxyCandidate {
+	if len(bound) == 0 {
+		return fresh
+	}
+	seen := make(map[string]bool, len(fresh))
+	for _, c := range fresh {
+		seen[c.addr] = true
+	}
+	head := make([]proxyCandidate, 0, len(bound))
+	for _, addr := range bound {
+		if addr == "" || seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		head = append(head, proxyCandidate{addr, "github-binding"})
+	}
+	if len(head) == 0 {
+		return fresh
+	}
+	return append(head, fresh...)
+}
+
+/*
 persistGitHubOutbound 把绑定变更落库（定点写，不整份覆盖）。
 
 与 updateAccountCookie 共用 configWriteMu：定点写和整份写必须互斥，否则整份写的

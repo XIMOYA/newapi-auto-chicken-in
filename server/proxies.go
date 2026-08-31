@@ -549,6 +549,21 @@ func (m *ProxyManager) RefreshProxies(cfg ProxyPool, saveLimit int) (aliveCount 
 		log.Printf("[proxy] 读取现存代理失败，本轮只测新抓的候选: %v", eerr)
 	}
 
+	// 2.6) 被 GitHub 账号绑定的出口一律并入候选，哪怕它上一轮已经判死。
+	//
+	// 绑定的语义是「粘住这个出口直到它真的不可用」，而判定「不可用」的依据是
+	// AvailableAddrs 里还有没有它。刷新时不把它捞回来复测，它就会因为不在候选里
+	// 而永远回不到可用清单 —— 于是每个绑定都只能活一轮，粘住也就无从谈起。
+	if bound, berr := m.boundOutbounds(); berr != nil {
+		log.Printf("[proxy] 读取 GitHub 账号绑定的出口失败，本轮不额外复测: %v", berr)
+	} else if len(bound) > 0 {
+		before := len(all)
+		all = mergeBoundOutbounds(all, bound)
+		if added := len(all) - before; added > 0 {
+			log.Printf("[proxy] 把 %d 条被 GitHub 账号绑定的出口并入候选复测", added)
+		}
+	}
+
 	// 3) 并发测通（saveLimit > 0 时达标提前停；不限制时测完全部候选）
 	workers := cfg.MaxWorkers
 	if workers <= 0 {
