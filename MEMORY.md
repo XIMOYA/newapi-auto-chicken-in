@@ -74,21 +74,39 @@ tokenRoute.POST("/:id/key", controller.GetTokenKey)
 3. 再列一次，拿到该条的 `id`
 4. `POST /api/token/{id}/key` → `{"success":true,"data":{"key":"<完整值>"}}`
 
-### KIQ 已确认的三条决策
+### KIQ 已确认的决策（全部拍定，可直接实现）
 1. **落库存 `sk-<key>`**（能直接粘去用的形态，带不带前缀站点都认）。
 2. **不需要配额与模型限制**：`remain_quota`/`model_limits` 都不设，走站点默认。
-   → 即请求体只带 `name`（加 `expired_time: -1` 永不过期），其余交给站点默认值。
-3. **要「整合所有 key 出来」**：不是只取一条，而是把每个账号的 key 汇总成一份可直接使用的清单。
-   ⚠️ 这条的具体产出形态**还需要在实现时定**：落库到 `accounts[].api_key` 字段？还是额外出一个汇总端点/导出文件？倾向：先落库到账号条目（每个账号一条 key），再提供一个只读汇总端点。
+   → 请求体只带 `name` + `expired_time: -1`（永不过期），其余交给站点默认值。
+3. **走 B 方案**（KIQ 明确回答「B」）：每个签到账号在自己站点上建**一条** key，没有才建，
+   最后把所有账号的 key 汇总成一份清单。**不是**遍历站点上已有的所有 token 逐条取值。
+4. token 名字用固定值 `newapi-auto-checkin` —— 这就是「没有才创建」的判据。
+5. 汇总端点做两个：`GET /api/sites/apikeys` 双认证但 key 打码（看哪些账号有/缺），
+   `GET /api/sites/apikeys/raw` 只认 API Key 给全值。与 `/api/config/raw`、
+   `/api/accounts/{name}/raw` 同一套惯例：含明文凭据的一律只认 API Key。
 
 ### 兼容旧站点的做法（已定）
 老版本 new-api 列表接口直接吐完整 key。做成「列表里的 key 含 `*` 就判为打码、走第 4 步；不含就直接用」，新旧站点都不用配。
 
-### 实现落点（尚未开写）
+### 实现落点（设计已定，正在开写）
 - 新文件 `server/site_apikey.go` + `server/site_apikey_test.go`
-- 参照 `server/site_provision.go` 的形状：`provisionIssuer` 那种函数类型注入假实现，端点级测试不真连网络
+- `Account` 加字段 `APIKey string \`json:"api_key"\``
+- **`MaskConfig` 必须打码它、`UnmaskConfig` 按账号名还原** —— 跟 `Cookie` 完全同一套口径。
+  漏了就是明文下发前端，这个坑踩过一次（`606d56e` 修的就是池子 session 漏打码）。
+- 核心函数 `ensureAccountAPIKey`，四步链路见上。HTTP 调用注入函数类型以便离线测试
+  （照 `site_provision.go` 的 `provisionIssuer` 做法）
 - 响应信封解析复用 `cookieTestJSONMap` / `cookieTestMessage`（`server/cookie_checker.go`）
-- **`MaskConfig` 必须加上 API Key 打码**（`server/config.go`，凭据不打码就明文下发前端，这个坑踩过一次）；`UnmaskConfig` 对应还原
+- 请求头复用 `setCookieTestCommonHeaders` / `setCookieTestUserID`；客户端用
+  `newCookieTestHTTPClient`（代理优先级：账号自带 > 池子 > 环境变量）
+- 鉴权两条路：cookie 含 `new_api_refresh=` 时先 `POST /api/user/auth/refresh` 换 session
+  （复用 `parseCookieTestRefreshBundle`），否则直接带 cookie
+- ⚠️ **refresh 会消耗一代 secret**：轮转出的新 cookie 必须落库，否则下轮保活拿旧代去用
+  就是 `AUTH_SESSION_REVOKED`、整条会话报废。沿用 `checkTabiAICookie` 的处置
+  （`extractTabiAIRefreshCookie` + 代次抢救必须先于任何 return）
+- 批量端点 `POST /api/sites/apikeys`，body `{"only": [...]}`。**串行**执行：
+  `POST /:id/key` 挂着 `CriticalRateLimit()`，并发会撞限流。开头过 `guardRunningCheckin`
+- 落库沿用 `saveProvisionedAccounts` 的模式：**持锁重读最新配置再改**，
+  不能拿开头那份直接写回（中间几分钟保活可能已轮转过别的账号凭据）
 
 ---
 
