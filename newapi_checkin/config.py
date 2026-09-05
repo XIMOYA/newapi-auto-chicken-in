@@ -257,6 +257,122 @@ class ConfigSyncConfig:
 
 
 @dataclass
+class GitHubProvisionAccount:
+    """一个待入池的 GitHub 账号：登录凭据 + 收件箱定位用的名字。"""
+
+    username: str
+    password: str
+    # ReMail 订单里 deliveryEmail 的 @ 前缀。留空按 username 去找 ——
+    # Remail.find_email 做的是「前缀与目标名全等」的严格匹配（remail.py:pick_usable_order），
+    # 邮箱前缀和 GitHub 用户名不一致的账号（改过名、前缀带后缀）必须在这里显式写出来，
+    # 否则一定落空、链路停在「找不到收件箱」，而日志上只看得到「没命中」这一句
+    email_name: str = ""
+    # 站点 OAuth 应用 ID，写回池子时原样带上。留空由站点 /api/status 探测
+    # （契约见 docs/github-accounts-api.md §2.1，不是凭据、明文下发）
+    client_id: str = ""
+
+    @property
+    def mailbox_name(self) -> str:
+        return (self.email_name or "").strip() or (self.username or "").strip()
+
+
+@dataclass
+class GitHubProvisionConfig:
+    """GitHub 账号自动填入编排：ReMail 取码 → 浏览器登录 → 状态过滤 → 写回池子。
+
+    remail_base_url 与 remail_api_keys 没有默认值也不给猜测值：收件服务的地址是部署方
+    自己的，猜一个填进去只会让整条链路在「取不到验证码」上打转。enabled 打开但没配全时
+    build_config 直接报错，比跑到一半才失败便宜得多。
+
+    平台端点不在这里配：写回走 config_sync.url 同源推导（与 remote_sync 的签发、
+    读回核实同一套惯例），多一份地址配置就多一处能配歪的地方。
+    """
+
+    enabled: bool = False
+    remail_base_url: str = ""
+    remail_api_keys: list = field(default_factory=list)
+    # 取件轮询次数与兜底间隔，直接喂给 Remail.poll_for_code。服务端给了
+    # nextFetchAllowedAt 时以它为准，这里只是没给时的节奏
+    remail_max_tries: int = 10
+    remail_poll_seconds: int = 8
+    # 一个账号从提交登录到拿到 user_session 的总时间盒。设备验证码要等邮件，
+    # 给太短会把马上就能成的登录判死
+    login_timeout: int = 180
+    # 本地判不出账号状态时，是否再问一次平台的 /api/github-accounts/status。
+    # 默认关：平台会带着这条刚登录出来的 session 从**另一个 IP** 去访问 GitHub，
+    # 而会话换 IP 是风控高权重信号。要开请确认这个代价可以接受
+    platform_status_recheck: bool = False
+    accounts: list = field(default_factory=list)
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "GitHubProvisionConfig":
+        raw = raw if isinstance(raw, dict) else {}
+        keys = [
+            str(item).strip()
+            for item in (raw.get("remail_api_keys") or [])
+            if str(item).strip()
+        ]
+        accounts = []
+        for item in raw.get("accounts") or []:
+            if not isinstance(item, dict):
+                continue
+            username = str(item.get("username") or "").strip()
+            if not username:
+                continue  # 没名字的条目无法定位收件箱也无法入池，直接丢
+            accounts.append(GitHubProvisionAccount(
+                username=username,
+                password=str(item.get("password") or ""),
+                email_name=str(item.get("email_name") or "").strip(),
+                client_id=str(item.get("client_id") or "").strip(),
+            ))
+        return cls(
+            enabled=_as_bool(raw.get("enabled"), False),
+            remail_base_url=str(raw.get("remail_base_url") or "").strip(),
+            remail_api_keys=keys,
+            remail_max_tries=max(1, _as_int(raw.get("remail_max_tries"), 10)),
+            remail_poll_seconds=max(1, _as_int(raw.get("remail_poll_seconds"), 8)),
+            login_timeout=max(30, _as_int(raw.get("login_timeout"), 180)),
+            platform_status_recheck=_as_bool(raw.get("platform_status_recheck"), False),
+            accounts=accounts,
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "remail_base_url": self.remail_base_url,
+            "remail_api_keys": list(self.remail_api_keys),
+            "remail_max_tries": self.remail_max_tries,
+            "remail_poll_seconds": self.remail_poll_seconds,
+            "login_timeout": self.login_timeout,
+            "platform_status_recheck": self.platform_status_recheck,
+            "accounts": [
+                {"username": a.username, "password": a.password,
+                 "email_name": a.email_name, "client_id": a.client_id}
+                for a in self.accounts
+            ],
+        }
+
+    def select(self, names: Optional[list] = None) -> list:
+        """按名字过滤待处理账号；不传就是全部。
+
+        找不到的名字直接报错而不是静默跳过：手动指定了名字却什么都没做，
+        比报错更难发现（尤其在 CI 日志里）。
+        """
+        if not names:
+            return list(self.accounts)
+        wanted = {str(n).strip() for n in names if str(n).strip()}
+        picked = [a for a in self.accounts if a.username in wanted]
+        missing = wanted - {a.username for a in picked}
+        if missing:
+            available = ", ".join(a.username for a in self.accounts) or "<空>"
+            raise ConfigError(
+                f"github_provision.accounts 里找不到: {', '.join(sorted(missing))}；"
+                f"可用: {available}"
+            )
+        return picked
+
+
+@dataclass
 class Account:
     name: str
     url: str
@@ -377,6 +493,7 @@ class Config:
     config_sync: ConfigSyncConfig = field(default_factory=ConfigSyncConfig)
     proxy_pool: ProxyPoolConfig = field(default_factory=ProxyPoolConfig)
     tabiai: TabiAIConfig = field(default_factory=TabiAIConfig)
+    github_provision: GitHubProvisionConfig = field(default_factory=GitHubProvisionConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     accounts: list = field(default_factory=list)
     source: Optional[Path] = None
@@ -634,6 +751,7 @@ def build_config(raw: dict, source: Optional[Path] = None) -> Config:
     config_sync = ConfigSyncConfig.from_raw(raw.get("config_sync"))
     proxy_pool = ProxyPoolConfig.from_raw(raw.get("proxy_pool"))
     tabiai = TabiAIConfig.from_raw(raw.get("tabiai"))
+    github_provision = GitHubProvisionConfig.from_raw(raw.get("github_provision"))
     notify = NotifyConfig.from_raw(raw.get("notify"))
 
     accounts = _build_accounts(raw.get("accounts"), problems)
@@ -644,11 +762,22 @@ def build_config(raw: dict, source: Optional[Path] = None) -> Config:
         ai=ai, browser=browser, http=http,
         security=security, config_sync=config_sync, proxy_pool=proxy_pool,
         tabiai=tabiai, notify=notify, accounts=accounts, source=source,
+        github_provision=github_provision,
     )
     _apply_env(cfg)
 
     if cfg.ai.enabled and not cfg.ai.ready:
         problems.append("ai.enabled 为 true 但 base_url / api_key / model 不完整")
+
+    # 打开了自动填入却没配收件服务：现在报错，而不是等跑到设备验证码那步才发现 ——
+    # 那时 GitHub 已经收到一次登录尝试、邮件也已经发出去了
+    if cfg.github_provision.enabled:
+        if not cfg.github_provision.remail_base_url:
+            problems.append("github_provision.enabled 为 true 但 remail_base_url 为空")
+        if not cfg.github_provision.remail_api_keys:
+            problems.append("github_provision.enabled 为 true 但 remail_api_keys 为空")
+        if not cfg.github_provision.accounts:
+            problems.append("github_provision.enabled 为 true 但 accounts 为空")
 
     if problems:
         raise ConfigError("配置有问题:\n  - " + "\n  - ".join(problems))

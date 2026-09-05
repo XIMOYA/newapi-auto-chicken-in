@@ -112,8 +112,7 @@ tokenRoute.POST("/:id/key", controller.GetTokenKey)
 
 ## 三、未开始
 
-1. **Python: GitHub 账号自动填入编排**（ReMail → 浏览器登录 → 状态过滤 → 写回池子）
-   地基已就绪：`bba6290` ReMail 多 key 客户端、`407a491` 浏览器 GitHub 登录判定、`215dbda` 账号自身状态探测。信息齐全，可直接做。
+1. ~~**Python: GitHub 账号自动填入编排**~~ → 已完成，见 §五（改动在工作树里，未提交）
 2. **重建 linux-amd64 单文件二进制并提交**（前端有改动时必做，参照 `aa41b2f`/`b54fece` 的做法）
 3. 最后汇总报告需要 KIQ 确认的点
 
@@ -129,3 +128,69 @@ tokenRoute.POST("/:id/key", controller.GetTokenKey)
 - 提交信息写「为什么」，把踩过的坑和变异测试结论写进去。
 - 称呼用户为 **KIQ**。
 - 子代理默认跟随主代理的模型与思考强度。
+
+---
+
+## 五、GitHub 账号自动填入编排（本轮完成，**改动在工作树里，未提交**）
+
+新增 `newapi_checkin/github_provision.py` + `tests/test_github_provision.py`（86 例），
+`config.py` 加 `github_provision` 配置节，`remote_sync._LOCAL_CONTROLLED_KEYS` 加同名键，
+`config.example.json` 补样例。Python 全量 **1229 passed**。
+
+### 查证到的实证（不是约定）
+
+- **写回只能走 `POST /api/github-accounts/ops`**。Python 侧 `Config` 压根没有
+  `github_accounts` 这一节 —— 池子只存在平台库里，客户端是读取方。端点按
+  `config_sync.url` 同源推导，与 `remote_sync._issue_endpoint` 同一套惯例。
+  字段名以 `server/github_account_ops.go` 的 `GitHubAccountOp` 为准；
+  `fingerprint`/`proxy_addr` 是服务端状态，不提交。
+- **验收只认响应体 `ok`**，不认 HTTP 状态码（网关会代答 200），并且 `skipped` 非空也判负。
+- 平台状态复核用 `{"user_session": ...}` 而不是 `{"name": ...}`：账号还没入池，按 name 查会 404。
+- Python 侧**没有**账号状态探测实现（`215dbda` 只做了 Go 侧），所以本地判定自己写：
+  浏览器 goto `settings/profile` → `classify_profile_page`，分支顺序照抄 Go 的
+  `classifyGitHubProfileResponse`，特征词表复用 `github_login.classify_account_page`。
+
+### 三条最容易改坏的约定
+
+1. **状态不是 active 就绝不写回**。被停用/封禁的账号照样能登录、照样下发 user_session，
+   入池后每轮签发都失败。判不出（unknown）同样不入池 —— 丢一个待入池账号只浪费一次登录，
+   放进一个坏账号是每轮都要付的账。
+2. **取验证码的 since 必须在提交登录之前取**，第二次取码要换新的 since。
+   取晚了会把「提交后一秒送达的那封」判成旧邮件、死等一封不会来的新邮件；
+   不换 since 就会一直填同一个错码。
+3. **填完设备验证码后时间盒重新起算**。取码本身可能烧掉几十秒，不重置会把刚填上码、
+   马上就要成功的登录判死。
+
+### 变异测试记录（22 个变异点，全部确认变红后还原）
+
+判定顺序错乱→2 红；不认「打回登录页」→2 红；去掉正文长度闸→1 红；只信 HTTP 状态码→1 红；
+无视 skipped→1 红；空 session 也发请求→1 红；不校验 usable→1 红；since 取在提交后→1 红；
+第二次不换 since→1 红；不重置时间盒→1 红；放宽取码次数→1 红；去掉状态过滤→7 红；
+无视复核开关→1 红；code_provider 忘了取 `[0]`→1 红；没收件箱也去登录→1 红；
+写回失败当成功→1 红；明文凭据进结果→1 红；登录失败报成功→4 红；不看 config_sync 开关→1 红；
+无视 only→1 红；本地控制名单去掉本节→1 红；去掉 build_config 前置校验→1 红；
+不同源推导→2 红；profile 目录不按账号分→2 红；goto 不吞超时→1 红；不拦空用户名→1 红。
+
+**抓到两个假绿，都值得记住**：
+- 「空正文不能判 active」那条：原用例用的是 `""`/`<html></html>`，去掉长度闸后照样绿
+  （正文里也没有登录态特征词）。补了一条 `<html class="logged-in">` —— GitHub 的 html
+  标签本来就带这个 class，**半加载的页面是真会走到这里的**。
+- 前置校验的用例原来用正常假驱动，去掉校验后测试掉进真实登录循环干等超时，
+  表现为「卡住」而不是「红」。换成爆炸工厂（起浏览器即断言失败）才能快速变红。
+
+### 待 KIQ 确认（都没有实证，我按最保守的做法留了配置项）
+
+1. **收件箱前缀 == GitHub 用户名？** `Remail.find_email` 做的是「deliveryEmail 的 @ 前缀
+   与目标名全等」的严格匹配。两者不一致时必须配 `accounts[].email_name`，否则一定落空。
+2. **出口**：`provision_accounts(proxy=...)` 默认直连，没接代理池。平台侧才是持有
+   「账号→出口绑定」的一方（`github_binding.go`），客户端自己挑出口会跟平台的绑定打架。
+   顺带一个固有缝隙：本机登录用的出口与平台后续签发用的绑定出口**必然不同**，
+   平台第一次用这条 session 时就换了 IP。
+3. **平台状态复核默认关**（`platform_status_recheck: false`）：开了会让这条刚登录出来的
+   session 立刻从平台的 IP 再出现一次，会话换 IP 是风控高权重信号。
+4. **没做「已在池子里就跳过」**：`GET /api/config` 下发的 `user_session` 是打码的 `"***"`，
+   判不出库里那条还有效没有，所以只能按 name 判，那又会拦住「想刷新失效凭据」的重跑。
+   目前每次跑都会 upsert 覆盖（平台语义天然幂等）。
+5. **没挂 CLI 入口**：`main.py` 是 flag 风格，加 `--github-provision` 属于改主入口，
+   等你点头再动。现在只能 `from newapi_checkin.github_provision import provision_accounts` 调用。
+6. **浏览器端到端没跑过**：需要真实 GitHub 账号 + ReMail key + 出口，与 `407a491` 同一状态。

@@ -80,6 +80,23 @@
     "token_interval_minutes": 21,
     "keep_page": false
   },
+  "github_provision": {
+    "enabled": false,
+    "remail_base_url": "https://你的收件服务.example.com",
+    "remail_api_keys": [],
+    "remail_max_tries": 10,
+    "remail_poll_seconds": 8,
+    "login_timeout": 180,
+    "platform_status_recheck": false,
+    "accounts": [
+      {
+        "username": "GitHub 用户名（同时是写回池子时的账号名）",
+        "password": "GitHub 密码",
+        "email_name": "",
+        "client_id": ""
+      }
+    ]
+  },
   "sites": [
     {
       "name": "GoRouter",

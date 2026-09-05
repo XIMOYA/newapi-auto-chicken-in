@@ -35,7 +35,11 @@ class RemoteSyncError(ValueError):
 
 # 远端永远不能覆盖的本地模块：同步设置和密钥必须由本地控制，
 # 否则覆盖后可能再也无法同步/解密。
-_LOCAL_CONTROLLED_KEYS = frozenset({"security", "config_sync", "tabiai"})
+# github_provision 同理但理由不同：GitHub 登录密码是这台机器上的本地物料，平台的
+# Config 结构体压根没有这一节（server/config.go），下发的 payload 里也就永远不会有它。
+# 万一平台哪天加了个同名字段，覆盖过来就是把本地密码清空，而链路会静默停在
+# 「没配 password」——放进这个名单等于把「这一节归本地」写成看得见的约定。
+_LOCAL_CONTROLLED_KEYS = frozenset({"security", "config_sync", "tabiai", "github_provision"})
 # 参与合并的业务模块（缺失告警用）。
 # tabiai 不在其中：cdp_url 指向本机 Chrome 的调试端口，属于机器级设置，
 # 远端平台不可能知道每台机器的端口，下发覆盖只会把能用的配置改坏。
