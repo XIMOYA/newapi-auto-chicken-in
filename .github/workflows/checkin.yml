@@ -66,6 +66,13 @@ on:
 permissions:
   contents: read
 
+# xray 版本固定，不用 latest：latest 会在某天静默换掉二进制，出问题时无从对比。
+# 升级就改这里一个值，缓存 key 带着它，改完自动重新下载。
+# 资产名与下载地址已核对过官方 release 接口（XTLS/Xray-core 的 assets 列表）。
+env:
+  XRAY_VERSION: v26.3.27
+  XRAY_ASSET: Xray-linux-64.zip
+
 # 同一时间只允许一个签到任务在跑，防止并发触发互相干扰。
 # 这是 workflow 级的：同一次运行内部的分片 job 属于同一个 group，不会互相排队。
 concurrency:
@@ -177,6 +184,20 @@ jobs:
           grep -vE '^(camoufox|patchright)' requirements-ci.txt > /tmp/req-sweep.txt
           pip install -r /tmp/req-sweep.txt
 
+      # 这一段不能省。体检的结论会回传给平台做优选排序，而 VLESS 节点没有 xray
+      # 就一条都测不通 —— 那会把整批机场节点记成 net_fail 排到最后，比不测更坏。
+      # 代码里对「没有本地入口」的节点是跳过不记账的，但跳过等于这趟白跑
+      - name: 恢复 xray 缓存
+        id: xray-cache
+        uses: actions/cache@v4
+        with:
+          path: bin
+          key: xray-${{ runner.os }}-${{ env.XRAY_VERSION }}
+
+      - name: 下载 xray（仅首次或版本变更时）
+        if: steps.xray-cache.outputs.cache-hit != 'true'
+        run: bash scripts/install-xray.sh
+
       - name: 写入配置（来自 GitHub Secrets）
         env:
           CONFIG_JSON_B64: ${{ secrets.CONFIG_JSON_B64 }}
@@ -272,6 +293,21 @@ jobs:
       - name: 下载 Camoufox 浏览器（仅首次或依赖升级时）
         if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') && steps.camoufox-cache.outputs.cache-hit != 'true' }}
         run: python -m camoufox fetch
+
+      # VLESS 节点要靠 xray 转成本地 socks5 才能给 curl_cffi / Playwright 用。
+      # 缺了它，池子里的机场节点在分配时会被判「没有本地入口」逐个跳过，
+      # 账号只能退回普通 http/socks5 代理
+      - name: 恢复 xray 缓存
+        if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') }}
+        id: xray-cache
+        uses: actions/cache@v4
+        with:
+          path: bin
+          key: xray-${{ runner.os }}-${{ env.XRAY_VERSION }}
+
+      - name: 下载 xray（仅首次或版本变更时）
+        if: ${{ matrix.shard <= fromJson(needs.plan.outputs.total || '0') && steps.xray-cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/install-xray.sh
 
       # 注意：公共仓库的 Actions 缓存对外可读，这里刻意【不缓存】data/sessions.json
       # （其中含过盾 cookie）。cf_clearance 绑定出口 IP，每次 runner IP 不同基本

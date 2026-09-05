@@ -15,6 +15,10 @@ __pycache__/
 # 本地下载的 Camoufox 浏览器压缩包（GitHub Actions 用 Linux 版，运行时自动下载）
 /camoufox-*.zip
 
+# xray 可执行文件（VLESS 节点要靠它转成本地 socks5）。约 20MB 的二进制，
+# Actions 里按 pin 的版本下载并缓存，本机自己放一份即可，都不入库
+/bin/
+
 # 配置管理平台构建产物与依赖
 /server/*.exe
 /server/data/

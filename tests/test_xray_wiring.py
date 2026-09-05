@@ -12,7 +12,11 @@ tests/test_xray_wiring.py
 cf_clearance 判给 B 节点用，然后静默被盾拦 —— 这种失败在日志上看不出原因。
 """
 
+import re
 import threading
+from pathlib import Path
+
+import pytest
 
 from newapi_checkin import config as cfgmod
 from newapi_checkin import client as api
@@ -562,6 +566,93 @@ class TestSweepDoesNotSlanderNodes:
         assert NODE_A not in pool._bad
         assert NODE_B not in pool._bad
         assert pool.feedback_snapshot() == []
+
+
+class TestBinaryLocationMatchesTheWorkflow:
+    """代码找二进制的位置必须和 workflow 装的位置一致。
+
+    这条接缝最容易悄悄漂：改了脚本的安装目录、或改了 find_binary 的查找顺序，
+    单测照样全绿，直到某天 Actions 上报「找不到 xray」才发现。所以这里直接
+    从 install-xray.sh 里把安装目录读出来比对，而不是各自写死一个字符串。
+    """
+
+    def _repo_root(self):
+        import newapi_checkin
+        return Path(newapi_checkin.__file__).resolve().parent.parent
+
+    def test_install_script_default_dir_is_what_find_binary_looks_at(self):
+        script = (self._repo_root() / "scripts" / "install-xray.sh").read_text(encoding="utf-8")
+        # 脚本里的默认安装目录
+        match = re.search(r'DEST_DIR="\$\{XRAY_DEST_DIR:-([^}]+)\}"', script)
+        assert match, "install-xray.sh 里没找到 DEST_DIR 默认值，两边的约定失去锚点"
+        assert match.group(1) == "bin"
+        # find_binary 的兜底候选（第三顺位）确实是 <repo>/bin/xray
+        assert "root / \"bin\" / name" in (
+            (self._repo_root() / "newapi_checkin" / "xray.py").read_text(encoding="utf-8")
+        )
+
+    def test_find_binary_picks_up_the_repo_bin_copy(self, tmp_path, monkeypatch):
+        """模拟 Actions 装好之后的样子：PATH 里没有，但 bin/ 下有。"""
+        fake_pkg = tmp_path / "newapi_checkin"
+        fake_pkg.mkdir()
+        (fake_pkg / "xray.py").write_text("# stand-in", encoding="utf-8")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        binary = bin_dir / "xray"
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setattr(xray, "__file__", str(fake_pkg / "xray.py"))
+        monkeypatch.setattr(xray.shutil, "which", lambda name: None)
+        assert xray.find_binary() == str(binary)
+
+    def test_configured_path_wins_over_everything(self, tmp_path, monkeypatch):
+        explicit = tmp_path / "custom-xray"
+        explicit.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setattr(xray.shutil, "which", lambda name: None)
+        assert xray.find_binary(str(explicit)) == str(explicit)
+
+    def test_missing_binary_names_all_three_ways_out(self, tmp_path, monkeypatch):
+        """报错要把三条修复路径说全 —— 这是用户唯一能看到的提示。"""
+        fake_pkg = tmp_path / "newapi_checkin"
+        fake_pkg.mkdir()
+        monkeypatch.setattr(xray, "__file__", str(fake_pkg / "xray.py"))
+        monkeypatch.setattr(xray.shutil, "which", lambda name: None)
+        with pytest.raises(xray.XrayUnavailable) as excinfo:
+            xray.find_binary()
+        message = str(excinfo.value)
+        assert "proxy_pool.xray_path" in message
+        assert "PATH" in message
+        assert "workflows" in message
+
+    def test_all_three_workflows_install_xray(self):
+        """sweep 少装一处就会把 VLESS 全量记成不可用，三处必须一起有。"""
+        yaml = pytest.importorskip("yaml")
+        root = self._repo_root()
+        expected = {
+            (".github/workflows/checkin.yml", "sweep"),
+            (".github/workflows/checkin.yml", "checkin"),
+            (".github/workflows/proxy-sweep.yml", "sweep"),
+        }
+        found = set()
+        for rel in {p for p, _ in expected}:
+            data = yaml.safe_load((root / rel).read_text(encoding="utf-8"))
+            assert data.get("env", {}).get("XRAY_VERSION"), f"{rel} 缺 XRAY_VERSION"
+            for job_name, job in (data.get("jobs") or {}).items():
+                runs = " ".join(str(s.get("run", "")) for s in (job.get("steps") or []))
+                if "install-xray.sh" in runs:
+                    found.add((rel, job_name))
+        assert found == expected
+
+    def test_both_workflows_pin_the_same_version(self):
+        """两边测同一批节点，版本漂开会出现「体检说通、签到连不上」。"""
+        yaml = pytest.importorskip("yaml")
+        root = self._repo_root()
+        versions = {
+            rel: yaml.safe_load((root / rel).read_text(encoding="utf-8"))["env"]["XRAY_VERSION"]
+            for rel in (".github/workflows/checkin.yml", ".github/workflows/proxy-sweep.yml")
+        }
+        assert len(set(versions.values())) == 1, versions
+        # 顺手守住「不许用 latest」：latest 会某天静默换掉二进制
+        assert "latest" not in str(set(versions.values())).lower()
 
 
 class TestLogsNeverLeakTheUuid:
