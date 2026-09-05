@@ -158,6 +158,9 @@ class ProxyPoolConfig:
     # 代价要知道：同 IP 上的账号越多，这个出口被 Cloudflare/Turnstile 盯上的概率越高；
     # 如果哪天发现盾突然变难过，先把这个值调小。
     max_accounts_per_ip: int = 4
+    # xray 可执行文件位置。留空就按 PATH、常见安装目录、仓库内 bin/ 依次找（见
+    # xray.find_binary）。只有池子里真出现 vless:// 节点时才需要它
+    xray_path: str = ""
 
     @classmethod
     def from_raw(cls, raw: Optional[dict]) -> "ProxyPoolConfig":
@@ -188,6 +191,7 @@ class ProxyPoolConfig:
             preflight_seconds=max(1, min(120, _as_int(raw.get("preflight_seconds"), 15))),
             # 0 或负数表示不限共用；上限 64 是防手滑写出天文数字
             max_accounts_per_ip=max(0, min(64, _as_int(raw.get("max_accounts_per_ip"), 4))),
+            xray_path=str(raw.get("xray_path") or "").strip(),
         )
 
     def to_dict(self) -> dict:
@@ -208,6 +212,7 @@ class ProxyPoolConfig:
             "preflight_limit": self.preflight_limit,
             "preflight_seconds": self.preflight_seconds,
             "max_accounts_per_ip": self.max_accounts_per_ip,
+            "xray_path": self.xray_path,
         }
 
 
@@ -261,6 +266,11 @@ class ProxyPool:
         self._stats: dict[str, dict[str, int]] = {}
         self._lock = threading.RLock()
         self.last_error = ""
+        # xray 管理器（可选）。挂上之后 VLESS 节点才有可拨号的本地入口。
+        # 池子里的一切记账（_bad / _share_count / _stats）仍然按**节点标识**走，
+        # 只有 dial_target 会把标识换成本地地址 —— 混用会让反馈全记到
+        # 127.0.0.1 上，平台侧的优选排序当场失效
+        self._xray = None
 
     # ------------------------------------------------------------------ #
     # 抓取 + 测通
@@ -693,6 +703,42 @@ class ProxyPool:
     # ------------------------------------------------------------------ #
     # 分配
     # ------------------------------------------------------------------ #
+
+    def vless_nodes(self) -> list:
+        """池子里还没被拉黑的 VLESS 节点，保持优选顺序。给 xray 启动用。
+
+        只看 _available：手动配在 accounts[].proxy 上的节点由账号自己负责，不该
+        由池子代管端口。
+        """
+        with self._lock:
+            return [p for p in self._available
+                    if p not in self._bad and p.lower().startswith("vless://")]
+
+    def attach_xray(self, manager) -> None:
+        """挂上 xray 管理器，让 VLESS 节点能被拨号。传 None 表示解绑。"""
+        with self._lock:
+            self._xray = manager
+
+    def dial_target(self, proxy: Optional[str]) -> Optional[str]:
+        """把「节点标识」翻译成 HTTP 客户端能直接用的代理地址。
+
+        普通 http/socks5 代理原样返回；vless:// 节点换成 xray 在本地开的
+        socks5://127.0.0.1:port。**只在真要发请求时调用它**，任何记账（拉黑、
+        共用计数、成功率反馈）都必须用原始标识，否则整池的统计会塌到 127.0.0.1
+        这一个键上。
+
+        xray 没挂上或该节点没起成入站时返回 None，调用方据此判断「这个节点现在
+        不能用」，而不是拿一个连不上的地址去死等超时。
+        """
+        if not proxy:
+            return None
+        if "://" not in proxy or not proxy.lower().startswith("vless://"):
+            return proxy
+        with self._lock:
+            manager = self._xray
+        if manager is None:
+            return None
+        return manager.proxy_for(proxy) or None
 
     def acquire(self) -> Optional[str]:
         """分配一个代理。同一 IP 最多给 max_accounts_per_ip 个账号用，绝不返回「直连」。

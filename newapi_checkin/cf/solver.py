@@ -975,7 +975,7 @@ def _harvest(driver: BrowserDriver, account: Account, exit_ip: Optional[str]) ->
         user_agent=driver.user_agent(),
         accept_language=driver.accept_language(),
         exit_ip=exit_ip,
-        proxy=account.proxy,
+        proxy=account.proxy_key,
         expires_at=cookie_expiry(driver.cookies()),
         saved_at=now(),
     )

@@ -267,6 +267,13 @@ class Account:
     github_client_id: str = ""
     user_id: Optional[int] = None
     proxy: Optional[str] = None
+    # 运行时字段，不来自配置文件也不写回去。proxy 是「拿去拨号的地址」，这个是
+    # 「这条出口的稳定标识」。普通代理两者一样；VLESS 节点 proxy 是 xray 开的
+    # socks5://127.0.0.1:随机端口，标识才是原始 vless:// URI。
+    # 过盾缓存的有效性、成功率反馈都必须按标识比对：本地端口每轮会漂移，而且从固定
+    # 起点分配时**不同节点很可能拿到同一个端口** —— 按 proxy 比对会把 A 节点的
+    # cf_clearance 判定为 B 节点可用，然后静默被盾拦
+    proxy_identity: Optional[str] = None
     checkin_path: Optional[str] = None
     browser_path: str = "/dashboard"
     enabled: bool = True
@@ -278,6 +285,11 @@ class Account:
     @property
     def credential_label(self) -> str:
         return "TaBiAI 凭据" if self.uses_tabiai else "站点 Cookie"
+
+    @property
+    def proxy_key(self) -> Optional[str]:
+        """记账用的出口标识。没设 proxy_identity 时回落 proxy，兼容手动配置的账号。"""
+        return self.proxy_identity or self.proxy or None
 
     @property
     def base_url(self) -> str:

@@ -86,6 +86,9 @@ def test_source_ip_backoff_only_blocks_that_account(tmp_path, monkeypatch):
                 self._next += 1
                 return f"p{self._next}:80"
 
+        def dial_target(self, proxy):
+            return proxy
+
         def mark_bad(self, _proxy, reason="net"):
             return None
 

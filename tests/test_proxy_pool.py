@@ -238,6 +238,9 @@ class FakePool:
                 return proxy
         return None
 
+    def dial_target(self, proxy):
+        return proxy
+
     def mark_bad(self, proxy, reason="net"):
         if proxy:
             self._bad.add(proxy)

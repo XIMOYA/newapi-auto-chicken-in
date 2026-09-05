@@ -147,6 +147,20 @@ def node_label(node: VlessNode) -> str:
     return f"vless://***@{node.host}:{node.port}#{name}" if node.tag else f"vless://***@{node.host}:{node.port}"
 
 
+def proxy_label(addr: str) -> str:
+    """任意代理地址的日志安全写法。
+
+    vless:// 必须打码（uuid 是接入凭据），http/socks5 原样返回 —— 那类地址在日志里
+    本来就是可见的，打码反而让排查时对不上号。解析不出来的 vless 也不能原样吐出去。
+    """
+    if not addr:
+        return ""
+    if not addr.lower().startswith("vless://"):
+        return addr
+    node = parse_vless_uri(addr)
+    return node_label(node) if node else "vless://<无法解析>"
+
+
 @dataclass
 class Binding:
     """节点与它的本地入口的对应关系。两个键刻意分开，见模块开头的约定。"""

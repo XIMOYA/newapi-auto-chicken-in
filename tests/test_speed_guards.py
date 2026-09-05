@@ -455,6 +455,9 @@ class _EndlessPool:
         self.n += 1
         return f"p{self.n}:80"
 
+    def dial_target(self, proxy):
+        return proxy
+
     def mark_bad(self, proxy, reason="net"):
         self.bad.append(proxy)
 
@@ -759,6 +762,9 @@ class TestShieldRetriesWithoutNewIP:
         class _DryPool:
             def acquire(self):
                 return None
+
+            def dial_target(self, proxy):
+                return proxy
 
             def mark_bad(self, proxy, reason="net"):
                 pass

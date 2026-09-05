@@ -18,6 +18,7 @@ from .config import (
     Config,
 )
 from .utils import jitter_sleep, now, probe_exit_ip
+from .xray import proxy_label
 
 STRATEGY_LABEL = {
     "S0": "S0 缓存直连",
@@ -40,6 +41,9 @@ SOURCE_IP_SWAP_BACKOFF_SECONDS = 5
 # 一个账号累计换满这么多 IP 后，换 IP 优先复用本轮签到成功过的出口（见 _swap_proxy）。
 # 前几个 IP 是扫雷阶段，过早复用会一个坑反复踩；过了阈值再启用才有意义。
 PROVEN_REUSE_THRESHOLD = 10
+# 从池里连续取到「没有本地入口」的节点时最多试几个就放弃。只对 VLESS 有意义：
+# xray 没装上/该协议不受支持时每个节点都会落空，试到手软也没用，早点报错好排查
+DIAL_ATTEMPTS = 5
 _SOURCE_IP_RETRYABLE = (api.FAILED, api.WAF_BLOCKED)
 # 源站/凭据/环境已经给出不可恢复结论：不再浪费重试，直接把账号标记为跳过。
 _SKIP_ON_FAILURE = (
@@ -136,6 +140,9 @@ class Runner:
         self._ai = None
         self._ai_ready = False
         self._pool = None
+        # xray 进程管理器。只有池子里出现 vless:// 节点时才起，跑完必须停 ——
+        # 漏掉会留一个占着端口的孤儿进程，下一轮起不来且报错难懂
+        self._xray = None
         # 记录「由代理池分配」的代理：手动配置的代理出错时不换，池分配的才换
         self._pooled_proxies: dict[str, str] = {}
         # 本账号累计换过的 IP 个数。换满 PROVEN_REUSE_THRESHOLD 后，换 IP 不再
@@ -195,6 +202,7 @@ class Runner:
                                    preset=self.options.proxy_list)
 
             count = self._pool.refresh(desired=desired)
+            self._start_xray()
             if count:
                 log.ok(f"代理池就绪: {count} 个可用代理")
                 self._report_proxy_capacity(count, accounts)
@@ -207,6 +215,58 @@ class Runner:
                     f"已要求必须走代理，没有自带代理的账号都会被跳过"
                     f"（配了 accounts[].proxy 的账号照常执行，也不降级直连）")
             self._pool = None
+
+    def _start_xray(self) -> None:
+        """池子里有 VLESS 节点就起一个 xray，把它们变成本地 socks5 入口。
+
+        一个进程带 N 个入站，不是一条一个进程 —— 几十上百个节点那个量级的进程起不来。
+        起不来就不挂：dial_target 会对 vless 一律返回 None，那些节点在分配时被跳过，
+        普通 http/socks5 代理完全不受影响。这是刻意的降级路径，别改成抛异常中断签到。
+        """
+        if self._pool is None:
+            return
+        uris = self._pool.vless_nodes()
+        if not uris:
+            return
+        try:
+            from .xray import XrayManager, parse_vless_uri
+
+            nodes = []
+            for uri in uris:
+                node = parse_vless_uri(uri)
+                if node is None:
+                    log.warn(f"跳过无法解析的节点: {proxy_label(uri)}")
+                    continue
+                nodes.append(node)
+            if not nodes:
+                log.err(f"池子里有 {len(uris)} 个 VLESS 节点但一个都解析不出来，全部跳过")
+                return
+            manager = XrayManager(nodes, xray_path=self.cfg.proxy_pool.xray_path)
+            manager.start()
+        except Exception as exc:  # noqa: BLE001 - 起不来就降级，不能让签到崩掉
+            log.err(f"xray 启动失败: {type(exc).__name__}: {exc}；"
+                    f"{len(uris)} 个 VLESS 节点本轮不可用（普通代理不受影响）")
+            self._xray = None
+            return
+        self._xray = manager
+        self._pool.attach_xray(manager)
+        if manager.skipped:
+            log.warn(f"{len(manager.skipped)} 个节点因协议不受支持被跳过: "
+                     + "；".join(manager.skipped[:3])
+                     + ("…" if len(manager.skipped) > 3 else ""))
+        log.ok(f"xray 就绪: {len(manager.bindings)} 个 VLESS 节点已开出本地入口")
+
+    def _stop_xray(self) -> None:
+        """停 xray 并解绑。必须在 run 的 finally 里调，漏了就留孤儿进程占端口。"""
+        manager, self._xray = self._xray, None
+        if manager is None:
+            return
+        if self._pool is not None:
+            self._pool.attach_xray(None)
+        try:
+            manager.stop()
+        except Exception as exc:  # noqa: BLE001 - 收尾失败只记一笔，不影响签到结果
+            log.warn(f"xray 收尾异常: {type(exc).__name__}: {exc}")
 
     def _proxy_required(self) -> bool:
         """启用代理池 = 必须走代理：宁可多个账号共用一个 IP，也不直连。"""
@@ -229,20 +289,35 @@ class Runner:
                  f"抓取时可调大 proxy_pool.max_workers 或增加 sources")
 
     def _assign_proxy(self, account: Account) -> None:
-        """给账号分配代理。手动配置的优先；否则从池里取（用尽时共用，绝不直连）。"""
+        """给账号分配代理。手动配置的优先；否则从池里取（用尽时共用，绝不直连）。
+
+        account.proxy 存的是**可拨号地址**，_pooled_proxies 存的是**节点标识**。
+        普通代理两者相同；VLESS 节点前者是 xray 开的本地 socks5、后者是原始
+        vless:// URI。所有记账都走标识，见 ProxyPool.dial_target 的说明。
+        """
         if account.proxy:
             log.debug("使用手动配置的代理")
             return
         if self._pool is None:
             return
-        proxy = self._pool.acquire()
-        if proxy:
-            account.proxy = proxy
-            with self._state_lock:
-                self._pooled_proxies[account.name] = proxy
-            log.info(f"已分配代理 {proxy}")
-        else:
-            log.err("代理池里没有任何可用代理，且已要求必须走代理")
+        for _ in range(DIAL_ATTEMPTS):
+            proxy = self._pool.acquire()
+            if not proxy:
+                log.err("代理池里没有任何可用代理，且已要求必须走代理")
+                return
+            dial = self._pool.dial_target(proxy)
+            if dial:
+                account.proxy = dial
+                account.proxy_identity = proxy
+                with self._state_lock:
+                    self._pooled_proxies[account.name] = proxy
+                log.info(f"已分配代理 {proxy_label(proxy)}")
+                return
+            # 拿到节点但没有本地入口：xray 没起成、或这条协议不受支持。
+            # 拉黑换下一个，不能把 None 塞进 account.proxy 变成直连
+            log.warn(f"节点 {proxy_label(proxy)} 没有可用的本地入口，跳过")
+            self._pool.mark_bad(proxy, "net")
+        log.err(f"连续 {DIAL_ATTEMPTS} 个节点都没有可用的本地入口，未能分配代理")
 
     def _swap_proxy(self, account: Account, reason: str = "net") -> Optional[str]:
         """换一个新代理。拿不到替代品时保留原代理，绝不清空成直连。
@@ -259,22 +334,37 @@ class Runner:
             old = self._pooled_proxies.get(account.name)
         if old:
             self._pool.mark_bad(old, reason)
-        # 先拿可用代理；没有才走成功 IP 复用。拿不到就继续用原来的，宁可重试失败也不直连
-        proxy = self._pool.acquire()
-        if proxy is None:
-            proxy = self._reuse_proven_proxy(account)
-        if proxy:
+        # 先拿可用代理；没有才走成功 IP 复用。拿不到就继续用原来的，宁可重试失败也不直连。
+        # 拿到了但起不出本地入口的节点当场拉黑再试下一个 —— 否则一个起不来的节点会把
+        # 这次换 IP 白白耗掉，账号继续用已知失败的旧出口重试
+        proxy = None
+        dial = None
+        for _ in range(DIAL_ATTEMPTS):
+            candidate = self._pool.acquire()
+            if candidate is None:
+                candidate = self._reuse_proven_proxy(account)
+            if candidate is None:
+                break
+            resolved = self._pool.dial_target(candidate)
+            if resolved:
+                proxy, dial = candidate, resolved
+                break
+            log.warn(f"节点 {proxy_label(candidate)} 没有可用的本地入口，跳过")
+            self._pool.mark_bad(candidate, "net")
+        if proxy and dial:
             self._swap_total[account.name] = self._swap_total.get(account.name, 0) + 1
-            account.proxy = proxy
+            account.proxy = dial
+            account.proxy_identity = proxy
             with self._state_lock:
                 self._pooled_proxies[account.name] = proxy
-            log.warn(f"代理 {old or '<手动>'} 连目标站点失败，换用 {proxy}"
+            log.warn(f"代理 {proxy_label(old) if old else '<手动>'} 连目标站点失败，"
+                     f"换用 {proxy_label(proxy)}"
                      + (f"（复用本轮已成功 IP，本账号累计已换 "
                         f"{self._swap_total[account.name]} 个）"
                         if proxy in self._proven_proxies else ""))
             return proxy
-        log.warn(f"代理 {old or '<手动>'} 连目标站点失败，但池里已无其他可用代理，"
-                 f"继续用它重试（不降级直连）")
+        log.warn(f"代理 {proxy_label(old) if old else '<手动>'} 连目标站点失败，"
+                 f"但池里已无其他可用代理，继续用它重试（不降级直连）")
         return None
 
     def _can_reuse_proven(self, account: Account) -> bool:
@@ -489,6 +579,9 @@ class Runner:
             # 释放懒加载创建的 AI 客户端（含各线程的 curl session），
             # 避免 daemon 长跑或多轮执行时泄漏资源。
             self._close_ai()
+            # xray 放最后停：上面几步（反馈回传、AI 收尾）可能还在走代理，
+            # 先把它拆了会让那些请求无端失败
+            self._stop_xray()
 
     # ------------------------------------------------------------------ #
     # 运行状态上报（配合平台锁住高危凭据操作）
@@ -1031,7 +1124,7 @@ class Runner:
 
         # ---------------- S0 缓存直连 ----------------
         if record.cf is not None:
-            usable, reason = record.cf.check(ip, account.proxy)
+            usable, reason = record.cf.check(ip, account.proxy_key)
             log.debug(f"S0 缓存判定: {reason}")
             if usable:
                 result = self._api_call(account, record.cf)
@@ -1074,7 +1167,7 @@ class Runner:
     def _attempt_tabiai(self, account: Account, record, ip: Optional[str]) -> log.SummaryRow:
         """TaBiAI 账号：复用站点 CF 缓存，但换令牌与签到由 TabiAIClient 完成。"""
         if record.cf is not None:
-            usable, reason = record.cf.check(ip, account.proxy)
+            usable, reason = record.cf.check(ip, account.proxy_key)
             log.debug(f"TaBiAI S0 缓存判定: {reason}")
             if usable:
                 result = self._tabiai_api_call(account, record.cf)
