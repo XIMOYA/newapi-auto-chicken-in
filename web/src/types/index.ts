@@ -88,6 +88,28 @@ export interface ProvisionOutcome {
   message?: string
 }
 
+/** POST /api/sites/apikeys 里单个账号的处置结果 */
+export interface APIKeyOutcome {
+  account: string
+  /** reused / created / failed / skipped_no_credentials */
+  status: string
+  message?: string
+}
+
+/**
+ * 汇总清单里的一条。
+ *
+ * api_key 在 GET /api/sites/apikeys 里是脱敏的（留头留尾），只有
+ * GET /api/sites/apikeys/raw 才给明文，而那个端点只认 API Key、前端拿不到。
+ * 所以判断「这个账号有没有 key」要看 has_key，不要去解析 api_key 的内容。
+ */
+export interface APIKeyEntry {
+  account: string
+  url: string
+  api_key: string
+  has_key: boolean
+}
+
 export interface AIConfig {
   enabled: boolean
   base_url: string
