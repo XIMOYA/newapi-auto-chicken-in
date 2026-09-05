@@ -93,6 +93,14 @@ func (s *Server) routes() http.Handler {
 	// 按站点 URL 批量建签到账号：会为每个 GitHub 账号签发一条站点凭据，
 	// 与签到抢代次，所以内部先过签到锁
 	mux.HandleFunc("POST /api/sites/provision", s.requireJWTOrAPIKey(s.handleProvisionSite))
+	// 站点 API Key：为每个启用账号在自己站点上备一条调用令牌并取回全值。
+	// 会消耗 tabiai 的 refresh 代次，内部先过签到锁；批内串行（站点给取值接口挂了
+	// CriticalRateLimit，并发打必被限流）
+	mux.HandleFunc("POST /api/sites/apikeys", s.requireJWTOrAPIKey(s.handleEnsureSiteAPIKeys))
+	// 汇总清单：打码版跟 GET /api/config 同级（双认证），明文版跟 /api/config/raw
+	// 同级（只认 API Key）。这些 key 能直接调用付费接口，明文一律不给浏览器 token
+	mux.HandleFunc("GET /api/sites/apikeys", s.requireJWTOrAPIKey(s.handleListSiteAPIKeys))
+	mux.HandleFunc("GET /api/sites/apikeys/raw", s.requireAPIKey(s.handleListSiteAPIKeysRaw))
 
 	// 单账号查询（凭据回写的读回核实，见 account_query.go）：
 	// 脱敏摘要跟 GET /api/config 同级（双认证，cookie 只给指纹不给明文），

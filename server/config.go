@@ -71,12 +71,17 @@ type Account struct {
 	// GitHubAccount 引用 github_accounts[].name。非空时凭据从那里取，
 	// 账号名也由「该 GitHub 名（本站域名）」自动生成，不再手填。
 	// 上面两个旧字段保留：老配置迁移期间仍作兜底，见 resolveAccountSession
-	GitHubAccount string  `json:"github_account"`
-	UserID        *int64  `json:"user_id"`
-	Proxy         *string `json:"proxy"`
-	CheckinPath   *string `json:"checkin_path"`
-	BrowserPath   *string `json:"browser_path"`
-	Enabled       bool    `json:"enabled"`
+	GitHubAccount string `json:"github_account"`
+	// APIKey 该账号在自己站点上的调用令牌，形如 sk-xxx。由 site_apikey.go 自动
+	// 建号取值后回填，人也可以手填。它跟签到无关 —— 签到用的是上面的 Cookie，
+	// 这个纯粹是「顺手把每个站点的可用 key 攒起来」的产物。
+	// 与 Cookie 同级的凭据：MaskConfig 会打码、UnmaskConfig 按账号名还原。
+	APIKey      string  `json:"api_key"`
+	UserID      *int64  `json:"user_id"`
+	Proxy       *string `json:"proxy"`
+	CheckinPath *string `json:"checkin_path"`
+	BrowserPath *string `json:"browser_path"`
+	Enabled     bool    `json:"enabled"`
 }
 
 // AIConfig AI 辅助配置。
@@ -298,6 +303,11 @@ func MaskConfig(cfg *Config) *Config {
 		if m.Accounts[i].GithubUserSession != "" {
 			m.Accounts[i].GithubUserSession = MaskPlaceholder
 		}
+		// 站点 API Key 能直接调用付费接口，比签到 cookie 的滥用面更大，一样不下发。
+		// 要看明文走 GET /api/sites/apikeys/raw（只认 API Key），与 config/raw 同惯例
+		if m.Accounts[i].APIKey != "" {
+			m.Accounts[i].APIKey = MaskPlaceholder
+		}
 	}
 	// 共享凭据池的 session 与账号自带的那份等价，同样不能明文下发浏览器。
 	// client_id 是站点 OAuth 应用的公开标识，不打码 —— 打了前端就没法判断
@@ -343,10 +353,12 @@ func UnmaskConfig(in, old *Config) (*Config, error) {
 
 	oldCookieByName := make(map[string]string, len(old.Accounts))
 	oldGithubSessionByName := make(map[string]string, len(old.Accounts))
+	oldAPIKeyByName := make(map[string]string, len(old.Accounts))
 	for _, a := range old.Accounts {
 		if a.Name != "" {
 			oldCookieByName[a.Name] = a.Cookie
 			oldGithubSessionByName[a.Name] = a.GithubUserSession
+			oldAPIKeyByName[a.Name] = a.APIKey
 		}
 	}
 	for i := range out.Accounts {
@@ -366,6 +378,12 @@ func UnmaskConfig(in, old *Config) (*Config, error) {
 					"accounts[%d].github_user_session 无法还原：旧配置中没有名为 %q 的账号（账号改名后需要重新填写 GitHub Cookie）", i, name)
 			}
 			out.Accounts[i].GithubUserSession = c
+		}
+		// API Key 的还原刻意比 cookie 宽松：找不到旧值时留空而不是报错。
+		// 它不是签到必需品（签到用 cookie），为它整份 PUT 失败不划算；而且留空后
+		// 重跑一次 POST /api/sites/apikeys 就能补回来，代价只是多打一次站点
+		if out.Accounts[i].APIKey == MaskPlaceholder {
+			out.Accounts[i].APIKey = oldAPIKeyByName[name]
 		}
 		if strings.TrimSpace(out.Accounts[i].LoginMethod) == "" {
 			out.Accounts[i].LoginMethod = LoginMethodNewAPICookie
