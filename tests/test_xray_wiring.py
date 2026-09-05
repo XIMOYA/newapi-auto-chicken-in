@@ -476,6 +476,94 @@ class TestXrayLifecycle:
         assert runner._xray is None
 
 
+class TestSweepDoesNotSlanderNodes:
+    """体检回传直接决定平台的优选排序，记错一次会长期影响所有 runner。"""
+
+    def _sweep_pool(self, monkeypatch, addrs, xray_ok):
+        pool = _pool([])
+        monkeypatch.setattr(pp.ProxyPool, "_fetch_remote", lambda self: list(addrs))
+        if xray_ok:
+            def fake_start(self):
+                self.bindings = [
+                    xray.Binding(node_addr=n.raw,
+                                 local_proxy=f"socks5://127.0.0.1:{22801 + i}",
+                                 inbound_tag=f"in-{i}")
+                    for i, n in enumerate(self.nodes)
+                ]
+                self._by_node = {b.node_addr: b.local_proxy for b in self.bindings}
+        else:
+            def fake_start(self):
+                raise xray.XrayUnavailable("找不到 xray 可执行文件")
+        monkeypatch.setattr(xray.XrayManager, "start", fake_start)
+        monkeypatch.setattr(xray.XrayManager, "stop", lambda self: None)
+        return pool
+
+    def test_missing_xray_skips_nodes_instead_of_failing_them(self, monkeypatch):
+        """核心：没装 xray 时 VLESS 不能被记成 net_fail 回传，那是拿本地原因诬陷节点。"""
+        pool = self._sweep_pool(monkeypatch, [NODE_A, NODE_B, "1.2.3.4:8080"], xray_ok=False)
+        monkeypatch.setattr(pp.ProxyPool, "_test_one", lambda self, proxy: 0.1)
+        stats = pool.sweep_remote(minutes=1)
+        assert stats["skipped"] == 2
+        assert stats["tested"] == 1
+        keys = [item["addr"] for item in pool.feedback_snapshot()]
+        assert keys == ["1.2.3.4:8080"]
+        assert NODE_A not in keys and NODE_B not in keys
+
+    def test_with_xray_the_nodes_are_accounted_by_their_uri(self, monkeypatch):
+        pool = self._sweep_pool(monkeypatch, [NODE_A, "1.2.3.4:8080"], xray_ok=True)
+        dialed: list = []
+
+        def fake_test(self, proxy):
+            dialed.append(self.dial_target(proxy))
+            return 0.1
+
+        monkeypatch.setattr(pp.ProxyPool, "_test_one", fake_test)
+        stats = pool.sweep_remote(minutes=1)
+        assert stats["skipped"] == 0
+        assert stats["tested"] == 2
+        keys = sorted(item["addr"] for item in pool.feedback_snapshot())
+        assert keys == sorted([NODE_A, "1.2.3.4:8080"])
+        # 真正拨号用的是本地入口
+        assert "socks5://127.0.0.1:22801" in dialed
+
+    def test_sweep_stops_xray_when_done(self, monkeypatch):
+        pool = self._sweep_pool(monkeypatch, [NODE_A], xray_ok=True)
+        stopped: list = []
+        monkeypatch.setattr(xray.XrayManager, "stop", lambda self: stopped.append(self))
+        monkeypatch.setattr(pp.ProxyPool, "_test_one", lambda self, proxy: 0.1)
+        pool.sweep_remote(minutes=1)
+        assert len(stopped) == 1
+        assert pool._xray is None
+
+    def test_test_one_translates_before_dialing(self):
+        """_test_one 拿到的是标识，必须自己翻译；直接把 vless:// 喂给 curl 是必错的。"""
+        pool = _pool([NODE_A], _FakeXray({}))
+        assert pool._test_one(NODE_A) is None
+
+    def test_preflight_leaves_vless_alone(self, monkeypatch):
+        """preflight 跑在 xray 之前，硬测会把整池机场节点当场清零。
+
+        必须混一个测得通的普通代理进来：preflight 有「无一测通就整体放弃自筛」的保护，
+        只放 VLESS 的话那条保护会替我们兜住，测试看着是绿的却什么都没守到 —— 这个
+        假绿是变异测试抓出来的。
+        """
+        pool = _pool([NODE_A, NODE_B, "1.2.3.4:8080"])
+        real_test = pp.ProxyPool._test_one
+
+        def part_stub(self, proxy):
+            # 普通代理直接算通（离线，不发请求）；VLESS 走真实逻辑，
+            # 没有本地入口时它会返回 None，也就是「若被纳入就会被拉黑」
+            if proxy.lower().startswith("vless://"):
+                return real_test(self, proxy)
+            return 0.1
+
+        monkeypatch.setattr(pp.ProxyPool, "_test_one", part_stub)
+        assert pool.preflight() == 0
+        assert NODE_A not in pool._bad
+        assert NODE_B not in pool._bad
+        assert pool.feedback_snapshot() == []
+
+
 class TestLogsNeverLeakTheUuid:
     """vless 的 uuid 是接入凭据。日志会进 Actions 产物，泄了等于把节点送人。"""
 

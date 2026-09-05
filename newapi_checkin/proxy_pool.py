@@ -19,6 +19,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -613,14 +614,23 @@ class ProxyPool:
 
         log.step(f"代理全量体检：平台给了 {len(addrs)} 条存活代理，"
                  f"并发 {self.cfg.max_workers}，时间盒 {minutes} 分钟")
-        alive = self._test_many(addrs, need=None, deadline=deadline, on_result=record)
+        # VLESS 得先有本地入口才测得动。起不来时那些节点会被剔出待测列表而不是记失败：
+        # 这趟体检的结论要回传给平台做排序，用「本机没装 xray」去记一堆 net_fail
+        # 等于把好节点排到最后，比不测更坏
+        with self._xray_session(addrs) as testable:
+            if len(testable) < len(addrs):
+                log.warn(f"{len(addrs) - len(testable)} 条节点没有本地入口，本轮跳过不测")
+            alive = self._test_many(testable, need=None, deadline=deadline, on_result=record)
         tested = counted["ok"] + counted["fail"]
         elapsed = time.monotonic() - started
-        if tested < len(addrs):
-            log.warn(f"时间盒用尽，{len(addrs) - tested} 条没轮到（不计入回传，"
+        # 分母是「本轮真打算测的」而不是「平台给的」：跳过的节点已经单独告警过，
+        # 混进来会让这条日志把「没装 xray」说成「时间盒用尽」，排查时找错方向
+        if tested < len(testable):
+            log.warn(f"时间盒用尽，{len(testable) - tested} 条没轮到（不计入回传，"
                      "免得把没测的记成失败）")
         return {
             "total": len(addrs), "tested": tested,
+            "skipped": len(addrs) - len(testable),
             "ok": counted["ok"], "fail": counted["fail"],
             "elapsed": elapsed,
             # 按延迟升序的可用清单。签到前置体检要把它落盘传给各分片直接用，
@@ -641,11 +651,19 @@ class ProxyPool:
 
         时间盒到点就收手，没拿到结论的一律保留：把「没测到」当成「不通」会误删好代理。
         探测打的仍然是配置里的 test_url，不碰目标站点。
+
+        **VLESS 节点整体跳过**。两个原因：一是这时候 xray 还没起（起它要先有
+        refresh 出来的节点列表，顺序上必然在 preflight 之后），硬测会把每一条都判成
+        不通然后全部拉黑，池子里的机场节点当场清零；二是这批节点来自订阅/平台而不是
+        免费代理源，本来就不是「几小时大批失效」那种货。真坏的节点在分配时开不出本地
+        入口，那一步会拉黑它并换下一个，兜得住。
         """
         if not self.cfg.preflight_check or self.cfg.preflight_limit <= 0:
             return 0
         with self._lock:
-            candidates = [p for p in self._available if p not in self._bad][: self.cfg.preflight_limit]
+            candidates = [p for p in self._available
+                          if p not in self._bad
+                          and not p.lower().startswith("vless://")][: self.cfg.preflight_limit]
         if not candidates:
             return 0
 
@@ -682,7 +700,15 @@ class ProxyPool:
         return len(dead)
 
     def _test_one(self, proxy: str) -> Optional[float]:
-        """测通单个代理。成功返回探测耗时（秒，用于按延迟排序），失败返回 None。"""
+        """测通单个代理。成功返回探测耗时（秒，用于按延迟排序），失败返回 None。
+
+        VLESS 节点要先翻译成本地入口才测得动。没有入口（xray 没起来/协议不支持）时
+        返回 None 而不是硬测原始 URI —— 但要留意调用方会把 None 记成失败，所以
+        「本轮没有 xray」这件事必须在起池子时就判掉，别指望这里兜。
+        """
+        dial = self.dial_target(proxy)
+        if not dial:
+            return None
         try:
             from curl_cffi import requests as cffi
 
@@ -690,7 +716,7 @@ class ProxyPool:
             resp = cffi.get(
                 self.cfg.test_url,
                 timeout=self.cfg.timeout,
-                proxies={"http": proxy, "https": proxy},
+                proxies={"http": dial, "https": dial},
                 impersonate="chrome",
                 verify=True,
             )
@@ -713,6 +739,53 @@ class ProxyPool:
         with self._lock:
             return [p for p in self._available
                     if p not in self._bad and p.lower().startswith("vless://")]
+
+    @contextmanager
+    def _xray_session(self, addrs: list):
+        """给这批地址里的 VLESS 节点临时开本地入口，yield 出「真正能测的地址」。
+
+        体检类入口（sweep_remote / preflight）不经过 Runner，得自己管 xray 生命周期。
+
+        起不来时把 VLESS **从待测列表里剔掉**，而不是让它们测失败：调用方会把 None
+        记成 net_fail 回传给平台，等于用「本机没装 xray」这个纯本地原因去诬陷节点，
+        把平台的优选顺序彻底带偏。没测的不记账，跟时间盒没轮到是同一个道理。
+
+        已经挂过 xray（签到主链路起的）就直接复用，不重复起进程。
+        """
+        addrs = list(addrs)
+        uris = [a for a in addrs
+                if isinstance(a, str) and a.lower().startswith("vless://")]
+        if not uris or self._xray is not None:
+            yield addrs
+            return
+        manager = None
+        try:
+            from .xray import XrayManager, parse_vless_uri
+
+            nodes = [n for n in (parse_vless_uri(u) for u in uris) if n is not None]
+            if nodes:
+                manager = XrayManager(nodes, xray_path=self.cfg.xray_path)
+                manager.start()
+                self.attach_xray(manager)
+                log.ok(f"xray 就绪: {len(manager.bindings)} 个 VLESS 节点已开出本地入口")
+        except Exception as exc:  # noqa: BLE001 - 起不来就跳过这批，不能中断体检
+            manager = None
+            log.err(f"xray 启动失败: {type(exc).__name__}: {exc}；"
+                    f"{len(uris)} 个 VLESS 节点本轮跳过不测（不记失败，免得诬陷节点）")
+        try:
+            if manager is None:
+                yield [a for a in addrs
+                       if not (isinstance(a, str) and a.lower().startswith("vless://"))]
+            else:
+                # 起来了但个别节点没开出入口（协议不支持）：那些同样只跳过不记账
+                yield [a for a in addrs if self.dial_target(a)]
+        finally:
+            if manager is not None:
+                self.attach_xray(None)
+                try:
+                    manager.stop()
+                except Exception as exc:  # noqa: BLE001 - 收尾失败只记一笔
+                    log.warn(f"xray 收尾异常: {type(exc).__name__}: {exc}")
 
     def attach_xray(self, manager) -> None:
         """挂上 xray 管理器，让 VLESS 节点能被拨号。传 None 表示解绑。"""
